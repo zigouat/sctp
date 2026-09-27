@@ -18,10 +18,11 @@ const max_heartbeat_info = 200;
 pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 
 pub const Config = struct {
-    source_port: u16 = 5000,
-    dest_port: u16 = 5000,
+    source_port: u16,
+    dest_port: u16,
     outbound_streams: u16 = std.math.maxInt(u16),
     inbound_streams: u16 = std.math.maxInt(u16),
+    random: std.Random,
 };
 
 pub const Event = union(enum) {
@@ -86,7 +87,7 @@ transmits: std.Deque(Transmit),
 events: std.Deque(Event) = .empty,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) Association {
-    const initial_tsn = 0x10203040;
+    const initial_tsn = config.random.int(u32);
 
     return Association{
         .allocator = allocator,
@@ -98,9 +99,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .inbound_streams = config.inbound_streams,
         .intial_tsn = initial_tsn,
         .peer_initial_tsn = 0,
-        .verification_tag = 0xAABBCCDD,
+        .verification_tag = config.random.int(u32),
         .peer_verification_tag = 0,
-        .cookie = @splat(0x11),
+        .cookie = config.random.array(u8, 32),
         .peer_cookie = &.{},
         .rwnd = 0,
         .cwnd = a_rwnd,
@@ -598,6 +599,8 @@ fn writeCommonHeader(self: *const Association, buffer: []u8) void {
 
 const testing = std.testing;
 
+var test_prng = std.Random.DefaultPrng.init(0);
+
 fn testPacket(buffer: *[16]u8, vtag: u32, chunk_type: message.ChunkType, flags: u8) []const u8 {
     std.mem.writeInt(u16, buffer[0..2], 5000, .big);
     std.mem.writeInt(u16, buffer[2..4], 5000, .big);
@@ -651,7 +654,7 @@ fn testSackPacket(buffer: *[32]u8, vtag: u32, cumulative_tsn: u32, gap: ?[2]u16)
 }
 
 test "Association.pollTransmits: a timed out message that was gap acked is not retransmitted" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
@@ -671,7 +674,7 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
 }
 
 test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
@@ -691,7 +694,7 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
 }
 
 test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
@@ -715,7 +718,7 @@ test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
 }
 
 test "Association.handleRead: Abort with the T bit and the peer tag closes the association" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.state = .established;
     assoc.peer_verification_tag = 0x11223344;
@@ -728,7 +731,7 @@ test "Association.handleRead: Abort with the T bit and the peer tag closes the a
 }
 
 test "Association.handleRead: Abort with the T bit and our own tag is ignored" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.state = .established;
     assoc.peer_verification_tag = 0x11223344;
@@ -741,7 +744,7 @@ test "Association.handleRead: Abort with the T bit and our own tag is ignored" {
 }
 
 test "Association.handleRead: shutdown complete with the T bit and the peer tag closes the association" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.state = .shutdown_ack_sent;
     assoc.peer_verification_tag = 0x11223344;
@@ -753,7 +756,7 @@ test "Association.handleRead: shutdown complete with the T bit and the peer tag 
 }
 
 test "Association.handleRead: data in shutdown sent is answered with a shutdown" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.peer_initial_tsn = 100;
     try assoc.setStateToEstablished();
@@ -771,7 +774,7 @@ test "Association.handleRead: data in shutdown sent is answered with a shutdown"
 }
 
 test "Association.handleRead: data in shutdown pending is delivered and acknowledged" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.peer_initial_tsn = 100;
     try assoc.setStateToEstablished();
@@ -788,7 +791,7 @@ test "Association.handleRead: data in shutdown pending is delivered and acknowle
 }
 
 test "Association.handleRead: shutdown in shutdown pending moves to shutdown received" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.state = .shutdown_pending;
 
@@ -809,7 +812,7 @@ test "Association.handleRead: shutdown in shutdown pending moves to shutdown rec
 }
 
 test "Association.handleRead: shutdown ack in shutdown ack sent closes the association" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.state = .shutdown_ack_sent;
 
@@ -821,7 +824,7 @@ test "Association.handleRead: shutdown ack in shutdown ack sent closes the assoc
 }
 
 test "Association.handleRead: out of the blue shutdown ack is answered with a reflected shutdown complete" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.peer_verification_tag = 0x11223344;
 
@@ -839,7 +842,7 @@ test "Association.handleRead: out of the blue shutdown ack is answered with a re
 }
 
 test "Association.shutdown: an empty queue sends a shutdown right away" {
-    var assoc = Association.init(testing.allocator, .{});
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
     assoc.peer_initial_tsn = 100;
     try assoc.setStateToEstablished();
