@@ -5,7 +5,7 @@ const Helper = @import("helper.zig");
 
 const SackHandler = @This();
 
-pub const bitmap_bits = 65536;
+pub const bitmap_bits = 1024;
 
 cumulative_tsn: u32,
 highest_tsn_received: u32,
@@ -52,13 +52,12 @@ pub fn handleCumulativeTsn(self: *SackHandler, cumulative_tsn: u32) void {
 pub fn isAcked(self: *const SackHandler, tsn: u32) bool {
     if (Helper.tsnLte(tsn, self.cumulative_tsn)) return true;
     if (Helper.tsnGt(tsn, self.highest_tsn_received)) return false;
-    const index: u16 = @truncate(tsn);
-    return self.isBitSet(index);
+    return self.isBitSet(bitIndex(tsn));
 }
 
 fn setRange(self: *SackHandler, start_tsn: u32, end_tsn: u32, value: bool) void {
-    const start_index: u16 = @truncate(start_tsn);
-    const end_index: u16 = @truncate(end_tsn);
+    const start_index = bitIndex(start_tsn);
+    const end_index = bitIndex(end_tsn);
 
     if (start_index <= end_index) {
         self.bitmap.setRangeValue(.{ .start = start_index, .end = @as(usize, end_index) + 1 }, value);
@@ -66,6 +65,10 @@ fn setRange(self: *SackHandler, start_tsn: u32, end_tsn: u32, value: bool) void 
         self.bitmap.setRangeValue(.{ .start = start_index, .end = bitmap_bits }, value);
         self.bitmap.setRangeValue(.{ .start = 0, .end = @as(usize, end_index) + 1 }, value);
     }
+}
+
+fn bitIndex(tsn: u32) u16 {
+    return @intCast(tsn % bitmap_bits);
 }
 
 inline fn isBitSet(self: *const SackHandler, index: u16) bool {

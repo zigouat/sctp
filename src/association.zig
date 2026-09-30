@@ -444,7 +444,7 @@ fn isValidVerificationTag(self: *const Association, packet: *const message.Packe
     if (packet.chunks.len < 2) return packet.verification_tag == self.verification_tag;
     const reflected = packet.chunks[1] & 0x01 != 0;
     return switch (@as(message.ChunkType, @enumFromInt(packet.chunks[0]))) {
-        .init => true,
+        .init => packet.verification_tag == 0,
         .abort, .shutdown_complete => packet.verification_tag == if (reflected) self.peer_verification_tag else self.verification_tag,
         else => packet.verification_tag == self.verification_tag,
     };

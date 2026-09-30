@@ -5,7 +5,7 @@ const Helper = @import("helper.zig");
 
 const SackGenerator = @This();
 
-pub const bitmap_bits = 65536;
+pub const bitmap_bits = 1024;
 pub const max_duplicates = 16;
 
 cumulative_tsn: u32,
@@ -33,7 +33,7 @@ pub fn receiveTsn(self: *SackGenerator, tsn: u32) error{ OutOfWindow, Duplicate 
     const offset = tsn -% (self.cumulative_tsn +% 1);
     if (offset >= bitmap_bits - 1) return error.OutOfWindow;
 
-    const index: u16 = @truncate(tsn);
+    const index = bitIndex(tsn);
     if (self.isBitSet(index)) {
         self.recordDuplicate(tsn);
         return error.Duplicate;
@@ -43,7 +43,7 @@ pub fn receiveTsn(self: *SackGenerator, tsn: u32) error{ OutOfWindow, Duplicate 
     if (Helper.tsnGt(tsn, self.highest_tsn_received)) self.highest_tsn_received = tsn;
 
     while (true) {
-        const next_index: u16 = @truncate(self.cumulative_tsn +% 1);
+        const next_index = bitIndex(self.cumulative_tsn +% 1);
         if (!self.isBitSet(next_index)) break;
         self.bitmap.unset(next_index);
         self.cumulative_tsn +%= 1;
@@ -64,16 +64,15 @@ pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) usize {
 
     var written: usize = 16;
     var gap_block_count: u16 = 0;
-    const base_index: u16 = @truncate(self.cumulative_tsn);
     const limit = self.gapScanLimit();
     var offset: u32 = 1;
     while (offset < limit) : (offset += 1) {
-        const index: u16 = base_index +% @as(u16, @intCast(offset));
+        const index = bitIndex(self.cumulative_tsn +% offset);
         if (!self.isBitSet(index)) continue;
 
         const start = offset;
         while (offset + 1 < limit and
-            self.isBitSet(base_index +% @as(u16, @intCast(offset + 1)))) : (offset += 1)
+            self.isBitSet(bitIndex(self.cumulative_tsn +% (offset + 1)))) : (offset += 1)
         {}
 
         if (buffer.len - written < 4) break;
@@ -95,6 +94,10 @@ pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) usize {
     std.mem.writeInt(u16, buffer[14..16], duplicate_written, .big);
     std.mem.writeInt(u16, buffer[2..4], @intCast(written), .big);
     return written;
+}
+
+fn bitIndex(tsn: u32) u16 {
+    return @intCast(tsn % bitmap_bits);
 }
 
 fn isBitSet(self: *const SackGenerator, index: u16) bool {
