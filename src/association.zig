@@ -278,7 +278,7 @@ pub fn pollEvent(self: *Association) ?Event {
     return self.events.popFront();
 }
 
-pub fn pollTransmits(self: *Association, buffer: []u8, now: i64) ?[]const u8 {
+pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) ?[]const u8 {
     std.debug.assert(buffer.len >= MessageQueue.mtu);
 
     const chunk_type = while (true) {
@@ -662,15 +662,15 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
     var out: [MessageQueue.mtu]u8 = undefined;
-    while (assoc.pollTransmits(&out, 0)) |_| {}
+    while (assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
     try assoc.handleRead(testSackPacket(&buffer, assoc.verification_tag, assoc.intial_tsn -% 1, .{ 2, 2 }), 0);
     try assoc.handleTimeout(10_000);
 
-    const packet = assoc.pollTransmits(&out, 10_000).?;
+    const packet = assoc.pollTransmit(&out, 10_000).?;
     try testing.expectEqual(assoc.intial_tsn, std.mem.readInt(u32, packet[16..20], .big));
-    try testing.expectEqual(null, assoc.pollTransmits(&out, 10_000));
+    try testing.expectEqual(null, assoc.pollTransmit(&out, 10_000));
 }
 
 test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
@@ -682,7 +682,7 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
     var out: [MessageQueue.mtu]u8 = undefined;
-    _ = assoc.pollTransmits(&out, 0).?;
+    _ = assoc.pollTransmit(&out, 0).?;
 
     var buffer: [32]u8 = undefined;
     try assoc.handleRead(testSackPacket(&buffer, assoc.verification_tag, assoc.intial_tsn +% 1, null), 0);
@@ -690,7 +690,7 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
 
     try testing.expectEqual(null, assoc.pollEvent());
     try testing.expectEqual(2, assoc.message_queue.messages.items.len);
-    try testing.expect(assoc.pollTransmits(&out, 0) != null);
+    try testing.expect(assoc.pollTransmit(&out, 0) != null);
 }
 
 test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
@@ -835,7 +835,7 @@ test "Association.handleRead: out of the blue shutdown ack is answered with a re
     try testing.expectEqual(null, assoc.pollEvent());
 
     var out: [MessageQueue.mtu]u8 = undefined;
-    const packet = assoc.pollTransmits(&out, 0).?;
+    const packet = assoc.pollTransmit(&out, 0).?;
     try testing.expectEqual(assoc.verification_tag, std.mem.readInt(u32, packet[4..8], .big));
     try testing.expectEqual(@intFromEnum(message.ChunkType.shutdown_complete), packet[12]);
     try testing.expectEqual(0x01, packet[13]);
