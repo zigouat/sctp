@@ -57,7 +57,7 @@ const Transmit = union(enum) {
     shutdown_complete: bool,
 };
 
-const Timer = struct {
+const RetransmissionTimer = struct {
     srtt: u32,
     rttvar: u32,
     rto: u16,
@@ -67,7 +67,7 @@ const Timer = struct {
     rtt_start: i64,
     first_sample: bool,
 
-    const init = Timer{
+    const init = RetransmissionTimer{
         .srtt = 0,
         .rttvar = 0,
         .rto = initial_rto,
@@ -77,7 +77,7 @@ const Timer = struct {
         .first_sample = true,
     };
 
-    fn calculateRto(timer: *Timer, sack: *const SackHandler, now: i64) void {
+    fn calculateRto(timer: *RetransmissionTimer, sack: *const SackHandler, now: i64) void {
         if (timer.rtt_tsn == null) return;
         if (!sack.isAcked(timer.rtt_tsn.?)) return;
 
@@ -99,30 +99,30 @@ const Timer = struct {
         timer.rtt_start = 0;
     }
 
-    fn clearCurrentSample(timer: *Timer) void {
+    fn clearCurrentSample(timer: *RetransmissionTimer) void {
         timer.rtt_tsn = null;
         timer.rtt_start = 0;
     }
 
-    fn setDeadline(timer: *Timer, now: i64) void {
+    fn setDeadline(timer: *RetransmissionTimer, now: i64) void {
         if (timer.deadline == std.math.maxInt(i64)) timer.deadline = now + timer.rto;
     }
 
-    fn setSample(timer: *Timer, tsn: u32, now: i64) void {
+    fn setSample(timer: *RetransmissionTimer, tsn: u32, now: i64) void {
         if (timer.rtt_tsn != null) return;
         timer.rtt_tsn = tsn;
         timer.rtt_start = now;
     }
 
-    fn restart(timer: *Timer, now: i64) void {
+    fn restart(timer: *RetransmissionTimer, now: i64) void {
         timer.deadline = now + timer.rto;
     }
 
-    fn stop(timer: *Timer) void {
+    fn stop(timer: *RetransmissionTimer) void {
         timer.deadline = std.math.maxInt(i64);
     }
 
-    fn doubleRto(timer: *Timer, now: i64) void {
+    fn doubleRto(timer: *RetransmissionTimer, now: i64) void {
         timer.rto = @min(max_init_rto * std.time.ms_per_s, timer.rto *| 2);
         timer.deadline = now + timer.rto;
     }
@@ -171,7 +171,7 @@ reassembler: Reassembler = .init(),
 transmits: std.Deque(Transmit),
 events: std.Deque(Event) = .empty,
 
-t3_timer: Timer,
+t3_timer: RetransmissionTimer,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) Association {
     const initial_tsn = config.random.int(u32);
