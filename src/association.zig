@@ -12,7 +12,8 @@ const Io = std.Io;
 const a_rwnd = 1_000_000;
 const sack_delay = 200;
 const max_init_retransmits = 8;
-const max_init_rto = 60; // in seconds
+const assoc_max_retransmits = 10;
+const max_rto = 60; // in seconds
 const max_heartbeat_info = 200;
 const initial_rto = std.time.ms_per_s;
 
@@ -67,6 +68,9 @@ const RetransmissionTimer = struct {
     rtt_start: i64,
     first_sample: bool,
 
+    // consecutive expirations, reset when the peer acknowledges new data
+    error_count: u8,
+
     const init = RetransmissionTimer{
         .srtt = 0,
         .rttvar = 0,
@@ -75,6 +79,7 @@ const RetransmissionTimer = struct {
         .rtt_tsn = null,
         .rtt_start = 0,
         .first_sample = true,
+        .error_count = 0,
     };
 
     fn calculateRto(timer: *RetransmissionTimer, sack: *const SackHandler, now: i64) void {
@@ -93,7 +98,7 @@ const RetransmissionTimer = struct {
             timer.srtt = (7 * timer.srtt +| rtt) / 8;
         }
 
-        timer.rto = @min(max_init_rto * std.time.ms_per_s, timer.srtt +| 4 *| timer.rttvar);
+        timer.rto = @min(max_rto * std.time.ms_per_s, timer.srtt +| 4 *| timer.rttvar);
         timer.rto = @max(timer.rto, initial_rto);
         timer.rtt_tsn = null;
         timer.rtt_start = 0;
@@ -122,9 +127,9 @@ const RetransmissionTimer = struct {
         timer.deadline = std.math.maxInt(i64);
     }
 
-    fn doubleRto(timer: *RetransmissionTimer, now: i64) void {
-        timer.rto = @min(max_init_rto * std.time.ms_per_s, timer.rto *| 2);
-        timer.deadline = now + timer.rto;
+    fn backoffAndRestart(timer: *RetransmissionTimer, now: i64) void {
+        timer.rto = @min(max_rto * std.time.ms_per_s, timer.rto *| 2);
+        timer.restart(now);
     }
 
     pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -325,7 +330,6 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) !void {
     };
 
     if (received_data and self.state == .shutdown_sent) {
-        self.resetInitTimer();
         try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn });
         if (self.sack_generator.cumulative_tsn != self.sack_generator.highest_tsn_received) {
             try self.pushSack();
@@ -354,17 +358,26 @@ pub fn handleTimeout(self: *Association, now: i64) !void {
         switch (self.state) {
             .cookie_wait => try self.transmits.pushBack(self.allocator, .init),
             .cookie_echoed => try self.transmits.pushBack(self.allocator, .{ .cookie_echo = self.peer_cookie }),
-            .shutdown_sent => try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn }),
-            .shutdown_ack_sent => try self.transmits.pushBack(self.allocator, .shutdown_ack),
             else => {},
         }
     }
 
     if (now >= self.sack_deadline) try self.pushSack();
 
+    // T3-rtx and T2-shutdown share the deadline, no data is in flight once shutdown starts
     if (now >= self.t3_timer.deadline) {
-        self.message_queue.retransmit_index = 0;
-        self.t3_timer.doubleRto(now);
+        self.t3_timer.error_count += 1;
+        if (self.t3_timer.error_count > assoc_max_retransmits) {
+            try self.setStateToClosed();
+            return;
+        }
+
+        switch (self.state) {
+            .shutdown_sent => try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn }),
+            .shutdown_ack_sent => try self.transmits.pushBack(self.allocator, .shutdown_ack),
+            else => self.message_queue.retransmit_index = 0,
+        }
+        self.t3_timer.backoffAndRestart(now);
         self.t3_timer.clearCurrentSample();
     }
 }
@@ -403,7 +416,8 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) ?[]const u8 {
     };
 
     switch (chunk_type) {
-        .init, .cookie_echo, .shutdown, .shutdown_ack => self.setInitTimer(now),
+        .init, .cookie_echo => self.setInitTimer(now),
+        .shutdown, .shutdown_ack => self.t3_timer.restart(now),
         else => {},
     }
 
@@ -443,6 +457,8 @@ fn releaseAcknowledged(self: *Association) !void {
 }
 
 fn updateT3Timer(self: *Association, prev_cumulative_tsn: u32, now: i64) void {
+    if (self.sack_handler.cumulative_tsn != prev_cumulative_tsn) self.t3_timer.error_count = 0;
+
     if (self.message_queue.chunks.len == 0) {
         self.t3_timer.stop();
     } else if (self.sack_handler.cumulative_tsn != prev_cumulative_tsn) {
@@ -514,7 +530,6 @@ fn handleShutdownChunk(self: *Association, cumulative_tsn: u32, now: i64) !void 
 
     if (self.state == .shutdown_sent) {
         self.state = .shutdown_ack_sent;
-        self.resetInitTimer();
         try self.transmits.pushBack(self.allocator, .shutdown_ack);
     } else {
         self.state = .shutdown_received;
@@ -572,10 +587,9 @@ fn resetInitTimer(self: *Association) void {
 
 fn setInitTimer(self: *Association, now: i64) void {
     self.init_deadline = now + @as(i64, self.init_rto) * std.time.ms_per_s;
-    self.init_rto = @min(self.init_rto * 2, max_init_rto);
+    self.init_rto = @min(self.init_rto * 2, max_rto);
     self.init_attempts += 1;
 }
-
 fn writeControlChunk(self: *Association, chunk_type: Transmit, buffer: []u8) usize {
     var written: usize = message.packet_header_size;
     self.writeCommonHeader(buffer);
