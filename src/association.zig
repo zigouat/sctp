@@ -14,6 +14,7 @@ const sack_delay = 200;
 const max_init_retransmits = 8;
 const max_init_rto = 60; // in seconds
 const max_heartbeat_info = 200;
+const initial_rto = std.time.ms_per_s;
 
 pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 
@@ -49,12 +50,96 @@ const Transmit = union(enum) {
     sack,
     cookie_ack,
     abort: u32,
-    message_retransmit: u16,
     cookie_echo: []const u8,
     heartbeat_ack: []const u8,
     shutdown: u32,
     shutdown_ack,
     shutdown_complete: bool,
+};
+
+const RetransmissionTimer = struct {
+    srtt: u32,
+    rttvar: u32,
+    rto: u16,
+    deadline: i64,
+
+    rtt_tsn: ?u32,
+    rtt_start: i64,
+    first_sample: bool,
+
+    const init = RetransmissionTimer{
+        .srtt = 0,
+        .rttvar = 0,
+        .rto = initial_rto,
+        .deadline = std.math.maxInt(i64),
+        .rtt_tsn = null,
+        .rtt_start = 0,
+        .first_sample = true,
+    };
+
+    fn calculateRto(timer: *RetransmissionTimer, sack: *const SackHandler, now: i64) void {
+        if (timer.rtt_tsn == null) return;
+        if (!sack.isAcked(timer.rtt_tsn.?)) return;
+
+        const rtt: u32 = @intCast(now - timer.rtt_start);
+        if (timer.first_sample) {
+            timer.first_sample = false;
+            timer.srtt = rtt;
+            timer.rttvar = rtt / 2;
+        } else {
+            // alpha = 1/8, beta = 1/4
+            const abs = @abs(@as(i64, timer.srtt) - rtt);
+            timer.rttvar = @intCast((3 * timer.rttvar +| abs) / 4);
+            timer.srtt = (7 * timer.srtt +| rtt) / 8;
+        }
+
+        timer.rto = @min(max_init_rto * std.time.ms_per_s, timer.srtt +| 4 *| timer.rttvar);
+        timer.rto = @max(timer.rto, initial_rto);
+        timer.rtt_tsn = null;
+        timer.rtt_start = 0;
+    }
+
+    fn clearCurrentSample(timer: *RetransmissionTimer) void {
+        timer.rtt_tsn = null;
+        timer.rtt_start = 0;
+    }
+
+    fn setDeadline(timer: *RetransmissionTimer, now: i64) void {
+        if (timer.deadline == std.math.maxInt(i64)) timer.deadline = now + timer.rto;
+    }
+
+    fn setSample(timer: *RetransmissionTimer, tsn: u32, now: i64) void {
+        if (timer.rtt_tsn != null) return;
+        timer.rtt_tsn = tsn;
+        timer.rtt_start = now;
+    }
+
+    fn restart(timer: *RetransmissionTimer, now: i64) void {
+        timer.deadline = now + timer.rto;
+    }
+
+    fn stop(timer: *RetransmissionTimer) void {
+        timer.deadline = std.math.maxInt(i64);
+    }
+
+    fn doubleRto(timer: *RetransmissionTimer, now: i64) void {
+        timer.rto = @min(max_init_rto * std.time.ms_per_s, timer.rto *| 2);
+        timer.deadline = now + timer.rto;
+    }
+
+    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print(
+            "srtt: {}, rttvar: {}, rto: {}, t3_deadline: {}, rtt_tsn: {?}, rtt_start: {}",
+            .{
+                self.srtt,
+                self.rttvar,
+                self.rto,
+                self.deadline,
+                self.rtt_tsn,
+                self.rtt_start,
+            },
+        );
+    }
 };
 
 allocator: std.mem.Allocator,
@@ -86,6 +171,8 @@ reassembler: Reassembler = .init(),
 transmits: std.Deque(Transmit),
 events: std.Deque(Event) = .empty,
 
+t3_timer: RetransmissionTimer,
+
 pub fn init(allocator: std.mem.Allocator, config: Config) Association {
     const initial_tsn = config.random.int(u32);
 
@@ -111,6 +198,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .sack_generator = undefined,
         .sack_handler = .init(initial_tsn),
         .message_queue = .init(initial_tsn),
+        .t3_timer = .init,
     };
 }
 
@@ -209,13 +297,17 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) !void {
                 try self.events.pushBack(self.allocator, .{ .message = msg });
             }
         },
-        .sack => |sack| {
-            self.sack_handler.handleSack(&sack, self.message_queue.next_tsn -% 1) catch continue;
-            self.rwnd = sack.a_rwnd;
-            while (self.message_queue.dropAcknowledged(self.sack_handler.cumulative_tsn)) |d| {
-                try self.events.pushBack(self.allocator, .{ .release = d });
-            }
-            try self.maybeSendShutdown();
+        .sack => |sack| switch (self.state) {
+            .established, .shutdown_pending, .shutdown_received, .cookie_echoed => {
+                const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
+                self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch continue;
+                self.rwnd = sack.a_rwnd;
+                try self.releaseAcknowledged();
+                try self.maybeSendShutdown();
+                self.t3_timer.calculateRto(&self.sack_handler, now);
+                self.updateT3Timer(prev_cumulative_tsn, now);
+            },
+            else => {},
         },
         .heartbeat => |hb| if (self.state == .established and hb.len <= max_heartbeat_info) {
             try self.transmits.pushBack(self.allocator, .{ .heartbeat_ack = hb });
@@ -224,7 +316,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) !void {
             try self.setStateToClosed();
             return;
         },
-        .shutdown => |cumulative_tsn| try self.handleShutdownChunk(cumulative_tsn),
+        .shutdown => |cumulative_tsn| try self.handleShutdownChunk(cumulative_tsn, now),
         .shutdown_ack => try self.handleShutdownAck(),
         .shutdown_complete => if (self.state == .shutdown_ack_sent) {
             try self.setStateToClosed();
@@ -270,8 +362,11 @@ pub fn handleTimeout(self: *Association, now: i64) !void {
 
     if (now >= self.sack_deadline) try self.pushSack();
 
-    var it = self.message_queue.handleTimeout(now);
-    while (it.next()) |index| try self.transmits.pushBack(self.allocator, .{ .message_retransmit = @intCast(index) });
+    if (now >= self.t3_timer.deadline) {
+        self.message_queue.retransmit_index = 0;
+        self.t3_timer.doubleRto(now);
+        self.t3_timer.clearCurrentSample();
+    }
 }
 
 pub fn pollEvent(self: *Association) ?Event {
@@ -281,34 +376,30 @@ pub fn pollEvent(self: *Association) ?Event {
 pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) ?[]const u8 {
     std.debug.assert(buffer.len >= MessageQueue.mtu);
 
-    const chunk_type = while (true) {
-        if (self.message_queue.nextRetransmit(&self.sack_handler, buffer[message.packet_header_size..])) |msg| {
+    const chunk_type = self.transmits.popFront() orelse {
+        if (self.message_queue.nextRetransmit(&self.sack_handler, buffer[message.packet_header_size..])) |written| {
             self.writeCommonHeader(buffer);
-            const packet = buffer[0 .. message.packet_header_size + msg.len];
+            const packet = buffer[0 .. message.packet_header_size + written];
             Helper.checkSum(packet);
             return packet;
         }
 
-        const transmit = self.transmits.popFront() orelse {
-            switch (self.state) {
-                .established, .shutdown_received, .shutdown_pending => {},
-                else => return null,
-            }
-
-            const next_msg = self.message_queue.next(buffer[message.packet_header_size..], now) orelse return null;
-            self.writeCommonHeader(buffer);
-            const packet = buffer[0 .. message.packet_header_size + next_msg.len];
-            Helper.checkSum(packet);
-            return packet;
-        };
-
-        switch (transmit) {
-            .message_retransmit => |index| {
-                self.message_queue.retrasmit_message = index;
-                self.message_queue.retransmit_tsn = self.message_queue.messages.items[index].start_tsn;
-            },
-            else => break transmit,
+        switch (self.state) {
+            .established, .shutdown_received, .shutdown_pending => {},
+            else => return null,
         }
+
+        const written = self.message_queue.nextChunk(
+            self.allocator,
+            buffer[message.packet_header_size..],
+        ) orelse return null;
+        self.writeCommonHeader(buffer);
+        const packet = buffer[0 .. message.packet_header_size + written];
+        Helper.checkSum(packet);
+
+        self.t3_timer.setDeadline(now);
+        self.t3_timer.setSample(self.message_queue.curr_tsn -% 1, now);
+        return packet;
     };
 
     switch (chunk_type) {
@@ -321,15 +412,15 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) ?[]const u8 {
 }
 
 pub fn pollTimeout(self: *Association) ?i64 {
-    const deadline = @min(@min(self.sack_deadline, self.init_deadline), self.message_queue.pollTimeout());
+    const deadline = @min(@min(self.sack_deadline, self.init_deadline), self.t3_timer.deadline);
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
 fn setStateToClosed(self: *Association) !void {
-    const pending_messages = self.message_queue.messages.items.len;
+    const pending_messages = self.message_queue.messages.len;
     try self.events.ensureUnusedCapacity(self.allocator, pending_messages + 1);
 
-    for (self.message_queue.messages.items) |msg| self.events.pushBackAssumeCapacity(.{ .release = msg.data });
+    while (self.message_queue.messages.popFront()) |msg| self.events.pushBackAssumeCapacity(.{ .release = msg.data });
     self.events.pushBackAssumeCapacity(.comm_down);
 
     self.state = .closed;
@@ -340,6 +431,23 @@ fn setStateToClosed(self: *Association) !void {
     self.resetInitTimer();
     self.message_queue.close(self.allocator, self.intial_tsn);
     self.reassembler.reset(self.allocator);
+    self.t3_timer = .init;
+}
+
+fn releaseAcknowledged(self: *Association) !void {
+    while (true) {
+        try self.events.ensureUnusedCapacity(self.allocator, 1);
+        const data = self.message_queue.dropAcknowledged(self.sack_handler.cumulative_tsn) orelse break;
+        self.events.pushBackAssumeCapacity(.{ .release = data });
+    }
+}
+
+fn updateT3Timer(self: *Association, prev_cumulative_tsn: u32, now: i64) void {
+    if (self.message_queue.chunks.len == 0) {
+        self.t3_timer.stop();
+    } else if (self.sack_handler.cumulative_tsn != prev_cumulative_tsn) {
+        self.t3_timer.restart(now);
+    }
 }
 
 fn setStateToEstablished(self: *Association) !void {
@@ -392,17 +500,17 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     self.transmits.pushBackAssumeCapacity(.{ .cookie_echo = self.peer_cookie });
 }
 
-fn handleShutdownChunk(self: *Association, cumulative_tsn: u32) !void {
+fn handleShutdownChunk(self: *Association, cumulative_tsn: u32, now: i64) !void {
     switch (self.state) {
         .established, .shutdown_pending, .shutdown_received, .shutdown_sent => {},
         else => return,
     }
-    if (Helper.tsnGt(cumulative_tsn, self.message_queue.next_tsn -% 1)) return;
+    if (Helper.tsnGt(cumulative_tsn, self.message_queue.curr_tsn -% 1)) return;
 
+    const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
     self.sack_handler.handleCumulativeTsn(cumulative_tsn);
-    while (self.message_queue.dropAcknowledged(self.sack_handler.cumulative_tsn)) |d| {
-        try self.events.pushBack(self.allocator, .{ .release = d });
-    }
+    try self.releaseAcknowledged();
+    self.updateT3Timer(prev_cumulative_tsn, now);
 
     if (self.state == .shutdown_sent) {
         self.state = .shutdown_ack_sent;
@@ -489,7 +597,6 @@ fn writeControlChunk(self: *Association, chunk_type: Transmit, buffer: []u8) usi
         .shutdown => |tsn| writeShutdown(buffer[written..], tsn),
         .shutdown_ack => writeShutdownAck(buffer[written..]),
         .shutdown_complete => |reflected| writeShutdownComplete(buffer[written..], reflected),
-        else => unreachable,
     };
 
     Helper.checkSum(buffer[0..written]);
@@ -673,6 +780,32 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
     try testing.expectEqual(null, assoc.pollTransmit(&out, 10_000));
 }
 
+test "Association.pollTransmit: control chunks are sent before retransmissions" {
+    var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
+    defer assoc.deinit();
+    assoc.peer_initial_tsn = 100;
+    try assoc.setStateToEstablished();
+    _ = assoc.pollEvent();
+
+    try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+    var out: [MessageQueue.mtu]u8 = undefined;
+    while (assoc.pollTransmit(&out, 0)) |_| {}
+
+    var buffer: [32]u8 = undefined;
+    try assoc.handleRead(testDataPacket(&buffer, assoc.verification_tag, 100), 0);
+    assoc.pollEvent().?.message.deinit(testing.allocator);
+
+    // both the delayed sack and T3 expire
+    try assoc.handleTimeout(10_000);
+
+    const sack = assoc.pollTransmit(&out, 10_000).?;
+    try testing.expectEqual(@intFromEnum(message.ChunkType.sack), sack[12]);
+
+    const retransmit = assoc.pollTransmit(&out, 10_000).?;
+    try testing.expectEqual(@intFromEnum(message.ChunkType.data), retransmit[12]);
+    try testing.expectEqual(assoc.intial_tsn, std.mem.readInt(u32, retransmit[16..20], .big));
+}
+
 test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     var assoc = Association.init(testing.allocator, .{ .source_port = 5000, .dest_port = 5000, .random = test_prng.random() });
     defer assoc.deinit();
@@ -689,7 +822,7 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     try assoc.handleRead(testSackPacket(&buffer, assoc.verification_tag, assoc.intial_tsn -% 1, .{ 1, 2 }), 0);
 
     try testing.expectEqual(null, assoc.pollEvent());
-    try testing.expectEqual(2, assoc.message_queue.messages.items.len);
+    try testing.expectEqual(2, assoc.message_queue.messages.len);
     try testing.expect(assoc.pollTransmit(&out, 0) != null);
 }
 
@@ -714,7 +847,7 @@ test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
     try assoc.handleRead(&buffer, 0);
 
     try testing.expectEqual(.established, assoc.state);
-    try testing.expectEqual(1, assoc.message_queue.messages.items.len);
+    try testing.expectEqual(1, assoc.message_queue.messages.len);
 }
 
 test "Association.handleRead: Abort with the T bit and the peer tag closes the association" {
