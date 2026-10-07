@@ -13,6 +13,7 @@ const UserMessage = struct {
     stream_id: u16,
     stream_seq: u16,
     ppid: u32,
+    unordered: bool,
 };
 
 streams_seq: std.AutoHashMapUnmanaged(u16, u16),
@@ -62,9 +63,10 @@ pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const
         .highest_tsn = 0,
         .ppid = config.ppid,
         .stream_id = config.stream_id,
-        .stream_seq = result.value_ptr.*,
+        .stream_seq = if (config.unordered) 0 else result.value_ptr.*,
+        .unordered = config.unordered,
     });
-    result.value_ptr.* +%= 1;
+    if (!config.unordered) result.value_ptr.* +%= 1;
 }
 
 pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) ?usize {
@@ -78,6 +80,7 @@ pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8
         .flags = .{
             .start_fragment = self.message_offset == 0,
             .end_fragment = self.message_offset + payload_size == msg.data.len,
+            .unordered = msg.unordered,
         },
         .tsn = self.curr_tsn,
         .ppid = msg.ppid,
@@ -149,4 +152,25 @@ pub fn dropAcknowledged(self: *MessageQueue, ack_tsn: u32) ?[]const u8 {
 
 pub fn isEmpty(self: *const MessageQueue) bool {
     return self.messages.len == 0;
+}
+
+const testing = std.testing;
+
+test "MessageQueue.pushData: unordered data does not increment stream sequence number" {
+    var msg_queue = MessageQueue.init(0x12345678);
+    defer msg_queue.deinit(testing.allocator);
+
+    try msg_queue.pushData(testing.allocator, "Hello", .{
+        .ppid = 42,
+        .stream_id = 100,
+        .unordered = false,
+    });
+    try testing.expectEqual(1, msg_queue.streams_seq.get(100).?);
+
+    try msg_queue.pushData(testing.allocator, "World", .{
+        .ppid = 43,
+        .stream_id = 1,
+        .unordered = true,
+    });
+    try testing.expectEqual(1, msg_queue.streams_seq.get(100).?);
 }
