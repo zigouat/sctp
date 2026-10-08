@@ -37,14 +37,16 @@ pub fn init(initial_tsn: u32) MessageQueue {
 }
 
 pub fn deinit(self: *MessageQueue, allocator: std.mem.Allocator) void {
+    while (self.messages.popFront()) |msg| allocator.free(msg.data);
     self.streams_seq.deinit(allocator);
-    self.messages.deinit(allocator);
     self.chunks.deinit(allocator);
+    self.messages.deinit(allocator);
 }
 
 pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32) void {
     self.streams_seq.clearAndFree(allocator);
     while (self.chunks.popFront()) |_| {}
+    while (self.messages.popFront()) |msg| allocator.free(msg.data);
     self.curr_tsn = initial_tsn;
     self.curr_msg = 0;
     self.message_offset = 0;
@@ -54,12 +56,13 @@ pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32
 pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const u8, config: message.UserMessageConfig) !void {
     try self.messages.ensureUnusedCapacity(allocator, 1);
     try self.streams_seq.ensureUnusedCapacity(allocator, 1);
+    const data_copy = try allocator.dupe(u8, data);
 
     const result = self.streams_seq.getOrPutAssumeCapacity(config.stream_id);
     if (!result.found_existing) result.value_ptr.* = 0;
 
     self.messages.pushBackAssumeCapacity(.{
-        .data = data,
+        .data = data_copy,
         .highest_tsn = 0,
         .ppid = config.ppid,
         .stream_id = config.stream_id,
@@ -124,8 +127,8 @@ pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buf
     }
 }
 
-pub fn dropAcknowledged(self: *MessageQueue, ack_tsn: u32) ?[]const u8 {
-    if (self.isEmpty()) return null;
+pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_tsn: u32) void {
+    if (self.isEmpty()) return;
 
     var dropped: u32 = 0;
     while (self.chunks.frontPtr()) |chunk| {
@@ -138,16 +141,13 @@ pub fn dropAcknowledged(self: *MessageQueue, ack_tsn: u32) ?[]const u8 {
     if (self.retransmit_index) |*index| index.* -|= dropped;
 
     // only release messages whose fragments have all been sent
-    if (self.curr_msg == 0) return null;
+    if (self.curr_msg == 0) return;
 
-    if (self.messages.frontPtr()) |msg| if (Helper.tsnLte(msg.highest_tsn, ack_tsn)) {
-        const data = msg.data;
+    while (self.messages.frontPtr()) |msg| {
+        if (!Helper.tsnLte(msg.highest_tsn, ack_tsn)) break;
+        allocator.free(msg.data);
         _ = self.messages.popFront();
-        self.curr_msg -= 1;
-        return data;
-    };
-
-    return null;
+    }
 }
 
 pub fn isEmpty(self: *const MessageQueue) bool {

@@ -29,7 +29,6 @@ pub const Config = struct {
 
 pub const Event = union(enum) {
     message: message.UserMessage,
-    release: []const u8,
     comm_up: void,
     comm_down: void,
 };
@@ -307,10 +306,10 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) !void {
                 const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
                 self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch continue;
                 self.rwnd = sack.a_rwnd;
-                try self.releaseAcknowledged();
-                try self.maybeSendShutdown();
+                self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
                 self.t3_timer.calculateRto(&self.sack_handler, now);
                 self.updateT3Timer(prev_cumulative_tsn, now);
+                try self.maybeSendShutdown();
             },
             else => {},
         },
@@ -431,12 +430,7 @@ pub fn pollTimeout(self: *Association) ?i64 {
 }
 
 fn setStateToClosed(self: *Association) !void {
-    const pending_messages = self.message_queue.messages.len;
-    try self.events.ensureUnusedCapacity(self.allocator, pending_messages + 1);
-
-    while (self.message_queue.messages.popFront()) |msg| self.events.pushBackAssumeCapacity(.{ .release = msg.data });
-    self.events.pushBackAssumeCapacity(.comm_down);
-
+    try self.events.pushBack(self.allocator, .comm_down);
     self.state = .closed;
     self.sack_generator = .init(0);
     self.sack_handler = .init(self.initial_tsn);
@@ -446,14 +440,6 @@ fn setStateToClosed(self: *Association) !void {
     self.message_queue.close(self.allocator, self.initial_tsn);
     self.reassembler.reset(self.allocator);
     self.t3_timer = .init;
-}
-
-fn releaseAcknowledged(self: *Association) !void {
-    while (true) {
-        try self.events.ensureUnusedCapacity(self.allocator, 1);
-        const data = self.message_queue.dropAcknowledged(self.sack_handler.cumulative_tsn) orelse break;
-        self.events.pushBackAssumeCapacity(.{ .release = data });
-    }
 }
 
 fn updateT3Timer(self: *Association, prev_cumulative_tsn: u32, now: i64) void {
@@ -527,7 +513,7 @@ fn handleShutdownChunk(self: *Association, cumulative_tsn: u32, now: i64) !void 
 
     const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
     self.sack_handler.handleCumulativeTsn(cumulative_tsn, self.message_queue.curr_tsn -% 1);
-    try self.releaseAcknowledged();
+    self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
     self.updateT3Timer(prev_cumulative_tsn, now);
 
     if (self.state == .shutdown_sent) {
