@@ -147,6 +147,7 @@ pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_t
         if (!Helper.tsnLte(msg.highest_tsn, ack_tsn)) break;
         allocator.free(msg.data);
         _ = self.messages.popFront();
+        self.curr_msg -= 1;
     }
 }
 
