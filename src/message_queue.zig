@@ -5,19 +5,8 @@ const Helper = @import("helper.zig");
 const MessageQueue = @This();
 const SackHandler = @import("sack_handler.zig");
 
-pub const mtu = 1200;
-
-const UserMessage = struct {
-    data: []const u8,
-    highest_tsn: u32,
-    stream_id: u16,
-    stream_seq: u16,
-    ppid: u32,
-    unordered: bool,
-};
-
 streams_seq: std.AutoHashMapUnmanaged(u16, u16),
-messages: std.Deque(UserMessage),
+messages: std.Deque(message.UserMessage),
 chunks: std.Deque(message.Data),
 curr_tsn: u32,
 curr_msg: u32,
@@ -63,7 +52,6 @@ pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const
 
     self.messages.pushBackAssumeCapacity(.{
         .data = data_copy,
-        .highest_tsn = 0,
         .ppid = config.ppid,
         .stream_id = config.stream_id,
         .stream_seq = if (config.unordered) 0 else result.value_ptr.*,
@@ -94,7 +82,6 @@ pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8
     self.chunks.pushBackAssumeCapacity(chunk);
     self.curr_tsn +%= 1;
 
-    msg.highest_tsn = chunk.tsn;
     if (chunk.flags.end_fragment) {
         self.curr_msg += 1;
         self.message_offset = 0;
@@ -132,23 +119,19 @@ pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_t
 
     var dropped: u32 = 0;
     while (self.chunks.frontPtr()) |chunk| {
-        if (Helper.tsnLte(chunk.tsn, ack_tsn)) {
-            _ = self.chunks.popFront();
-            dropped += 1;
-        } else break;
+        if (!Helper.tsnLte(chunk.tsn, ack_tsn)) break;
+
+        if (chunk.flags.end_fragment) {
+            const msg = self.messages.popFront().?;
+            allocator.free(msg.data);
+            self.curr_msg -= 1;
+        }
+
+        _ = self.chunks.popFront();
+        dropped += 1;
     }
 
     if (self.retransmit_index) |*index| index.* -|= dropped;
-
-    // only release messages whose fragments have all been sent
-    if (self.curr_msg == 0) return;
-
-    while (self.messages.frontPtr()) |msg| {
-        if (!Helper.tsnLte(msg.highest_tsn, ack_tsn)) break;
-        allocator.free(msg.data);
-        _ = self.messages.popFront();
-        self.curr_msg -= 1;
-    }
 }
 
 pub fn isEmpty(self: *const MessageQueue) bool {
