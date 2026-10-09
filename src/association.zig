@@ -171,7 +171,7 @@ send_sack: bool = false,
 sack_deadline: i64 = std.math.maxInt(i64),
 
 message_queue: MessageQueue,
-reassembler: Reassembler = .init(),
+reassembler: Reassembler,
 transmits: std.Deque(Transmit),
 events: std.Deque(Event) = .empty,
 
@@ -196,6 +196,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .peer_cookie = &.{},
         .rwnd = 0,
         .cwnd = a_rwnd,
+        .reassembler = .init(a_rwnd),
         .init_attempts = 0,
         .init_rto = 1,
         .init_deadline = std.math.maxInt(i64),
@@ -386,7 +387,7 @@ pub fn pollEvent(self: *Association) ?Event {
 }
 
 pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) ?[]const u8 {
-    std.debug.assert(buffer.len >= MessageQueue.mtu);
+    std.debug.assert(buffer.len >= message.mtu);
 
     const chunk_type = self.transmits.popFront() orelse {
         if (self.message_queue.nextRetransmit(&self.sack_handler, buffer[message.packet_header_size..])) |written| {
@@ -606,8 +607,7 @@ fn writeControlChunk(self: *Association, chunk_type: Transmit, buffer: []u8) usi
 }
 
 fn writeSack(self: *Association, buffer: []u8) usize {
-    const wnd = a_rwnd -| self.reassembler.buffered_data;
-    const written = self.sack_generator.writeSack(buffer, wnd);
+    const written = self.sack_generator.writeSack(buffer, self.reassembler.advertised_wnd);
     self.sack_generator.clearDuplicates();
     return written;
 }
@@ -777,7 +777,7 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
-    var out: [MessageQueue.mtu]u8 = undefined;
+    var out: [message.mtu]u8 = undefined;
     while (assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
@@ -797,7 +797,7 @@ test "Association.pollTransmit: control chunks are sent before retransmissions" 
     _ = assoc.pollEvent();
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
-    var out: [MessageQueue.mtu]u8 = undefined;
+    var out: [message.mtu]u8 = undefined;
     while (assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
@@ -823,7 +823,7 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
-    var out: [MessageQueue.mtu]u8 = undefined;
+    var out: [message.mtu]u8 = undefined;
     _ = assoc.pollTransmit(&out, 0).?;
 
     var buffer: [32]u8 = undefined;
@@ -970,7 +970,7 @@ test "Association.handleRead: out of the blue shutdown ack is answered with a re
     try testing.expectEqual(.closed, assoc.state);
     try testing.expectEqual(null, assoc.pollEvent());
 
-    var out: [MessageQueue.mtu]u8 = undefined;
+    var out: [message.mtu]u8 = undefined;
     const packet = assoc.pollTransmit(&out, 0).?;
     try testing.expectEqual(assoc.verification_tag, std.mem.readInt(u32, packet[4..8], .big));
     try testing.expectEqual(@intFromEnum(message.ChunkType.shutdown_complete), packet[12]);
