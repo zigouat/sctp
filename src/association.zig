@@ -280,20 +280,28 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) !void {
                 else => break,
             }
 
-            received_data = true;
-
             if (d.user_data.len == 0) {
                 try self.transmits.pushBack(self.allocator, .{ .abort = d.tsn });
                 try self.setStateToClosed();
                 return;
             }
 
-            self.sack_generator.receiveTsn(d.tsn) catch |err| {
-                std.log.warn("Error for packet {}: {}", .{ d.tsn, err });
-                immediate_sack = true;
-                continue;
+            received_data = true;
+            self.sack_generator.checkTsn(d.tsn) catch |err| switch (err) {
+                error.Duplicate => {
+                    immediate_sack = true;
+                    continue;
+                },
+                else => continue,
             };
 
+            if (self.reassembler.advertised_wnd == 0) {
+                @branchHint(.unlikely);
+                if (!self.dropChunkWithHighestTsn(d)) continue;
+                immediate_sack = true;
+            }
+
+            self.sack_generator.receiveTsn(d.tsn);
             immediate_sack |= d.flags.immediate;
 
             try self.reassembler.receiveData(self.allocator, d);
@@ -578,6 +586,7 @@ fn setInitTimer(self: *Association, now: i64) void {
     self.init_rto = @min(self.init_rto * 2, max_rto);
     self.init_attempts += 1;
 }
+
 fn writeControlChunk(self: *Association, chunk_type: Transmit, buffer: []u8) usize {
     var written: usize = message.packet_header_size;
     self.writeCommonHeader(buffer);
@@ -705,6 +714,20 @@ fn writeCommonHeader(self: *const Association, buffer: []u8) void {
     std.mem.writeInt(u32, buffer[8..12], 0, .big); // checksum
 }
 
+fn dropChunkWithHighestTsn(self: *Association, d: message.Data) bool {
+    if (Helper.tsnLte(d.tsn, self.sack_generator.cumulative_tsn) or
+        Helper.tsnLte(self.sack_generator.highest_tsn_received, d.tsn)) return false;
+
+    var high = self.sack_generator.highest_tsn_received;
+    while (Helper.tsnGt(high, d.tsn)) : (high -%= 1) {
+        if (!self.reassembler.dropChunk(self.allocator, high)) continue;
+        self.sack_generator.reneg(high);
+        return true;
+    }
+
+    return false;
+}
+
 const testing = std.testing;
 
 var test_prng = std.Random.DefaultPrng.init(0);
@@ -716,6 +739,7 @@ fn testAssoc() Association {
         .random = test_prng.random(),
     });
     assoc.peer_verification_tag = assoc.verification_tag;
+    assoc.peer_initial_tsn = assoc.initial_tsn;
     return assoc;
 }
 
@@ -747,6 +771,13 @@ fn testDataPacket(buffer: *[32]u8, vtag: u32, tsn: u32) []const u8 {
     _ = data.write(buffer[message.packet_header_size..]);
     Helper.checkSum(buffer);
     return buffer;
+}
+
+fn testDataPacket2(assoc: *const Association, data: message.Data, buffer: []u8) []const u8 {
+    assoc.writeCommonHeader(buffer);
+    const written = data.write(buffer[message.packet_header_size..]);
+    Helper.checkSum(buffer[0 .. message.packet_header_size + written]);
+    return buffer[0 .. message.packet_header_size + written];
 }
 
 fn testSackPacket(buffer: *[32]u8, assoc: *const Association, cumulative_tsn: u32, gaps: []const u16) []const u8 {
@@ -993,6 +1024,69 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 });
     try assoc.handleRead(sack, 10);
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
+}
+
+test "Association.handleRead: zero receive window drops or reneg chunks" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    assoc.reassembler = .init(100);
+    try assoc.setStateToEstablished();
+    _ = assoc.pollEvent();
+
+    var buffer: [1024]u8 = undefined;
+    const payload: [100]u8 = @splat(0xAA);
+    const tsn = assoc.initial_tsn;
+
+    var data = message.Data{
+        .flags = .{ .start_fragment = true, .end_fragment = true },
+        .ppid = 0,
+        .stream_id = 1,
+        .stream_seq = 1,
+        .tsn = tsn +% 1,
+        .user_data = payload[0..60],
+    };
+
+    // ssn 1 waits for ssn 0
+    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 0);
+    try testing.expect(assoc.reassembler.pending.contains(tsn +% 1));
+    try testing.expectEqual(40, assoc.reassembler.advertised_wnd);
+
+    // unordered message is delivered right away and closes the window
+    data.tsn = tsn +% 3;
+    data.flags.unordered = true;
+    data.user_data = payload[0..40];
+    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 1);
+    try testing.expectEqual(0, assoc.reassembler.advertised_wnd);
+    try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
+
+    // a tsn above the highest one is dropped
+    data.tsn = tsn +% 4;
+    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 2);
+    try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
+
+    // the higher tsns are already delivered or never received, nothing to reneg
+    data.tsn = tsn +% 2;
+    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 3);
+    try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
+    try testing.expectEqual(tsn -% 1, assoc.sack_generator.cumulative_tsn);
+
+    // ssn 1 held for reordering is reneged to accept ssn 0
+    data.tsn = tsn;
+    data.flags.unordered = false;
+    data.stream_seq = 0;
+    data.user_data = payload[0..10];
+    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 4);
+    try testing.expect(!assoc.reassembler.pending.contains(tsn +% 1));
+    try testing.expectEqual(tsn, assoc.sack_generator.cumulative_tsn);
+    try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
+
+    // the unordered and the ssn 0 messages are delivered
+    for ([_]usize{ 40, 10 }) |len| {
+        const event = assoc.pollEvent().?;
+        defer event.message.deinit(testing.allocator);
+        try testing.expectEqual(len, event.message.data.len);
+    }
+    try testing.expect(assoc.pollEvent() == null);
 }
 
 test "Association.shutdown: an empty queue sends a shutdown right away" {

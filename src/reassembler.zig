@@ -76,6 +76,17 @@ pub fn drainReady(self: *Reassembler) ?UserMessage {
     return null;
 }
 
+pub fn dropChunk(self: *Reassembler, allocator: std.mem.Allocator, tsn: u32) bool {
+    if (self.pending.fetchRemove(tsn)) |d| {
+        allocator.free(d.value.user_data);
+        self.buffered_data -= @intCast(d.value.user_data.len);
+        self.updateAdvertisedWindow();
+        return true;
+    }
+
+    return false;
+}
+
 fn storeChunk(self: *Reassembler, allocator: std.mem.Allocator, d: message.Data) !bool {
     try self.ready.ensureUnusedCapacity(allocator, 1);
     try self.pending.ensureUnusedCapacity(allocator, 1);
@@ -458,4 +469,29 @@ test "Reassembler.receiveData: lazy reassembly of ordered messages" {
         defer msg.deinit(testing.allocator);
         try testing.expectEqualStrings(expected, msg.data);
     }
+}
+
+test "Reassembler.dropChunk: drops only chunks held for reordering" {
+    var r = Reassembler.init(100);
+    defer r.deinit(testing.allocator);
+
+    const payload: [60]u8 = @splat(0xAA);
+    try r.receiveData(testing.allocator, testData(2, 0, 1, .{ .start_fragment = true, .end_fragment = true }, &payload));
+    try r.receiveData(testing.allocator, testData(3, 1, 0, .{ .start_fragment = true, .end_fragment = true }, payload[0..40]));
+    try testing.expectEqual(0, r.advertised_wnd);
+
+    // ready messages are not held for reordering
+    try testing.expect(!r.dropChunk(testing.allocator, 3));
+    try testing.expect(!r.dropChunk(testing.allocator, 4));
+
+    try testing.expect(r.dropChunk(testing.allocator, 2));
+    try testing.expect(!r.pending.contains(2));
+    try testing.expectEqual(40, r.buffered_data);
+    try testing.expectEqual(60, r.advertised_wnd);
+
+    // the dropped chunk can be received again
+    try r.receiveData(testing.allocator, testData(2, 0, 1, .{ .start_fragment = true, .end_fragment = true }, &payload));
+    try r.receiveData(testing.allocator, testData(1, 0, 0, .{ .start_fragment = true, .end_fragment = true }, payload[0..10]));
+    try testing.expectEqual(0, r.pending.count());
+    try testing.expectEqual(3, r.ready.len);
 }
