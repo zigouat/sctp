@@ -28,9 +28,16 @@ pub const Config = struct {
 };
 
 pub const Event = union(enum) {
-    message: message.UserMessage,
     comm_up: void,
     comm_down: void,
+};
+
+pub const MessageIterator = struct {
+    assoc: *Association,
+
+    pub fn next(it: *MessageIterator) ?message.UserMessage {
+        return it.assoc.reassembler.drainReady();
+    }
 };
 
 const InnerState = enum {
@@ -209,10 +216,6 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
 
 pub fn deinit(self: *Association) void {
     self.transmits.deinit(self.allocator);
-    while (self.events.popFront()) |event| switch (event) {
-        .message => |msg| msg.deinit(self.allocator),
-        else => {},
-    };
     self.events.deinit(self.allocator);
     self.reassembler.deinit(self.allocator);
     self.message_queue.deinit(self.allocator);
@@ -241,110 +244,124 @@ pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMe
     try self.message_queue.pushData(self.allocator, data, options);
 }
 
-pub fn handleRead(self: *Association, data: []const u8, now: i64) !void {
+/// Handle an incoming sctp packet.
+///
+/// The return value is an iterator over the messages that have been fully reassembled and are ready to be read.
+///
+/// Back-pressure can be implemented by not reading from the iterator. Reading messages will open the receive window and the
+/// assocation can accept more message from the sender.
+pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ InvalidPacket, OutOfMemory }!?MessageIterator {
     const packet = try message.Packet.parse(data);
 
     if (packet.source_port != self.dest_port or packet.destination_port != self.source_port) {
         @branchHint(.unlikely);
-        return;
+        return null;
     }
 
     if (!self.isValidVerificationTag(&packet)) {
         @branchHint(.unlikely);
-        return;
+        return null;
     }
 
     var chunk_it = packet.iterateChunks();
     var received_data = false;
     var immediate_sack = false;
-    while (try chunk_it.next()) |chunk| switch (chunk) {
-        .init => |c| try self.handleInitChunk(c),
-        .init_ack => |c| switch (self.state) {
-            .cookie_wait => try self.handleInitAckChunk(c),
-            else => {},
-        },
-        .cookie_echo => |cookie| {
-            try self.transmits.ensureUnusedCapacity(self.allocator, 2);
-            if (!std.mem.eql(u8, cookie, &self.cookie)) break;
+    while (true) {
+        const chunk = chunk_it.next() catch |err| switch (err) {
+            error.InvalidChunk => break,
+            error.UnrecognizedChunkType => break, // send error chunk
+        } orelse break;
 
-            self.transmits.pushBackAssumeCapacity(.cookie_ack);
-            if (self.state == .closed) try self.setStateToEstablished();
-        },
-        .cookie_ack => if (self.state == .cookie_echoed) {
-            try self.setStateToEstablished();
-            self.resetInitTimer();
-        },
-        .data => |d| {
-            switch (self.state) {
-                .established, .shutdown_pending, .shutdown_sent => {},
-                else => break,
-            }
-
-            if (d.user_data.len == 0) {
-                try self.transmits.pushBack(self.allocator, .{ .abort = d.tsn });
-                try self.setStateToClosed();
-                return;
-            }
-
-            received_data = true;
-            self.sack_generator.checkTsn(d.tsn) catch |err| switch (err) {
-                error.Duplicate => {
-                    immediate_sack = true;
-                    continue;
+        switch (chunk) {
+            .init => |c| try self.handleInitChunk(c),
+            .init_ack => |c| switch (self.state) {
+                .cookie_wait => self.handleInitAckChunk(c) catch |err| switch (err) {
+                    error.MissingCookie => continue,
+                    error.InvalidParameter => continue,
+                    else => |e| return e,
                 },
-                else => continue,
-            };
-
-            if (self.reassembler.advertised_wnd == 0) {
-                @branchHint(.unlikely);
-                if (!self.dropChunkWithHighestTsn(d)) continue;
-                immediate_sack = true;
-            }
-
-            self.sack_generator.receiveTsn(d.tsn);
-            immediate_sack |= d.flags.immediate;
-
-            try self.reassembler.receiveData(self.allocator, d);
-            while (self.reassembler.drainReady()) |msg| {
-                try self.events.pushBack(self.allocator, .{ .message = msg });
-            }
-        },
-        .sack => |sack| switch (self.state) {
-            .established, .shutdown_pending, .shutdown_received, .cookie_echoed => {
-                const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
-                self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch continue;
-                self.rwnd = sack.a_rwnd;
-                self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
-                self.t3_timer.calculateRto(&self.sack_handler, now);
-                self.updateT3Timer(prev_cumulative_tsn, now);
-                try self.maybeSendShutdown();
+                else => {},
             },
-            else => {},
-        },
-        .heartbeat => |hb| if (self.state == .established and hb.len <= max_heartbeat_info) {
-            try self.transmits.pushBack(self.allocator, .{ .heartbeat_ack = hb });
-        },
-        .abort => if (self.state != .closed) {
-            try self.setStateToClosed();
-            return;
-        },
-        .shutdown => |cumulative_tsn| try self.handleShutdownChunk(cumulative_tsn, now),
-        .shutdown_ack => try self.handleShutdownAck(),
-        .shutdown_complete => if (self.state == .shutdown_ack_sent) {
-            try self.setStateToClosed();
-            return;
-        },
-    };
+            .cookie_echo => |cookie| {
+                try self.transmits.ensureUnusedCapacity(self.allocator, 2);
+                if (!std.mem.eql(u8, cookie, &self.cookie)) break;
+
+                self.transmits.pushBackAssumeCapacity(.cookie_ack);
+                if (self.state == .closed) try self.setStateToEstablished();
+            },
+            .cookie_ack => if (self.state == .cookie_echoed) {
+                try self.setStateToEstablished();
+                self.resetInitTimer();
+            },
+            .data => |d| {
+                switch (self.state) {
+                    .established, .shutdown_pending, .shutdown_sent => {},
+                    else => break,
+                }
+
+                if (d.user_data.len == 0) {
+                    try self.transmits.pushBack(self.allocator, .{ .abort = d.tsn });
+                    try self.setStateToClosed();
+                    return self.messageIterator();
+                }
+
+                received_data = true;
+                self.sack_generator.checkTsn(d.tsn) catch |err| switch (err) {
+                    error.Duplicate => {
+                        immediate_sack = true;
+                        continue;
+                    },
+                    else => continue,
+                };
+
+                if (self.reassembler.advertised_wnd == 0) {
+                    @branchHint(.unlikely);
+                    if (!self.dropChunkWithHighestTsn(d)) continue;
+                    immediate_sack = true;
+                }
+
+                self.sack_generator.receiveTsn(d.tsn);
+                immediate_sack |= d.flags.immediate;
+
+                try self.reassembler.receiveData(self.allocator, d);
+            },
+            .sack => |sack| switch (self.state) {
+                .established, .shutdown_pending, .shutdown_received, .cookie_echoed => {
+                    const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
+                    self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch continue;
+                    self.rwnd = sack.a_rwnd;
+                    self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
+                    self.t3_timer.calculateRto(&self.sack_handler, now);
+                    self.updateT3Timer(prev_cumulative_tsn, now);
+                    try self.maybeSendShutdown();
+                },
+                else => {},
+            },
+            .heartbeat => |hb| if (self.state == .established and hb.len <= max_heartbeat_info) {
+                try self.transmits.pushBack(self.allocator, .{ .heartbeat_ack = hb });
+            },
+            .abort => if (self.state != .closed) {
+                try self.setStateToClosed();
+                return null;
+            },
+            .shutdown => |cumulative_tsn| try self.handleShutdownChunk(cumulative_tsn, now),
+            .shutdown_ack => try self.handleShutdownAck(),
+            .shutdown_complete => if (self.state == .shutdown_ack_sent) {
+                try self.setStateToClosed();
+                return null;
+            },
+        }
+    }
 
     if (received_data and self.state == .shutdown_sent) {
         try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn });
         if (self.sack_generator.cumulative_tsn != self.sack_generator.highest_tsn_received) {
             try self.pushSack();
         }
-        return;
+        return self.messageIterator();
     }
 
-    if (!received_data or (self.state != .established and self.state != .shutdown_pending)) return;
+    if (!received_data or (self.state != .established and self.state != .shutdown_pending)) return null;
 
     const has_gaps = self.sack_generator.highest_tsn_received != self.sack_generator.cumulative_tsn;
     if (self.send_sack or immediate_sack or has_gaps) {
@@ -353,9 +370,11 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) !void {
         self.send_sack = true;
         self.sack_deadline = now + sack_delay;
     }
+
+    return self.messageIterator();
 }
 
-pub fn handleTimeout(self: *Association, now: i64) !void {
+pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void {
     if (now >= self.init_deadline) {
         if (self.init_attempts > max_init_retransmits) {
             try self.setStateToClosed();
@@ -437,6 +456,10 @@ pub fn pollTimeout(self: *Association) ?i64 {
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
+fn messageIterator(self: *Association) ?MessageIterator {
+    return if (self.reassembler.ready.len != 0) .{ .assoc = self } else null;
+}
+
 fn setStateToClosed(self: *Association) !void {
     try self.events.pushBack(self.allocator, .comm_down);
     self.state = .closed;
@@ -488,12 +511,10 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
 
     const cookie = blk: {
         var it = chunk.iterateParameters();
-        while (try it.next()) |param| {
-            switch (param) {
-                .state_cookie => |cookie_param| break :blk cookie_param,
-                else => {},
-            }
-        } else return error.InvalidPacket;
+        while (try it.next()) |param| switch (param) {
+            .state_cookie => |cookie_param| break :blk cookie_param,
+            else => {},
+        } else return error.MissingCookie;
     };
 
     if (self.peer_cookie.len != 0) {
@@ -780,6 +801,16 @@ fn testDataPacket2(assoc: *const Association, data: message.Data, buffer: []u8) 
     return buffer[0 .. message.packet_header_size + written];
 }
 
+fn testRead(assoc: *Association, packet: []const u8, now: i64, lens: []usize) ![]usize {
+    var it = try assoc.handleRead(packet, now) orelse return lens[0..0];
+    var n: usize = 0;
+    while (it.next()) |msg| : (n += 1) {
+        defer msg.deinit(testing.allocator);
+        lens[n] = msg.data.len;
+    }
+    return lens[0..n];
+}
+
 fn testSackPacket(buffer: *[32]u8, assoc: *const Association, cumulative_tsn: u32, gaps: []const u16) []const u8 {
     assoc.writeCommonHeader(buffer);
     buffer[12] = @intFromEnum(message.ChunkType.sack);
@@ -811,7 +842,7 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
     while (assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
-    try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }), 0);
     try assoc.handleTimeout(10_000);
 
     const packet = assoc.pollTransmit(&out, 10_000).?;
@@ -831,8 +862,14 @@ test "Association.pollTransmit: control chunks are sent before retransmissions" 
     while (assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
-    try assoc.handleRead(testDataPacket(&buffer, assoc.verification_tag, 100), 0);
-    assoc.pollEvent().?.message.deinit(testing.allocator);
+    var lens: [1]usize = undefined;
+    const messages_len = try testRead(
+        &assoc,
+        testDataPacket(&buffer, assoc.verification_tag, 100),
+        0,
+        &lens,
+    );
+    try testing.expectEqual(1, messages_len.len);
 
     // both the delayed sack and T3 expire
     try assoc.handleTimeout(10_000);
@@ -857,8 +894,8 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     _ = assoc.pollTransmit(&out, 0).?;
 
     var buffer: [32]u8 = undefined;
-    try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}), 0);
-    try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }), 0);
 
     try testing.expectEqual(null, assoc.pollEvent());
     try testing.expectEqual(2, assoc.message_queue.messages.len);
@@ -880,7 +917,7 @@ test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
     std.mem.writeInt(u16, buffer[14..16], 8, .big);
     std.mem.writeInt(u32, buffer[16..20], assoc.initial_tsn, .big);
     Helper.checkSum(&buffer);
-    try assoc.handleRead(&buffer, 0);
+    _ = try assoc.handleRead(&buffer, 0);
 
     try testing.expectEqual(.established, assoc.state);
     try testing.expectEqual(1, assoc.message_queue.messages.len);
@@ -893,7 +930,7 @@ test "Association.handleRead: Abort with the T bit and the peer tag closes the a
     assoc.peer_verification_tag = 0x11223344;
 
     var buffer: [16]u8 = undefined;
-    try assoc.handleRead(testPacket(&buffer, 0x11223344, .abort, 0x01), 0);
+    _ = try assoc.handleRead(testPacket(&buffer, 0x11223344, .abort, 0x01), 0);
 
     try testing.expectEqual(.closed, assoc.state);
     try testing.expect(assoc.pollEvent().? == .comm_down);
@@ -906,7 +943,7 @@ test "Association.handleRead: Abort with the T bit and our own tag is ignored" {
     assoc.peer_verification_tag = 0x11223344;
 
     var buffer: [16]u8 = undefined;
-    try assoc.handleRead(testPacket(&buffer, assoc.verification_tag, .abort, 0x01), 0);
+    _ = try assoc.handleRead(testPacket(&buffer, assoc.verification_tag, .abort, 0x01), 0);
 
     try testing.expectEqual(.established, assoc.state);
     try testing.expectEqual(null, assoc.pollEvent());
@@ -919,7 +956,7 @@ test "Association.handleRead: shutdown complete with the T bit and the peer tag 
     assoc.peer_verification_tag = 0x11223344;
 
     var buffer: [16]u8 = undefined;
-    try assoc.handleRead(testPacket(&buffer, 0x11223344, .shutdown_complete, 0x01), 0);
+    _ = try assoc.handleRead(testPacket(&buffer, 0x11223344, .shutdown_complete, 0x01), 0);
 
     try testing.expectEqual(.closed, assoc.state);
 }
@@ -933,12 +970,16 @@ test "Association.handleRead: data in shutdown sent is answered with a shutdown"
     assoc.state = .shutdown_sent;
 
     var buffer: [32]u8 = undefined;
-    try assoc.handleRead(testDataPacket(&buffer, assoc.verification_tag, 100), 0);
+    var lens: [1]usize = undefined;
+    const messages_len = try testRead(
+        &assoc,
+        testDataPacket(&buffer, assoc.verification_tag, 100),
+        0,
+        &lens,
+    );
+    try testing.expectEqual(1, messages_len.len);
 
     try testing.expectEqual(.shutdown_sent, assoc.state);
-    const event = assoc.pollEvent().?;
-    try testing.expect(event == .message);
-    event.message.deinit(testing.allocator);
     try testing.expectEqual(Transmit{ .shutdown = 100 }, assoc.transmits.popFront().?);
 }
 
@@ -951,11 +992,14 @@ test "Association.handleRead: data in shutdown pending is delivered and acknowle
     assoc.state = .shutdown_pending;
 
     var buffer: [32]u8 = undefined;
-    try assoc.handleRead(testDataPacket(&buffer, assoc.verification_tag, 100), 0);
-
-    const event = assoc.pollEvent().?;
-    try testing.expect(event == .message);
-    event.message.deinit(testing.allocator);
+    var lens: [1]usize = undefined;
+    const messages_len = try testRead(
+        &assoc,
+        testDataPacket(&buffer, assoc.verification_tag, 100),
+        0,
+        &lens,
+    );
+    try testing.expectEqual(1, messages_len.len);
     try testing.expect(assoc.send_sack);
 }
 
@@ -971,7 +1015,7 @@ test "Association.handleRead: shutdown in shutdown pending moves to shutdown rec
     std.mem.writeInt(u16, buffer[14..16], 8, .big);
     std.mem.writeInt(u32, buffer[16..20], assoc.initial_tsn -% 1, .big);
     Helper.checkSum(&buffer);
-    try assoc.handleRead(&buffer, 0);
+    _ = try assoc.handleRead(&buffer, 0);
 
     try testing.expectEqual(.shutdown_ack_sent, assoc.state);
     try testing.expectEqual(Transmit.shutdown_ack, assoc.transmits.popFront().?);
@@ -983,7 +1027,7 @@ test "Association.handleRead: shutdown ack in shutdown ack sent closes the assoc
     assoc.state = .shutdown_ack_sent;
 
     var buffer: [16]u8 = undefined;
-    try assoc.handleRead(testPacket(&buffer, assoc.verification_tag, .shutdown_ack, 0), 0);
+    _ = try assoc.handleRead(testPacket(&buffer, assoc.verification_tag, .shutdown_ack, 0), 0);
 
     try testing.expectEqual(.closed, assoc.state);
     try testing.expectEqual(Transmit{ .shutdown_complete = false }, assoc.transmits.popFront().?);
@@ -995,7 +1039,7 @@ test "Association.handleRead: out of the blue shutdown ack is answered with a re
     assoc.peer_verification_tag = 0x11223344;
 
     var buffer: [16]u8 = undefined;
-    try assoc.handleRead(testPacket(&buffer, assoc.verification_tag, .shutdown_ack, 0), 0);
+    _ = try assoc.handleRead(testPacket(&buffer, assoc.verification_tag, .shutdown_ack, 0), 0);
 
     try testing.expectEqual(.closed, assoc.state);
     try testing.expectEqual(null, assoc.pollEvent());
@@ -1016,13 +1060,13 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
 
     var buffer: [32]u8 = undefined;
     var sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{});
-    try assoc.handleRead(sack, 5);
+    _ = try assoc.handleRead(sack, 5);
 
     try testing.expectEqual(0, assoc.t3_timer.error_count);
     try testing.expect(assoc.t3_timer.deadline != std.math.maxInt(i64));
 
     sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 });
-    try assoc.handleRead(sack, 10);
+    _ = try assoc.handleRead(sack, 10);
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
 
@@ -1036,6 +1080,7 @@ test "Association.handleRead: zero receive window drops or reneg chunks" {
     var buffer: [1024]u8 = undefined;
     const payload: [100]u8 = @splat(0xAA);
     const tsn = assoc.initial_tsn;
+    var lens: [2]usize = undefined;
 
     var data = message.Data{
         .flags = .{ .start_fragment = true, .end_fragment = true },
@@ -1047,7 +1092,7 @@ test "Association.handleRead: zero receive window drops or reneg chunks" {
     };
 
     // ssn 1 waits for ssn 0
-    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 0);
+    try testing.expectEqual(0, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 0, &lens)).len);
     try testing.expect(assoc.reassembler.pending.contains(tsn +% 1));
     try testing.expectEqual(40, assoc.reassembler.advertised_wnd);
 
@@ -1055,18 +1100,18 @@ test "Association.handleRead: zero receive window drops or reneg chunks" {
     data.tsn = tsn +% 3;
     data.flags.unordered = true;
     data.user_data = payload[0..40];
-    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 1);
+    try testing.expectEqualSlices(usize, &.{40}, try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 1, &lens));
     try testing.expectEqual(0, assoc.reassembler.advertised_wnd);
     try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
 
     // a tsn above the highest one is dropped
     data.tsn = tsn +% 4;
-    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 2);
+    try testing.expectEqual(0, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 2, &lens)).len);
     try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
 
     // the higher tsns are already delivered or never received, nothing to reneg
     data.tsn = tsn +% 2;
-    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 3);
+    try testing.expectEqual(0, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 3, &lens)).len);
     try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
     try testing.expectEqual(tsn -% 1, assoc.sack_generator.cumulative_tsn);
 
@@ -1075,18 +1120,10 @@ test "Association.handleRead: zero receive window drops or reneg chunks" {
     data.flags.unordered = false;
     data.stream_seq = 0;
     data.user_data = payload[0..10];
-    try assoc.handleRead(testDataPacket2(&assoc, data, &buffer), 4);
+    try testing.expectEqualSlices(usize, &.{10}, try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 4, &lens));
     try testing.expect(!assoc.reassembler.pending.contains(tsn +% 1));
     try testing.expectEqual(tsn, assoc.sack_generator.cumulative_tsn);
     try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
-
-    // the unordered and the ssn 0 messages are delivered
-    for ([_]usize{ 40, 10 }) |len| {
-        const event = assoc.pollEvent().?;
-        defer event.message.deinit(testing.allocator);
-        try testing.expectEqual(len, event.message.data.len);
-    }
-    try testing.expect(assoc.pollEvent() == null);
 }
 
 test "Association.shutdown: an empty queue sends a shutdown right away" {
