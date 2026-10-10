@@ -56,7 +56,14 @@ pub const ChunkIterator = struct {
         return null;
     }
 
-    fn parseChunk(self: *ChunkIterator) !?Chunk {
+    pub const ParseError = error{
+        /// Parsing failed due to insufficient data or invalid length.
+        InvalidChunk,
+        /// Chunk type is not recognized, stop processing the remaining chunks.
+        UnrecognizedChunkType,
+    };
+
+    fn parseChunk(self: *ChunkIterator) ParseError!?Chunk {
         if (self.slice.len < 4) return error.InvalidChunk;
 
         const chunk_type: ChunkType = @enumFromInt(self.slice[0]);
@@ -146,7 +153,7 @@ pub const Init = struct {
     pub fn parse(data: []const u8) !Init {
         if (data.len < 16) {
             @branchHint(.unlikely);
-            return error.InvalidInitChunk;
+            return error.InvalidChunk;
         }
 
         return Init{
