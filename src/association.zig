@@ -296,9 +296,8 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) !void {
 
             immediate_sack |= d.flags.immediate;
 
-            if (try self.reassembler.receiveData(self.allocator, d)) |msg| {
-                try self.events.pushBack(self.allocator, .{ .message = msg });
-            } else while (self.reassembler.drainReady(d.stream_id)) |msg| {
+            try self.reassembler.receiveData(self.allocator, d);
+            while (self.reassembler.drainReady()) |msg| {
                 try self.events.pushBack(self.allocator, .{ .message = msg });
             }
         },

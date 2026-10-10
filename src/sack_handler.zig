@@ -99,7 +99,7 @@ fn testSack(cumulative_tsn: u32, blocks: []const u8) message.Sack {
     };
 }
 
-test "gap ack blocks mark tsns as acked" {
+test "SackHandler.handleSack: gap ack blocks mark tsns as acked" {
     var h = SackHandler.init(1);
     try h.handleSack(&testSack(1, &.{ 0, 2, 0, 3 }), 100);
 
@@ -110,7 +110,7 @@ test "gap ack blocks mark tsns as acked" {
     try testing.expect(!h.isAcked(5));
 }
 
-test "a sack with an unchanged cumulative tsn still updates gap blocks" {
+test "SackHandler.handleSack: a sack with an unchanged cumulative tsn still updates gap blocks" {
     var h = SackHandler.init(1);
     try h.handleSack(&testSack(1, &.{ 0, 2, 0, 2 }), 100);
     try h.handleSack(&testSack(1, &.{ 0, 2, 0, 4 }), 100);
@@ -119,14 +119,14 @@ test "a sack with an unchanged cumulative tsn still updates gap blocks" {
     try testing.expect(h.isAcked(5));
 }
 
-test "a sack with an older cumulative tsn is discarded" {
+test "SackHandler.handleSack: a sack with an older cumulative tsn is discarded" {
     var h = SackHandler.init(1);
     try h.handleSack(&testSack(5, &.{}), 100);
     try testing.expectError(error.Discard, h.handleSack(&testSack(4, &.{}), 100));
     try testing.expectEqual(5, h.cumulative_tsn);
 }
 
-test "bits acked by old gap blocks are cleared once the cumulative tsn passes them" {
+test "SackHandler.handleSack: bits acked by old gap blocks are cleared once the cumulative tsn passes them" {
     var h = SackHandler.init(1);
     try h.handleSack(&testSack(1, &.{ 0, 2, 0, 3 }), 100);
     try h.handleSack(&testSack(4, &.{}), 100);
@@ -136,7 +136,7 @@ test "bits acked by old gap blocks are cleared once the cumulative tsn passes th
     try testing.expect(!h.isAcked(3 + bitmap_bits));
 }
 
-test "reneged gap blocks are no longer acked" {
+test "SackHandler.handleSack: reneged gap blocks are no longer acked" {
     var h = SackHandler.init(1);
     try h.handleSack(&testSack(1, &.{ 0, 2, 0, 3 }), 100);
     try h.handleSack(&testSack(1, &.{}), 100);
@@ -145,7 +145,7 @@ test "reneged gap blocks are no longer acked" {
     try testing.expect(!h.isAcked(4));
 }
 
-test "an invalid gap block discards the sack without changing state" {
+test "SackHandler.handleSack: an invalid gap block discards the sack without changing state" {
     var h = SackHandler.init(1);
     try h.handleSack(&testSack(1, &.{ 0, 2, 0, 2 }), 100);
     try testing.expectError(error.Discard, h.handleSack(&testSack(3, &.{ 0, 4, 0, 1 }), 100));
@@ -154,13 +154,51 @@ test "an invalid gap block discards the sack without changing state" {
     try testing.expect(h.isAcked(3));
 }
 
-test "a sack acknowledging tsns that were never sent is discarded" {
+test "SackHandler.handleSack: a sack acknowledging tsns that were never sent is discarded" {
     var h = SackHandler.init(1);
     try testing.expectError(error.Discard, h.handleSack(&testSack(6, &.{}), 5));
     try testing.expectError(error.Discard, h.handleSack(&testSack(1, &.{ 0, 2, 0, 5 }), 5));
 
     try testing.expectEqual(0, h.cumulative_tsn);
     try testing.expect(!h.isAcked(3));
+}
+
+test "SackHandler.handleSack: set all_acked" {
+    // the cumulative tsn reaches the highest tsn sent
+    {
+        var h = SackHandler.init(1);
+        try h.handleSack(&testSack(10, &.{}), 10);
+        try testing.expect(h.all_acked);
+    }
+
+    // contiguous gap blocks reach the highest tsn sent
+    {
+        var h = SackHandler.init(1);
+        try h.handleSack(&testSack(1, &.{ 0, 1, 0, 3, 0, 4, 0, 5 }), 6);
+        try testing.expect(h.all_acked);
+    }
+}
+
+test "SackHandler.handleSack: clear all_acked" {
+    // a hole or a trailing unacked tsn
+    {
+        var h = SackHandler.init(1);
+        try h.handleSack(&testSack(1, &.{ 0, 2, 0, 5 }), 6);
+        try testing.expect(!h.all_acked);
+
+        try h.handleSack(&testSack(1, &.{ 0, 1, 0, 4 }), 6);
+        try testing.expect(!h.all_acked);
+    }
+
+    // reneged gap blocks
+    {
+        var h = SackHandler.init(1);
+        try h.handleSack(&testSack(1, &.{ 0, 1, 0, 5 }), 6);
+        try testing.expect(h.all_acked);
+
+        try h.handleSack(&testSack(1, &.{}), 6);
+        try testing.expect(!h.all_acked);
+    }
 }
 
 test "SackHandler.handleCumulativeTsn: cumulative tsn clears the gap bits it passes" {
@@ -200,34 +238,4 @@ test "SackHandler.handleCumulativeTsn: all acked only when it reaches the highes
 
     h.handleCumulativeTsn(10, 10);
     try testing.expect(h.all_acked);
-}
-
-test "SackHandler.handleSack: set all_acked when the cumulative tsn reaches the highest tsn sent" {
-    var h = SackHandler.init(1);
-    try h.handleSack(&testSack(10, &.{}), 10);
-    try testing.expect(h.all_acked);
-}
-
-test "SackHandler.handleSack: set all_acked when contiguous gap blocks reach the highest tsn sent" {
-    var h = SackHandler.init(1);
-    try h.handleSack(&testSack(1, &.{ 0, 1, 0, 3, 0, 4, 0, 5 }), 6);
-    try testing.expect(h.all_acked);
-}
-
-test "SackHandler.handleSack: clear all_acked with a hole or a trailing unacked tsn" {
-    var h = SackHandler.init(1);
-    try h.handleSack(&testSack(1, &.{ 0, 2, 0, 5 }), 6);
-    try testing.expect(!h.all_acked);
-
-    try h.handleSack(&testSack(1, &.{ 0, 1, 0, 4 }), 6);
-    try testing.expect(!h.all_acked);
-}
-
-test "SackHandler.handleSack: reneged gap blocks clear all_acked" {
-    var h = SackHandler.init(1);
-    try h.handleSack(&testSack(1, &.{ 0, 1, 0, 5 }), 6);
-    try testing.expect(h.all_acked);
-
-    try h.handleSack(&testSack(1, &.{}), 6);
-    try testing.expect(!h.all_acked);
 }
