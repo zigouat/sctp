@@ -210,6 +210,20 @@ pub const Data = struct {
         @memset(buffer[data_chunk_header_size + self.user_data.len ..][0..pad], 0);
         return data_chunk_header_size + self.user_data.len + pad;
     }
+
+    pub fn isComplete(self: *const Data) bool {
+        return self.flags.start_fragment and self.flags.end_fragment;
+    }
+
+    pub fn toUserMessage(chunk: *const Data) UserMessage {
+        return UserMessage{
+            .stream_id = chunk.stream_id,
+            .stream_seq = chunk.stream_seq,
+            .ppid = chunk.ppid,
+            .unordered = chunk.flags.unordered,
+            .data = chunk.user_data,
+        };
+    }
 };
 
 pub const Sack = struct {
@@ -415,7 +429,7 @@ pub const UserMessage = struct {
     stream_seq: u16,
     ppid: u32,
     unordered: bool,
-    data: []u8,
+    data: []const u8,
 
     pub fn deinit(self: UserMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
