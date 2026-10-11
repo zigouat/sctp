@@ -2,7 +2,7 @@ const std = @import("std");
 const message = @import("message.zig");
 const SackGenerator = @import("sack_generator.zig");
 const SackHandler = @import("sack_handler.zig");
-const Reassembler = @import("reassembler.zig");
+const MessageAssembler = @import("message_assembler.zig");
 const MessageQueue = @import("message_queue.zig");
 const Helper = @import("helper.zig");
 
@@ -38,7 +38,7 @@ pub const MessageIterator = struct {
     assoc: *Association,
 
     pub fn next(it: *MessageIterator) ?message.UserMessage {
-        return it.assoc.reassembler.drainReady();
+        return it.assoc.message_assembler.drainReady();
     }
 };
 
@@ -90,10 +90,7 @@ const RetransmissionTimer = struct {
         .error_count = 0,
     };
 
-    fn calculateRto(timer: *RetransmissionTimer, sack: *const SackHandler, now: i64) void {
-        if (timer.rtt_tsn == null) return;
-        if (!sack.isAcked(timer.rtt_tsn.?)) return;
-
+    fn calculateRto(timer: *RetransmissionTimer, now: i64) void {
         const rtt: u32 = @intCast(now - timer.rtt_start);
         if (timer.first_sample) {
             timer.first_sample = false;
@@ -180,7 +177,7 @@ send_sack: bool = false,
 sack_deadline: i64 = std.math.maxInt(i64),
 
 message_queue: MessageQueue,
-reassembler: Reassembler,
+message_assembler: MessageAssembler,
 transmits: std.Deque(Transmit),
 events: std.Deque(Event),
 
@@ -206,7 +203,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .cwnd = config.receive_buffer_size,
         .transmits = .empty,
         .events = .empty,
-        .reassembler = .init(config.receive_buffer_size),
+        .message_assembler = .init(config.receive_buffer_size),
         .init_attempts = 0,
         .init_rto = 1,
         .init_deadline = std.math.maxInt(i64),
@@ -220,7 +217,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
 pub fn deinit(self: *Association) void {
     self.transmits.deinit(self.allocator);
     self.events.deinit(self.allocator);
-    self.reassembler.deinit(self.allocator);
+    self.message_assembler.deinit(self.allocator);
     self.message_queue.deinit(self.allocator);
     self.allocator.free(self.peer_cookie);
 }
@@ -320,7 +317,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                     else => continue,
                 };
 
-                if (self.reassembler.advertised_wnd == 0) {
+                if (self.message_assembler.advertised_wnd == 0) {
                     @branchHint(.unlikely);
                     if (!self.dropChunkWithHighestTsn(d)) continue;
                     immediate_sack = true;
@@ -329,7 +326,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 self.sack_generator.receiveTsn(d.tsn);
                 immediate_sack |= d.flags.immediate;
 
-                try self.reassembler.receiveData(self.allocator, d);
+                try self.message_assembler.receiveData(self.allocator, d);
             },
             .sack => |sack| switch (self.state) {
                 .established, .shutdown_pending, .shutdown_received, .cookie_echoed => {
@@ -337,7 +334,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                     self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch continue;
                     self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
                     self.rwnd = sack.a_rwnd -| self.message_queue.getOutstandingDataSize(&self.sack_handler);
-                    self.t3_timer.calculateRto(&self.sack_handler, now);
+                    if (self.t3_timer.rtt_tsn) |tsn| if (self.sack_handler.isAcked(tsn)) self.t3_timer.calculateRto(now);
                     self.updateT3Timer(prev_cumulative_tsn, now);
                     try self.maybeSendShutdown();
                 },
@@ -518,7 +515,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
 }
 
 fn messageIterator(self: *Association) ?MessageIterator {
-    return if (self.reassembler.ready.len != 0) .{ .assoc = self } else null;
+    return if (self.message_assembler.ready.len != 0) .{ .assoc = self } else null;
 }
 
 fn setStateToClosed(self: *Association) !void {
@@ -530,7 +527,7 @@ fn setStateToClosed(self: *Association) !void {
     self.send_sack = false;
     self.resetInitTimer();
     self.message_queue.close(self.allocator, self.initial_tsn);
-    self.reassembler.reset(self.allocator);
+    self.message_assembler.reset(self.allocator);
     self.t3_timer = .init;
 }
 
@@ -670,7 +667,7 @@ fn setInitTimer(self: *Association, now: i64) void {
 }
 
 fn writeSack(self: *Association, buffer: []u8) usize {
-    const written = self.sack_generator.writeSack(buffer, self.reassembler.advertised_wnd);
+    const written = self.sack_generator.writeSack(buffer, self.message_assembler.advertised_wnd);
     self.sack_generator.clearDuplicates();
     return written;
 }
@@ -680,7 +677,7 @@ fn writeInit(self: *Association, buffer: []u8) usize {
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 20, .big);
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
-    std.mem.writeInt(u32, buffer[8..12], self.reassembler.capacity, .big);
+    std.mem.writeInt(u32, buffer[8..12], self.message_assembler.capacity, .big);
     std.mem.writeInt(u16, buffer[12..14], self.outbound_streams, .big);
     std.mem.writeInt(u16, buffer[14..16], self.inbound_streams, .big);
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
@@ -693,7 +690,7 @@ fn writeInitAck(self: *Association, buffer: []u8) usize {
     buffer[1] = 0; // flags
 
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
-    std.mem.writeInt(u32, buffer[8..12], self.reassembler.capacity, .big);
+    std.mem.writeInt(u32, buffer[8..12], self.message_assembler.capacity, .big);
     std.mem.writeInt(u16, buffer[12..14], self.outbound_streams, .big);
     std.mem.writeInt(u16, buffer[14..16], self.inbound_streams, .big);
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
@@ -781,7 +778,7 @@ fn dropChunkWithHighestTsn(self: *Association, d: message.Data) bool {
 
     var high = self.sack_generator.highest_tsn_received;
     while (Helper.tsnGt(high, d.tsn)) : (high -%= 1) {
-        if (!self.reassembler.dropChunk(self.allocator, high)) continue;
+        if (!self.message_assembler.dropChunk(self.allocator, high)) continue;
         self.sack_generator.reneg(high);
         return true;
     }
@@ -883,7 +880,7 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
     while (try assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, assoc.reassembler.advertised_wnd), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, assoc.message_assembler.advertised_wnd), 0);
     try assoc.handleTimeout(10_000);
 
     const packet = (try assoc.pollTransmit(&out, 10_000)).?;
@@ -1046,8 +1043,8 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [32]u8 = undefined;
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}, assoc.reassembler.advertised_wnd), 0);
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }, assoc.reassembler.advertised_wnd), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}, assoc.message_assembler.advertised_wnd), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }, assoc.message_assembler.advertised_wnd), 0);
 
     try testing.expectEqual(null, assoc.pollEvent());
     try testing.expectEqual(2, assoc.message_queue.messages.len);
@@ -1211,13 +1208,13 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     assoc.t3_timer.restart(0);
 
     var buffer: [32]u8 = undefined;
-    var sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{}, assoc.reassembler.advertised_wnd);
+    var sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{}, assoc.message_assembler.advertised_wnd);
     _ = try assoc.handleRead(sack, 5);
 
     try testing.expectEqual(0, assoc.t3_timer.error_count);
     try testing.expect(assoc.t3_timer.deadline != std.math.maxInt(i64));
 
-    sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 }, assoc.reassembler.advertised_wnd);
+    sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 }, assoc.message_assembler.advertised_wnd);
     _ = try assoc.handleRead(sack, 10);
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
@@ -1225,7 +1222,7 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
 test "Association.handleRead: zero receive window drops or reneg chunks" {
     var assoc = testAssoc();
     defer assoc.deinit();
-    assoc.reassembler = .init(100);
+    assoc.message_assembler = .init(100);
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
 
@@ -1245,15 +1242,15 @@ test "Association.handleRead: zero receive window drops or reneg chunks" {
 
     // ssn 1 waits for ssn 0
     try testing.expectEqual(0, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 0, &lens)).len);
-    try testing.expect(assoc.reassembler.pending.contains(tsn +% 1));
-    try testing.expectEqual(40, assoc.reassembler.advertised_wnd);
+    try testing.expect(assoc.message_assembler.pending.contains(tsn +% 1));
+    try testing.expectEqual(40, assoc.message_assembler.advertised_wnd);
 
     // unordered message is delivered right away and closes the window
     data.tsn = tsn +% 3;
     data.flags.unordered = true;
     data.user_data = payload[0..40];
     try testing.expectEqualSlices(usize, &.{40}, try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 1, &lens));
-    try testing.expectEqual(0, assoc.reassembler.advertised_wnd);
+    try testing.expectEqual(0, assoc.message_assembler.advertised_wnd);
     try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
 
     // a tsn above the highest one is dropped
@@ -1273,7 +1270,7 @@ test "Association.handleRead: zero receive window drops or reneg chunks" {
     data.stream_seq = 0;
     data.user_data = payload[0..10];
     try testing.expectEqualSlices(usize, &.{10}, try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 4, &lens));
-    try testing.expect(!assoc.reassembler.pending.contains(tsn +% 1));
+    try testing.expect(!assoc.message_assembler.pending.contains(tsn +% 1));
     try testing.expectEqual(tsn, assoc.sack_generator.cumulative_tsn);
     try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
 }

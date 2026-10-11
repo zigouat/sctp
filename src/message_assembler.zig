@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const message = @import("message.zig");
 
-const Reassembler = @This();
+const MessageAssembler = @This();
 const UserMessage = message.UserMessage;
 
 const StreamState = struct {
@@ -29,7 +29,7 @@ capacity: u32,
 buffered_data: u32,
 advertised_wnd: u32,
 
-pub fn init(capacity: u32) Reassembler {
+pub fn init(capacity: u32) MessageAssembler {
     return .{
         .pending = .empty,
         .streams = .empty,
@@ -40,7 +40,7 @@ pub fn init(capacity: u32) Reassembler {
     };
 }
 
-pub fn deinit(self: *Reassembler, allocator: std.mem.Allocator) void {
+pub fn deinit(self: *MessageAssembler, allocator: std.mem.Allocator) void {
     var pending_it = self.pending.valueIterator();
     while (pending_it.next()) |d| allocator.free(d.user_data);
     self.pending.deinit(allocator);
@@ -53,12 +53,12 @@ pub fn deinit(self: *Reassembler, allocator: std.mem.Allocator) void {
     self.ready.deinit(allocator);
 }
 
-pub fn reset(self: *Reassembler, allocator: std.mem.Allocator) void {
+pub fn reset(self: *MessageAssembler, allocator: std.mem.Allocator) void {
     self.deinit(allocator);
     self.* = .init(self.capacity);
 }
 
-pub fn receiveData(self: *Reassembler, allocator: std.mem.Allocator, d: message.Data) AllocError!void {
+pub fn receiveData(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) AllocError!void {
     const may_complete = try self.storeChunk(allocator, d);
     self.buffered_data += @intCast(d.user_data.len);
     self.advertised_wnd -|= @intCast(d.user_data.len);
@@ -66,7 +66,7 @@ pub fn receiveData(self: *Reassembler, allocator: std.mem.Allocator, d: message.
     if (may_complete) try self.assembleReadyMessages(allocator, self.streams.getPtr(d.stream_id).?);
 }
 
-pub fn drainReady(self: *Reassembler) ?UserMessage {
+pub fn drainReady(self: *MessageAssembler) ?UserMessage {
     if (self.ready.popFront()) |msg| {
         self.buffered_data -= @intCast(msg.data.len);
         self.updateAdvertisedWindow();
@@ -76,7 +76,7 @@ pub fn drainReady(self: *Reassembler) ?UserMessage {
     return null;
 }
 
-pub fn dropChunk(self: *Reassembler, allocator: std.mem.Allocator, tsn: u32) bool {
+pub fn dropChunk(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32) bool {
     if (self.pending.fetchRemove(tsn)) |d| {
         allocator.free(d.value.user_data);
         self.buffered_data -= @intCast(d.value.user_data.len);
@@ -87,7 +87,7 @@ pub fn dropChunk(self: *Reassembler, allocator: std.mem.Allocator, tsn: u32) boo
     return false;
 }
 
-fn storeChunk(self: *Reassembler, allocator: std.mem.Allocator, d: message.Data) !bool {
+fn storeChunk(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) !bool {
     try self.ready.ensureUnusedCapacity(allocator, 1);
     try self.pending.ensureUnusedCapacity(allocator, 1);
 
@@ -113,7 +113,7 @@ fn storeChunk(self: *Reassembler, allocator: std.mem.Allocator, d: message.Data)
     return is_next;
 }
 
-fn handleUnorderedChunk(self: *Reassembler, allocator: std.mem.Allocator, d: message.Data) !void {
+fn handleUnorderedChunk(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) !void {
     if (d.isComplete()) {
         self.ready.pushBackAssumeCapacity(d.toUserMessage());
         return;
@@ -124,7 +124,7 @@ fn handleUnorderedChunk(self: *Reassembler, allocator: std.mem.Allocator, d: mes
     if (try self.tryReassemble(allocator, d.tsn)) |msg| self.ready.pushBackAssumeCapacity(msg);
 }
 
-fn assembleReadyMessages(self: *Reassembler, allocator: std.mem.Allocator, stream_state: *StreamState) !void {
+fn assembleReadyMessages(self: *MessageAssembler, allocator: std.mem.Allocator, stream_state: *StreamState) !void {
     while (stream_state.seq_to_tsn.get(stream_state.next_ssn)) |tsn| {
         try self.ready.ensureUnusedCapacity(allocator, 1);
         const msg = try self.tryReassemble(allocator, tsn) orelse return;
@@ -134,7 +134,7 @@ fn assembleReadyMessages(self: *Reassembler, allocator: std.mem.Allocator, strea
     }
 }
 
-fn updateAdvertisedWindow(self: *Reassembler) void {
+fn updateAdvertisedWindow(self: *MessageAssembler) void {
     const avail = self.capacity -| self.buffered_data;
     const thres = @min(message.mtu - message.data_chunk_header_size - message.packet_header_size, self.capacity / 2);
 
@@ -144,7 +144,7 @@ fn updateAdvertisedWindow(self: *Reassembler) void {
     }
 }
 
-fn tryReassemble(self: *Reassembler, allocator: std.mem.Allocator, tsn: u32) !?UserMessage {
+fn tryReassemble(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32) !?UserMessage {
     var start_tsn = tsn;
     while (true) {
         const frag = self.pending.get(start_tsn) orelse return null;
@@ -184,7 +184,7 @@ fn tryReassemble(self: *Reassembler, allocator: std.mem.Allocator, tsn: u32) !?U
     };
 }
 
-fn getStreamState(self: *Reassembler, allocator: std.mem.Allocator, stream_id: u16) !*StreamState {
+fn getStreamState(self: *MessageAssembler, allocator: std.mem.Allocator, stream_id: u16) !*StreamState {
     const state = try self.streams.getOrPut(allocator, stream_id);
     if (!state.found_existing) state.value_ptr.* = .init;
     return state.value_ptr;
@@ -202,7 +202,7 @@ fn testData(tsn: u32, stream_id: u16, stream_seq: u16, flags: message.Data.Flags
 }
 
 test "Reassembler.deinit: frees pending fragments, buffered reorder entries and ready messages" {
-    var r: Reassembler = .init(4000);
+    var r: MessageAssembler = .init(4000);
 
     try r.receiveData(testing.allocator, testData(1, 0, 0, .{ .start_fragment = true }, "partial"));
     try r.receiveData(testing.allocator, testData(2, 0, 1, .{ .start_fragment = true, .end_fragment = true }, "buffered"));
@@ -212,7 +212,7 @@ test "Reassembler.deinit: frees pending fragments, buffered reorder entries and 
 }
 
 test "Reassembler.receiveData: single-chunk unordered message is delivered immediately" {
-    var r: Reassembler = .init(4000);
+    var r: MessageAssembler = .init(4000);
     defer r.deinit(testing.allocator);
 
     try r.receiveData(testing.allocator, testData(1, 0, 0, .{ .start_fragment = true, .end_fragment = true, .unordered = true }, "hello"));
@@ -224,7 +224,7 @@ test "Reassembler.receiveData: single-chunk unordered message is delivered immed
 }
 
 test "Reassembler.receiveData: single-chunk ordered message with ssn 0 is delivered immediately" {
-    var r: Reassembler = .init(4000);
+    var r: MessageAssembler = .init(4000);
     defer r.deinit(testing.allocator);
 
     try r.receiveData(testing.allocator, testData(1, 0, 0, .{ .start_fragment = true, .end_fragment = true }, "hello"));
@@ -236,7 +236,7 @@ test "Reassembler.receiveData: single-chunk ordered message with ssn 0 is delive
 }
 
 test "Reassembler.receiveData: unordered message bypasses a pending ordered reorder buffer" {
-    var r: Reassembler = .init(4000);
+    var r: MessageAssembler = .init(4000);
     defer r.deinit(testing.allocator);
 
     try r.receiveData(testing.allocator, testData(1, 0, 1, .{ .start_fragment = true, .end_fragment = true }, "ordered-second"));
@@ -252,7 +252,7 @@ test "Reassembler.receiveData: unordered message bypasses a pending ordered reor
 }
 
 test "Reassembler.drainReady: re-assemble messages" {
-    var r: Reassembler = .init(4000);
+    var r: MessageAssembler = .init(4000);
     defer r.deinit(testing.allocator);
 
     {
@@ -298,7 +298,7 @@ test "Reassembler.drainReady: re-assemble messages" {
 }
 
 test "Reassembler.drainReady: re-ordered messages are drained in order" {
-    var r: Reassembler = .init(4000);
+    var r: MessageAssembler = .init(4000);
     defer r.deinit(testing.allocator);
 
     try r.receiveData(testing.allocator, testData(3, 0, 2, .{ .start_fragment = true, .end_fragment = true }, "third"));
@@ -317,7 +317,7 @@ test "Reassembler.drainReady: re-ordered messages are drained in order" {
 }
 
 test "Reassembler: independent streams track ssn separately" {
-    var r: Reassembler = .init(4000);
+    var r: MessageAssembler = .init(4000);
     defer r.deinit(testing.allocator);
 
     try r.receiveData(testing.allocator, testData(1, 1, 0, .{ .start_fragment = true, .end_fragment = true }, "stream1"));
@@ -333,7 +333,7 @@ test "Reassembler: independent streams track ssn separately" {
 }
 
 test "Reassembler: ssn wraparound at 0xFFFF advances to 0" {
-    var r: Reassembler = .init(4000);
+    var r: MessageAssembler = .init(4000);
     defer r.deinit(testing.allocator);
 
     try r.streams.put(testing.allocator, 0, .{ .next_ssn = 0xFFFF, .seq_to_tsn = .empty });
@@ -351,7 +351,7 @@ test "Reassembler: ssn wraparound at 0xFFFF advances to 0" {
 }
 
 test "Reassembler: advertised window" {
-    var r = Reassembler.init(4000);
+    var r = MessageAssembler.init(4000);
     defer r.deinit(testing.allocator);
 
     try testing.expectEqual(4000, r.advertised_wnd);
@@ -381,7 +381,7 @@ test "Reassembler: advertised window" {
 test "Reassembler.receiveData: allocation failure" {
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         pub fn run(alloc: std.mem.Allocator) !void {
-            var r: Reassembler = .init(4000);
+            var r: MessageAssembler = .init(4000);
             defer r.deinit(alloc);
 
             try r.receiveData(alloc, testData(1, 0, 0, .{ .start_fragment = true }, "hel"));
@@ -391,7 +391,7 @@ test "Reassembler.receiveData: allocation failure" {
 
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         pub fn run(alloc: std.mem.Allocator) !void {
-            var r: Reassembler = .init(4000);
+            var r: MessageAssembler = .init(4000);
             defer r.deinit(alloc);
 
             try r.receiveData(alloc, testData(2, 0, 0, .{
@@ -403,7 +403,7 @@ test "Reassembler.receiveData: allocation failure" {
 
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         pub fn run(alloc: std.mem.Allocator) !void {
-            var r: Reassembler = .init(4000);
+            var r: MessageAssembler = .init(4000);
             defer r.deinit(alloc);
 
             try r.receiveData(alloc, testData(3, 0, 1, .{ .start_fragment = true, .end_fragment = true }, "second"));
@@ -416,7 +416,7 @@ test "Reassembler.receiveData: allocation failure" {
 }
 
 test "Reassembler.receiveData: lazy reassembly of ordered messages" {
-    var r = Reassembler.init(4000);
+    var r = MessageAssembler.init(4000);
     defer r.deinit(testing.allocator);
 
     try r.receiveData(testing.allocator, testData(1, 0, 0, .{ .start_fragment = true }, "hel"));
@@ -472,7 +472,7 @@ test "Reassembler.receiveData: lazy reassembly of ordered messages" {
 }
 
 test "Reassembler.dropChunk: drops only chunks held for reordering" {
-    var r = Reassembler.init(100);
+    var r = MessageAssembler.init(100);
     defer r.deinit(testing.allocator);
 
     const payload: [60]u8 = @splat(0xAA);
