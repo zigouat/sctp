@@ -852,12 +852,12 @@ fn testRead(assoc: *Association, packet: []const u8, now: i64, lens: []usize) ![
     return lens[0..n];
 }
 
-fn testSackPacket(buffer: *[32]u8, assoc: *const Association, cumulative_tsn: u32, gaps: []const u16) []const u8 {
+fn testSackPacket(buffer: *[32]u8, assoc: *const Association, cumulative_tsn: u32, gaps: []const u16, a_rwnd: u32) []const u8 {
     assoc.writeCommonHeader(buffer);
     buffer[12] = @intFromEnum(message.ChunkType.sack);
     buffer[13] = 0;
     std.mem.writeInt(u32, buffer[16..20], cumulative_tsn, .big);
-    std.mem.writeInt(u32, buffer[20..24], assoc.reassembler.advertised_wnd, .big);
+    std.mem.writeInt(u32, buffer[20..24], a_rwnd, .big);
     std.mem.writeInt(u16, buffer[24..26], @intCast(gaps.len / 2), .big);
     std.mem.writeInt(u16, buffer[26..28], 0, .big);
     for (0..gaps.len / 2) |idx| {
@@ -883,7 +883,7 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
     while (try assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, assoc.reassembler.advertised_wnd), 0);
     try assoc.handleTimeout(10_000);
 
     const packet = (try assoc.pollTransmit(&out, 10_000)).?;
@@ -1046,8 +1046,8 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [32]u8 = undefined;
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}), 0);
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}, assoc.reassembler.advertised_wnd), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }, assoc.reassembler.advertised_wnd), 0);
 
     try testing.expectEqual(null, assoc.pollEvent());
     try testing.expectEqual(2, assoc.message_queue.messages.len);
@@ -1211,13 +1211,13 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     assoc.t3_timer.restart(0);
 
     var buffer: [32]u8 = undefined;
-    var sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{});
+    var sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{}, assoc.reassembler.advertised_wnd);
     _ = try assoc.handleRead(sack, 5);
 
     try testing.expectEqual(0, assoc.t3_timer.error_count);
     try testing.expect(assoc.t3_timer.deadline != std.math.maxInt(i64));
 
-    sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 });
+    sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 }, assoc.reassembler.advertised_wnd);
     _ = try assoc.handleRead(sack, 10);
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
@@ -1288,4 +1288,150 @@ test "Association.shutdown: an empty queue sends a shutdown right away" {
 
     try testing.expectEqual(.shutdown_sent, assoc.state);
     try testing.expectEqual(Transmit{ .shutdown = 99 }, assoc.transmits.popFront().?);
+}
+
+test "Association.rwnd: sending subtracts the user data size, not the chunk size" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+    assoc.rwnd = 1000;
+
+    const data: [101]u8 = @splat('a');
+    try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+
+    try testing.expectEqual(899, assoc.rwnd);
+}
+
+test "Association.rwnd: a sack subtracts the outstanding data from the advertised window" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    const data: [100]u8 = @splat('a');
+    for (0..3) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+
+    var buffer: [32]u8 = undefined;
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn, &.{}, 1000), 0);
+    try testing.expectEqual(800, assoc.rwnd);
+}
+
+test "Association.rwnd: gap acked chunks are not outstanding" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    const data: [100]u8 = @splat('a');
+    for (0..3) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+
+    // acks the second chunk only
+    var buffer: [32]u8 = undefined;
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, 1000), 0);
+    try testing.expectEqual(800, assoc.rwnd);
+}
+
+test "Association.rwnd: a sack with a window smaller than the outstanding data saturates to zero" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    const data: [100]u8 = @splat('a');
+    for (0..3) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+
+    var buffer: [32]u8 = undefined;
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 100), 0);
+    try testing.expectEqual(0, assoc.rwnd);
+}
+
+test "Association.rwnd: a timeout adds back the unacked data and the retransmission subtracts it" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    const data: [100]u8 = @splat('a');
+    for (0..2) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+
+    var buffer: [32]u8 = undefined;
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, 1000), 0);
+    try testing.expectEqual(900, assoc.rwnd);
+
+    try assoc.handleTimeout(10_000);
+    try testing.expectEqual(1000, assoc.rwnd);
+
+    _ = (try assoc.pollTransmit(&out, 10_000)).?;
+    try testing.expectEqual(900, assoc.rwnd);
+}
+
+test "Association.rwnd: a second timeout during a retransmission does not add the pending chunks twice" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    const data: [message.mtu - message.packet_header_size - message.data_chunk_header_size]u8 = @splat('a');
+    for (0..2) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    while (try assoc.pollTransmit(&out, 0)) |_| {}
+
+    var buffer: [32]u8 = undefined;
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 10_000), 0);
+    try testing.expectEqual(10_000 - 2 * data.len, assoc.rwnd);
+
+    try assoc.handleTimeout(10_000);
+    try testing.expectEqual(10_000, assoc.rwnd);
+
+    // only the first chunk is retransmitted before the timer expires again
+    _ = (try assoc.pollTransmit(&out, 10_000)).?;
+    try testing.expectEqual(10_000 - data.len, assoc.rwnd);
+
+    try assoc.handleTimeout(20_000);
+    try testing.expectEqual(10_000, assoc.rwnd);
+}
+
+test "Association.rwnd: adding back the outstanding data on a timeout saturates" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    const data: [100]u8 = @splat('a');
+    try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+
+    assoc.rwnd = std.math.maxInt(u32) - 10;
+    try assoc.handleTimeout(10_000);
+    try testing.expectEqual(std.math.maxInt(u32), assoc.rwnd);
+}
+
+test "Association.rwnd: new data is not sent while the window is smaller than the next chunk" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    const data: [100]u8 = @splat('a');
+    try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+
+    var buffer: [32]u8 = undefined;
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 150), 0);
+    try testing.expectEqual(50, assoc.rwnd);
+
+    try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    try testing.expectEqual(null, try assoc.pollTransmit(&out, 0));
+
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn, &.{}, 1000), 0);
+    try testing.expectEqual(1000, assoc.rwnd);
+
+    const packet = (try assoc.pollTransmit(&out, 0)).?;
+    try testing.expectEqual(assoc.initial_tsn +% 1, std.mem.readInt(u32, packet[16..20], .big));
+    try testing.expectEqual(900, assoc.rwnd);
 }
