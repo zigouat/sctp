@@ -254,7 +254,7 @@ pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMe
 /// The return value is an iterator over the messages that have been fully reassembled and are ready to be read.
 ///
 /// Back-pressure can be implemented by not reading from the iterator. Reading messages will open the receive window and the
-/// assocation can accept more message from the sender.
+/// association can accept more messages from the sender.
 pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ InvalidPacket, OutOfMemory }!?MessageIterator {
     const packet = try message.Packet.parse(data);
 
@@ -430,7 +430,7 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
     self.writeCommonHeader(buffer);
 
     while (true) {
-        const next = self.nextChunk(slice, now) catch |err| {
+        const next = self.nextChunk(slice, now, written == message.packet_header_size) catch |err| {
             if (written == message.packet_header_size) return err;
             break;
         };
@@ -463,8 +463,8 @@ pub fn pollTimeout(self: *Association) ?i64 {
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
-fn nextChunk(self: *Association, buffer: []u8, now: i64) TransmitError!?struct { ?Transmit, usize } {
-    const chunk_type = self.transmits.popFront() orelse {
+fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) TransmitError!?struct { ?Transmit, usize } {
+    const chunk_type = self.transmits.front() orelse {
         if (try self.message_queue.nextRetransmit(&self.sack_handler, buffer)) |written| return .{ null, written };
 
         switch (self.state) {
@@ -477,7 +477,11 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64) TransmitError!?struct {
         self.t3_timer.setSample(self.message_queue.curr_tsn -% 1, now);
         return .{ null, written };
     };
-    errdefer self.transmits.pushFrontAssumeCapacity(chunk_type);
+
+    if (!first_chunk) switch (chunk_type) {
+        .init, .init_ack, .shutdown_complete => return null,
+        else => {},
+    };
 
     const written = switch (chunk_type) {
         .init => self.writeInit(buffer),
@@ -498,6 +502,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64) TransmitError!?struct {
         else => {},
     }
 
+    _ = self.transmits.popFront();
     return .{ chunk_type, written };
 }
 
@@ -976,6 +981,44 @@ test "Association.pollTransmit: data chunk padding fits in a buffer not aligned 
     const packet = (try assoc.pollTransmit(&out, 0)).?;
     try testing.expectEqual(0, packet.len % 4);
     try testing.expect(packet.len <= out.len);
+}
+
+test "Association.pollTransmit: init, init_ack and shutdown_complete must not be bundled" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+
+    try assoc.transmits.pushBack(testing.allocator, .init);
+    try assoc.transmits.pushBack(testing.allocator, .{ .init_ack = assoc.verification_tag });
+    try assoc.transmits.pushBack(testing.allocator, .{ .heartbeat_ack = &.{ 1, 2, 3 } });
+    try assoc.transmits.pushBack(testing.allocator, .{ .shutdown_complete = true });
+
+    var out: [message.mtu]u8 = undefined;
+    for (0..4) |_| try testing.expect(try assoc.pollTransmit(&out, 0) != null);
+    try testing.expectEqual(null, try assoc.pollTransmit(&out, 0));
+}
+
+test "Association.pollTransmit: bundle control messages with data" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+    try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
+
+    try assoc.transmits.pushBack(testing.allocator, .init);
+    try assoc.transmits.pushBack(testing.allocator, .cookie_ack);
+
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+    const data = (try assoc.pollTransmit(&out, 0)).?;
+    var packet = try message.Packet.parse(data);
+    var it = packet.iterateChunks();
+    try testing.expect(std.meta.activeTag(try it.next() orelse return error.UnexpectedFailedTest) == .cookie_ack);
+    try testing.expect(std.meta.activeTag(try it.next() orelse return error.UnexpectedFailedTest) == .data);
+    try testing.expect(std.meta.activeTag(try it.next() orelse return error.UnexpectedFailedTest) == .data);
+    try testing.expect(try it.next() == null);
+
+    try testing.expect(try assoc.pollTransmit(&out, 0) == null);
 }
 
 test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
