@@ -10,7 +10,7 @@ This is a sans-IO implementation of SCTP, meaning that it does not handle any I/
 
 ## Installation
 
-Requires Zig `>= 0.16.0`.
+Requires Zig `0.16.0`.
 
 ```sh
 zig fetch --save git+https://github.com/zigouat/sctp
@@ -30,7 +30,7 @@ exe.root_module.addImport("sctp", sctp.module("sctp"));
 ### Input
 
 - `handleRead(packet, now)`: feeds one received SCTP packet (common header + chunks).
-- `handleWrite(data, options)`: queues a user message. **`data` is not copied**: keep it alive until it is returned by a `.release` event.
+- `handleWrite(data, options)`: queues a user message. **`data` is copied**.
 - `handleTimeout(now)`: handle expired timers.
 
 ### Output
@@ -38,7 +38,7 @@ exe.root_module.addImport("sctp", sctp.module("sctp"));
 Drain every output after each input call.
 
 - `pollEvent() ?Event`: returns the next application event, or `null` when none is left.
-- `pollTransmits(buffer, now) ?[]const u8`: returns the next packet to send as a slice of `buffer` or `null` when nothing is left.
+- `pollTransmit(buffer, now) TransmitError!?[]const u8`: returns the next packet to send as a slice of `buffer` or `null` when nothing is left.
 - `pollTimeout() ?i64`: returns the earliest absolute deadline, or `null` when no timer is armed.
 
 `Association` is not thread-safe, so serialize all calls.

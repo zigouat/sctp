@@ -60,12 +60,13 @@ pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const
     if (!config.unordered) result.value_ptr.* +%= 1;
 }
 
-pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) ?usize {
+pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!?usize {
     if (self.curr_msg >= self.messages.len) return null;
-    self.chunks.ensureUnusedCapacity(allocator, 1) catch return null;
+    try self.chunks.ensureUnusedCapacity(allocator, 1);
 
     const msg = self.messages.atPtr(self.curr_msg);
-    const payload_size = @min(msg.data.len - self.message_offset, buffer.len - message.data_chunk_header_size);
+    const max_payload = std.mem.alignBackward(usize, buffer.len - message.data_chunk_header_size, 4);
+    const payload_size = @min(msg.data.len - self.message_offset, max_payload);
 
     const chunk = message.Data{
         .flags = .{
@@ -92,7 +93,7 @@ pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8
     return chunk.write(buffer);
 }
 
-pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buffer: []u8) ?usize {
+pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buffer: []u8) error{WriteFailed}!?usize {
     if (self.retransmit_index == null or self.retransmit_index.? >= self.chunks.len) {
         self.retransmit_index = null;
         return null;
@@ -109,6 +110,7 @@ pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buf
             continue;
         }
 
+        if (chunk.getSize() > buffer.len) return error.WriteFailed;
         self.retransmit_index = self.retransmit_index.? + 1;
         return chunk.write(buffer);
     }

@@ -16,6 +16,8 @@ const assoc_max_retransmits = 10;
 const max_rto = 60; // in seconds
 const max_heartbeat_info = 200;
 const initial_rto = std.time.ms_per_s;
+/// The minimum buffer size that can be passed to `pollTransmit`.
+const min_buffer_size = 128;
 
 pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 
@@ -235,6 +237,9 @@ pub fn shutdown(self: *Association) Error!void {
     try self.maybeSendShutdown();
 }
 
+/// Write a message to the association.
+///
+/// The `data` is copied internally.
 pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMessageConfig) Error!void {
     std.debug.assert(data.len > 0);
     switch (self.state) {
@@ -249,7 +254,7 @@ pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMe
 /// The return value is an iterator over the messages that have been fully reassembled and are ready to be read.
 ///
 /// Back-pressure can be implemented by not reading from the iterator. Reading messages will open the receive window and the
-/// assocation can accept more message from the sender.
+/// association can accept more messages from the sender.
 pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ InvalidPacket, OutOfMemory }!?MessageIterator {
     const packet = try message.Packet.parse(data);
 
@@ -412,33 +417,83 @@ pub fn pollEvent(self: *Association) ?Event {
     return self.events.popFront();
 }
 
-pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) ?[]const u8 {
-    std.debug.assert(buffer.len >= message.mtu);
+pub const TransmitError = error{ WriteFailed, OutOfMemory };
 
-    const chunk_type = self.transmits.popFront() orelse {
-        if (self.message_queue.nextRetransmit(&self.sack_handler, buffer[message.packet_header_size..])) |written| {
-            self.writeCommonHeader(buffer);
-            const packet = buffer[0 .. message.packet_header_size + written];
-            Helper.checkSum(packet);
-            return packet;
+/// Poll the association for data to transmit.
+///
+/// Chunks are bundled into packets of at most `message.mtu` bytes. `buffer` must be at least 128 bytes;
+/// `error.WriteFailed` is returned when the buffer is too small to write one chunk.
+pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[]const u8 {
+    if (buffer.len < min_buffer_size) return error.WriteFailed;
+    var written: usize = message.packet_header_size;
+    var slice = buffer[written..@min(buffer.len, message.mtu)];
+    self.writeCommonHeader(buffer);
+
+    while (true) {
+        const next = self.nextChunk(slice, now, written == message.packet_header_size) catch |err| {
+            if (written == message.packet_header_size) return err;
+            break;
+        };
+        const maybe_control_chunk, const w = next orelse if (written == message.packet_header_size) return null else break;
+        written += w;
+        slice = slice[w..];
+
+        if (maybe_control_chunk) |chunk_type| {
+            switch (chunk_type) {
+                .init_ack => |tag| std.mem.writeInt(u32, buffer[4..8], tag, .big),
+                .shutdown_complete => |reflected| if (reflected) std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big),
+                else => {},
+            }
+
+            switch (chunk_type) {
+                .init, .init_ack, .shutdown_complete => break,
+                else => {},
+            }
         }
+
+        if (slice.len < min_buffer_size) break;
+    }
+
+    Helper.checkSum(buffer[0..written]);
+    return buffer[0..written];
+}
+
+pub fn pollTimeout(self: *Association) ?i64 {
+    const deadline = @min(@min(self.sack_deadline, self.init_deadline), self.t3_timer.deadline);
+    return if (deadline == std.math.maxInt(i64)) null else deadline;
+}
+
+fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) TransmitError!?struct { ?Transmit, usize } {
+    const chunk_type = self.transmits.front() orelse {
+        if (try self.message_queue.nextRetransmit(&self.sack_handler, buffer)) |written| return .{ null, written };
 
         switch (self.state) {
             .established, .shutdown_received, .shutdown_pending => {},
             else => return null,
         }
 
-        const written = self.message_queue.nextChunk(
-            self.allocator,
-            buffer[message.packet_header_size..],
-        ) orelse return null;
-        self.writeCommonHeader(buffer);
-        const packet = buffer[0 .. message.packet_header_size + written];
-        Helper.checkSum(packet);
-
+        const written = try self.message_queue.nextChunk(self.allocator, buffer) orelse return null;
         self.t3_timer.setDeadline(now);
         self.t3_timer.setSample(self.message_queue.curr_tsn -% 1, now);
-        return packet;
+        return .{ null, written };
+    };
+
+    if (!first_chunk) switch (chunk_type) {
+        .init, .init_ack, .shutdown_complete => return null,
+        else => {},
+    };
+
+    const written = switch (chunk_type) {
+        .init => self.writeInit(buffer),
+        .init_ack => self.writeInitAck(buffer),
+        .cookie_echo => |cookie| try writeCookieEcho(cookie, buffer),
+        .cookie_ack => self.writeCookieAck(buffer),
+        .abort => |tsn| self.writeNoUserDataAbort(tsn, buffer),
+        .sack => self.writeSack(buffer),
+        .heartbeat_ack => |data| try writeHeartbeatAck(data, buffer),
+        .shutdown => |tsn| writeShutdown(buffer, tsn),
+        .shutdown_ack => writeShutdownAck(buffer),
+        .shutdown_complete => |reflected| writeShutdownComplete(buffer, reflected),
     };
 
     switch (chunk_type) {
@@ -447,13 +502,8 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) ?[]const u8 {
         else => {},
     }
 
-    const written = self.writeControlChunk(chunk_type, buffer);
-    return buffer[0..written];
-}
-
-pub fn pollTimeout(self: *Association) ?i64 {
-    const deadline = @min(@min(self.sack_deadline, self.init_deadline), self.t3_timer.deadline);
-    return if (deadline == std.math.maxInt(i64)) null else deadline;
+    _ = self.transmits.popFront();
+    return .{ chunk_type, written };
 }
 
 fn messageIterator(self: *Association) ?MessageIterator {
@@ -608,33 +658,6 @@ fn setInitTimer(self: *Association, now: i64) void {
     self.init_attempts += 1;
 }
 
-fn writeControlChunk(self: *Association, chunk_type: Transmit, buffer: []u8) usize {
-    var written: usize = message.packet_header_size;
-    self.writeCommonHeader(buffer);
-
-    switch (chunk_type) {
-        .init_ack => |tag| std.mem.writeInt(u32, buffer[4..8], tag, .big),
-        .shutdown_complete => |reflected| if (reflected) std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big),
-        else => {},
-    }
-
-    written += switch (chunk_type) {
-        .init => self.writeInit(buffer[written..]),
-        .init_ack => self.writeInitAck(buffer[written..]),
-        .cookie_echo => |cookie| self.writeCookieEcho(cookie, buffer[written..]),
-        .cookie_ack => self.writeCookieAck(buffer[written..]),
-        .abort => |tsn| self.writeNoUserDataAbort(tsn, buffer[written..]),
-        .sack => self.writeSack(buffer[written..]),
-        .heartbeat_ack => |data| writeHeartbeatAck(data, buffer[written..]),
-        .shutdown => |tsn| writeShutdown(buffer[written..], tsn),
-        .shutdown_ack => writeShutdownAck(buffer[written..]),
-        .shutdown_complete => |reflected| writeShutdownComplete(buffer[written..], reflected),
-    };
-
-    Helper.checkSum(buffer[0..written]);
-    return written;
-}
-
 fn writeSack(self: *Association, buffer: []u8) usize {
     const written = self.sack_generator.writeSack(buffer, self.reassembler.advertised_wnd);
     self.sack_generator.clearDuplicates();
@@ -664,19 +687,25 @@ fn writeInitAck(self: *Association, buffer: []u8) usize {
     std.mem.writeInt(u16, buffer[14..16], self.inbound_streams, .big);
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
 
-    const written = message.Parameter.writeBuffer(.{ .state_cookie = &self.cookie }, buffer[20..]);
+    // Cookie is 32 bytes and the smallest buffer we can write to is 128 bytes, so this should never fail.
+    const written = message.Parameter.writeBuffer(
+        .{ .state_cookie = &self.cookie },
+        buffer[20..],
+    ) catch unreachable;
     std.mem.writeInt(u16, buffer[2..4], @intCast(20 + written), .big);
     return 20 + written;
 }
 
-fn writeCookieEcho(self: *Association, cookie: []const u8, buffer: []u8) usize {
-    _ = self;
+fn writeCookieEcho(cookie: []const u8, buffer: []u8) error{WriteFailed}!usize {
+    const pad = (4 - (cookie.len % 4)) % 4;
+    if (4 + cookie.len + pad > buffer.len) return error.WriteFailed;
     buffer[0] = @intFromEnum(message.ChunkType.cookie_echo);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], @intCast(4 + cookie.len), .big);
     @memcpy(buffer[4..][0..cookie.len], cookie);
+    @memset(buffer[4 + cookie.len ..][0..pad], 0);
 
-    return 4 + cookie.len;
+    return 4 + cookie.len + pad;
 }
 
 fn writeCookieAck(self: *Association, buffer: []u8) usize {
@@ -698,10 +727,10 @@ fn writeNoUserDataAbort(self: *Association, tsn: u32, buffer: []u8) usize {
     return 4 + written;
 }
 
-fn writeHeartbeatAck(data: []const u8, buffer: []u8) usize {
+fn writeHeartbeatAck(data: []const u8, buffer: []u8) !usize {
     buffer[0] = @intFromEnum(message.ChunkType.heartbeat_ack);
     buffer[1] = 0; // flags
-    const written = message.Parameter.writeBuffer(.{ .heartbeat_info = data }, buffer[4..]);
+    const written = try message.Parameter.writeBuffer(.{ .heartbeat_info = data }, buffer[4..]);
     std.mem.writeInt(u16, buffer[2..4], @intCast(written + 4), .big);
     return written + 4;
 }
@@ -839,15 +868,15 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
     var out: [message.mtu]u8 = undefined;
-    while (assoc.pollTransmit(&out, 0)) |_| {}
+    while (try assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }), 0);
     try assoc.handleTimeout(10_000);
 
-    const packet = assoc.pollTransmit(&out, 10_000).?;
+    const packet = (try assoc.pollTransmit(&out, 10_000)).?;
     try testing.expectEqual(assoc.initial_tsn, std.mem.readInt(u32, packet[16..20], .big));
-    try testing.expectEqual(null, assoc.pollTransmit(&out, 10_000));
+    try testing.expectEqual(null, try assoc.pollTransmit(&out, 10_000));
 }
 
 test "Association.pollTransmit: control chunks are sent before retransmissions" {
@@ -859,7 +888,7 @@ test "Association.pollTransmit: control chunks are sent before retransmissions" 
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     var out: [message.mtu]u8 = undefined;
-    while (assoc.pollTransmit(&out, 0)) |_| {}
+    while (try assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
     var lens: [1]usize = undefined;
@@ -874,12 +903,122 @@ test "Association.pollTransmit: control chunks are sent before retransmissions" 
     // both the delayed sack and T3 expire
     try assoc.handleTimeout(10_000);
 
-    const sack = assoc.pollTransmit(&out, 10_000).?;
-    try testing.expectEqual(@intFromEnum(message.ChunkType.sack), sack[12]);
+    const packet_data = (try assoc.pollTransmit(&out, 10_000)).?;
+    var packet = try message.Packet.parse(packet_data);
+    var it = packet.iterateChunks();
+    var chunk = try it.next() orelse return error.UnexpectedFailedTest;
+    try testing.expect(std.meta.activeTag(chunk) == .sack);
 
-    const retransmit = assoc.pollTransmit(&out, 10_000).?;
-    try testing.expectEqual(@intFromEnum(message.ChunkType.data), retransmit[12]);
+    chunk = try it.next() orelse return error.UnexpectedFailedTest;
+    try testing.expect(std.meta.activeTag(chunk) == .data);
+    try testing.expect(try it.next() == null);
+}
+
+test "Association.pollTransmit: a retransmission that does not fit is sent in the next packet" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    assoc.peer_initial_tsn = 100;
+    try assoc.setStateToEstablished();
+    _ = assoc.pollEvent();
+
+    const data: [message.mtu - message.packet_header_size - message.data_chunk_header_size]u8 = @splat('a');
+    try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.mtu]u8 = undefined;
+    while (try assoc.pollTransmit(&out, 0)) |_| {}
+
+    try assoc.pushSack();
+    try assoc.handleTimeout(10_000);
+
+    var packet = try message.Packet.parse((try assoc.pollTransmit(&out, 10_000)).?);
+    var it = packet.iterateChunks();
+    try testing.expect(std.meta.activeTag(try it.next() orelse return error.UnexpectedFailedTest) == .sack);
+    try testing.expect(try it.next() == null);
+
+    const retransmit = (try assoc.pollTransmit(&out, 10_000)).?;
+    try testing.expectEqual(message.mtu, retransmit.len);
     try testing.expectEqual(assoc.initial_tsn, std.mem.readInt(u32, retransmit[16..20], .big));
+}
+
+test "Association.pollTransmit: cookie echo is padded when bundled" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+
+    try assoc.transmits.pushBack(testing.allocator, .{ .cookie_echo = "abcde" });
+    try assoc.transmits.pushBack(testing.allocator, .cookie_ack);
+
+    var out: [message.mtu]u8 = undefined;
+    const packet = (try assoc.pollTransmit(&out, 0)).?;
+    try testing.expectEqual(message.packet_header_size + 12 + 4, packet.len);
+    try testing.expectEqual(9, std.mem.readInt(u16, packet[14..16], .big));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, packet[21..24]);
+    try testing.expectEqual(@intFromEnum(message.ChunkType.cookie_ack), packet[24]);
+}
+
+test "Association.pollTransmit: a cookie echo that does not fit does not arm the init timer" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+
+    const cookie: [min_buffer_size]u8 = @splat('c');
+    try assoc.transmits.pushBack(testing.allocator, .{ .cookie_echo = &cookie });
+
+    var out: [min_buffer_size]u8 = undefined;
+    try testing.expectError(error.WriteFailed, assoc.pollTransmit(&out, 0));
+    try testing.expectError(error.WriteFailed, assoc.pollTransmit(&out, 0));
+    try testing.expectEqual(0, assoc.init_attempts);
+    try testing.expectEqual(std.math.maxInt(i64), assoc.init_deadline);
+    try testing.expectEqual(1, assoc.transmits.len);
+}
+
+test "Association.pollTransmit: data chunk padding fits in a buffer not aligned to 4 bytes" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+    _ = assoc.pollEvent();
+
+    const data: [500]u8 = @splat('a');
+    try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [min_buffer_size + 2]u8 = undefined;
+    const packet = (try assoc.pollTransmit(&out, 0)).?;
+    try testing.expectEqual(0, packet.len % 4);
+    try testing.expect(packet.len <= out.len);
+}
+
+test "Association.pollTransmit: init, init_ack and shutdown_complete must not be bundled" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+
+    try assoc.transmits.pushBack(testing.allocator, .init);
+    try assoc.transmits.pushBack(testing.allocator, .{ .init_ack = assoc.verification_tag });
+    try assoc.transmits.pushBack(testing.allocator, .{ .heartbeat_ack = &.{ 1, 2, 3 } });
+    try assoc.transmits.pushBack(testing.allocator, .{ .shutdown_complete = true });
+
+    var out: [message.mtu]u8 = undefined;
+    for (0..4) |_| try testing.expect(try assoc.pollTransmit(&out, 0) != null);
+    try testing.expectEqual(null, try assoc.pollTransmit(&out, 0));
+}
+
+test "Association.pollTransmit: bundle control messages with data" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.setStateToEstablished();
+
+    try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+    try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
+
+    try assoc.transmits.pushBack(testing.allocator, .init);
+    try assoc.transmits.pushBack(testing.allocator, .cookie_ack);
+
+    var out: [message.mtu]u8 = undefined;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+    const data = (try assoc.pollTransmit(&out, 0)).?;
+    var packet = try message.Packet.parse(data);
+    var it = packet.iterateChunks();
+    try testing.expect(std.meta.activeTag(try it.next() orelse return error.UnexpectedFailedTest) == .cookie_ack);
+    try testing.expect(std.meta.activeTag(try it.next() orelse return error.UnexpectedFailedTest) == .data);
+    try testing.expect(std.meta.activeTag(try it.next() orelse return error.UnexpectedFailedTest) == .data);
+    try testing.expect(try it.next() == null);
+
+    try testing.expect(try assoc.pollTransmit(&out, 0) == null);
 }
 
 test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
@@ -889,9 +1028,10 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     _ = assoc.pollEvent();
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
-    try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
     var out: [message.mtu]u8 = undefined;
-    _ = assoc.pollTransmit(&out, 0).?;
+    _ = (try assoc.pollTransmit(&out, 0)).?;
+
+    try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}), 0);
@@ -899,7 +1039,7 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
 
     try testing.expectEqual(null, assoc.pollEvent());
     try testing.expectEqual(2, assoc.message_queue.messages.len);
-    try testing.expect(assoc.pollTransmit(&out, 0) != null);
+    try testing.expect(try assoc.pollTransmit(&out, 0) != null);
 }
 
 test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
@@ -1045,7 +1185,7 @@ test "Association.handleRead: out of the blue shutdown ack is answered with a re
     try testing.expectEqual(null, assoc.pollEvent());
 
     var out: [message.mtu]u8 = undefined;
-    const packet = assoc.pollTransmit(&out, 0).?;
+    const packet = (try assoc.pollTransmit(&out, 0)).?;
     try testing.expectEqual(assoc.verification_tag, std.mem.readInt(u32, packet[4..8], .big));
     try testing.expectEqual(@intFromEnum(message.ChunkType.shutdown_complete), packet[12]);
     try testing.expectEqual(0x01, packet[13]);
