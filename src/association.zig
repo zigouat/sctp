@@ -9,7 +9,6 @@ const Helper = @import("helper.zig");
 const Association = @This();
 const Io = std.Io;
 
-const a_rwnd = 1_000_000;
 const sack_delay = 200;
 const max_init_retransmits = 8;
 const assoc_max_retransmits = 10;
@@ -24,9 +23,10 @@ pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 pub const Config = struct {
     source_port: u16,
     dest_port: u16,
+    random: std.Random,
     outbound_streams: u16 = std.math.maxInt(u16),
     inbound_streams: u16 = std.math.maxInt(u16),
-    random: std.Random,
+    receive_buffer_size: u32 = 1024 * 1024, // 1 MiB
 };
 
 pub const Event = union(enum) {
@@ -182,7 +182,7 @@ sack_deadline: i64 = std.math.maxInt(i64),
 message_queue: MessageQueue,
 reassembler: Reassembler,
 transmits: std.Deque(Transmit),
-events: std.Deque(Event) = .empty,
+events: std.Deque(Event),
 
 t3_timer: RetransmissionTimer,
 
@@ -191,7 +191,6 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
 
     return Association{
         .allocator = allocator,
-        .transmits = .empty,
         .state = .closed,
         .source_port = config.source_port,
         .dest_port = config.dest_port,
@@ -204,8 +203,10 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .cookie = config.random.array(u8, 32),
         .peer_cookie = &.{},
         .rwnd = 0,
-        .cwnd = a_rwnd,
-        .reassembler = .init(a_rwnd),
+        .cwnd = config.receive_buffer_size,
+        .transmits = .empty,
+        .events = .empty,
+        .reassembler = .init(config.receive_buffer_size),
         .init_attempts = 0,
         .init_rto = 1,
         .init_deadline = std.math.maxInt(i64),
@@ -334,8 +335,8 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 .established, .shutdown_pending, .shutdown_received, .cookie_echoed => {
                     const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
                     self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch continue;
-                    self.rwnd = sack.a_rwnd;
                     self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
+                    self.rwnd = sack.a_rwnd -| self.message_queue.getOutstandingDataSize(&self.sack_handler);
                     self.t3_timer.calculateRto(&self.sack_handler, now);
                     self.updateT3Timer(prev_cumulative_tsn, now);
                     try self.maybeSendShutdown();
@@ -406,7 +407,10 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
         switch (self.state) {
             .shutdown_sent => try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn }),
             .shutdown_ack_sent => try self.transmits.pushBack(self.allocator, .shutdown_ack),
-            else => self.message_queue.retransmit_index = 0,
+            else => {
+                self.rwnd +|= @intCast(self.message_queue.getOutstandingDataSize(&self.sack_handler));
+                self.message_queue.retransmit_index = 0;
+            },
         }
         self.t3_timer.backoffAndRestart(now);
         self.t3_timer.clearCurrentSample();
@@ -465,17 +469,24 @@ pub fn pollTimeout(self: *Association) ?i64 {
 
 fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) TransmitError!?struct { ?Transmit, usize } {
     const chunk_type = self.transmits.front() orelse {
-        if (try self.message_queue.nextRetransmit(&self.sack_handler, buffer)) |written| return .{ null, written };
+        if (try self.message_queue.nextRetransmit(&self.sack_handler, buffer)) |written| {
+            self.rwnd -|= @intCast(written.@"0");
+            return .{ null, written.@"1" };
+        }
 
         switch (self.state) {
             .established, .shutdown_received, .shutdown_pending => {},
             else => return null,
         }
 
-        const written = try self.message_queue.nextChunk(self.allocator, buffer) orelse return null;
+        const next_chunk_size = self.message_queue.nextChunkSize(buffer.len) orelse return null;
+        if (self.rwnd < next_chunk_size) return null;
+
+        const written = try self.message_queue.nextChunk(self.allocator, buffer);
+        self.rwnd -|= @intCast(written.@"0");
         self.t3_timer.setDeadline(now);
         self.t3_timer.setSample(self.message_queue.curr_tsn -% 1, now);
-        return .{ null, written };
+        return .{ null, written.@"1" };
     };
 
     if (!first_chunk) switch (chunk_type) {
@@ -669,7 +680,7 @@ fn writeInit(self: *Association, buffer: []u8) usize {
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 20, .big);
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
-    std.mem.writeInt(u32, buffer[8..12], a_rwnd, .big);
+    std.mem.writeInt(u32, buffer[8..12], self.reassembler.capacity, .big);
     std.mem.writeInt(u16, buffer[12..14], self.outbound_streams, .big);
     std.mem.writeInt(u16, buffer[14..16], self.inbound_streams, .big);
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
@@ -682,7 +693,7 @@ fn writeInitAck(self: *Association, buffer: []u8) usize {
     buffer[1] = 0; // flags
 
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
-    std.mem.writeInt(u32, buffer[8..12], a_rwnd, .big);
+    std.mem.writeInt(u32, buffer[8..12], self.reassembler.capacity, .big);
     std.mem.writeInt(u16, buffer[12..14], self.outbound_streams, .big);
     std.mem.writeInt(u16, buffer[14..16], self.inbound_streams, .big);
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
@@ -790,6 +801,7 @@ fn testAssoc() Association {
     });
     assoc.peer_verification_tag = assoc.verification_tag;
     assoc.peer_initial_tsn = assoc.initial_tsn;
+    assoc.rwnd = 1024 * 1024;
     return assoc;
 }
 
@@ -845,7 +857,7 @@ fn testSackPacket(buffer: *[32]u8, assoc: *const Association, cumulative_tsn: u3
     buffer[12] = @intFromEnum(message.ChunkType.sack);
     buffer[13] = 0;
     std.mem.writeInt(u32, buffer[16..20], cumulative_tsn, .big);
-    std.mem.writeInt(u32, buffer[20..24], a_rwnd, .big);
+    std.mem.writeInt(u32, buffer[20..24], assoc.reassembler.advertised_wnd, .big);
     std.mem.writeInt(u16, buffer[24..26], @intCast(gaps.len / 2), .big);
     std.mem.writeInt(u16, buffer[26..28], 0, .big);
     for (0..gaps.len / 2) |idx| {

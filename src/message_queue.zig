@@ -60,8 +60,16 @@ pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const
     if (!config.unordered) result.value_ptr.* +%= 1;
 }
 
-pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!?usize {
+pub fn nextChunkSize(self: *MessageQueue, buffer_size: usize) ?u32 {
     if (self.curr_msg >= self.messages.len) return null;
+    const msg = self.messages.atPtr(self.curr_msg);
+    const curr_payload = msg.data.len - self.message_offset;
+    const max_payload = std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4);
+    return @intCast(@min(curr_payload, max_payload));
+}
+
+pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!struct { usize, usize } {
+    std.debug.assert(self.curr_msg < self.messages.len);
     try self.chunks.ensureUnusedCapacity(allocator, 1);
 
     const msg = self.messages.atPtr(self.curr_msg);
@@ -90,10 +98,24 @@ pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8
         self.message_offset += @intCast(payload_size);
     }
 
-    return chunk.write(buffer);
+    return .{ chunk.user_data.len, chunk.write(buffer) };
 }
 
-pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buffer: []u8) error{WriteFailed}!?usize {
+pub fn getOutstandingDataSize(self: *const MessageQueue, sack_handler: *const SackHandler) u32 {
+    var start: usize = 0;
+    const end: usize = if (self.retransmit_index) |index| index else self.chunks.len; // a retransmission in progress.
+
+    var size: u32 = 0;
+    while (start < end) : (start += 1) {
+        const chunk = self.chunks.atPtr(start);
+        if (sack_handler.isAcked(chunk.tsn)) continue;
+        size += @intCast(chunk.user_data.len);
+    }
+
+    return size;
+}
+
+pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buffer: []u8) error{WriteFailed}!?struct { u32, u32 } {
     if (self.retransmit_index == null or self.retransmit_index.? >= self.chunks.len) {
         self.retransmit_index = null;
         return null;
@@ -112,7 +134,7 @@ pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buf
 
         if (chunk.getSize() > buffer.len) return error.WriteFailed;
         self.retransmit_index = self.retransmit_index.? + 1;
-        return chunk.write(buffer);
+        return .{ @intCast(chunk.user_data.len), @intCast(chunk.write(buffer)) };
     }
 }
 
