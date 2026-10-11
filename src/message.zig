@@ -204,6 +204,8 @@ pub const Data = struct {
     }
 
     pub fn write(self: *const Data, buffer: []u8) usize {
+        const size = self.getSize();
+
         buffer[0] = @intFromEnum(ChunkType.data);
         buffer[1] = @bitCast(self.flags);
         std.mem.writeInt(u16, buffer[2..4], @intCast(self.user_data.len + data_chunk_header_size), .big);
@@ -213,8 +215,13 @@ pub const Data = struct {
         std.mem.writeInt(u32, buffer[12..16], self.ppid, .big);
         @memcpy(buffer[data_chunk_header_size..][0..self.user_data.len], self.user_data);
 
-        const pad = (4 - (self.user_data.len % 4)) % 4;
+        const pad = size - data_chunk_header_size - self.user_data.len;
         @memset(buffer[data_chunk_header_size + self.user_data.len ..][0..pad], 0);
+        return size;
+    }
+
+    pub fn getSize(self: *const Data) usize {
+        const pad = (4 - (self.user_data.len % 4)) % 4;
         return data_chunk_header_size + self.user_data.len + pad;
     }
 
@@ -378,20 +385,21 @@ pub const Parameter = union(enum) {
     state_cookie: []const u8,
     unknown: struct { param_type: u16, value: []const u8 },
 
-    pub fn writeBuffer(self: Parameter, buffer: []u8) usize {
-        return switch (self) {
+    pub fn writeBuffer(self: Parameter, buffer: []u8) error{WriteFailed}!usize {
+        return try switch (self) {
             .heartbeat_info => |value| writeTLV(ParameterType.heartbeat_info, value, buffer),
             .state_cookie => |value| writeTLV(ParameterType.state_cookie, value, buffer),
             .unknown => |param| writeTLV(@enumFromInt(param.param_type), param.value, buffer),
         };
     }
 
-    fn writeTLV(typ: ParameterType, data: []const u8, buffer: []u8) usize {
+    fn writeTLV(typ: ParameterType, data: []const u8, buffer: []u8) !usize {
+        const pad = (4 - (data.len % 4)) % 4;
+        if (buffer.len < data.len + 4 + pad) return error.WriteFailed;
+
         std.mem.writeInt(u16, buffer[0..2], @intFromEnum(typ), .big);
         std.mem.writeInt(u16, buffer[2..4], @intCast(data.len + 4), .big);
         @memcpy(buffer[4..][0..data.len], data);
-
-        const pad = (4 - (data.len % 4)) % 4;
         @memset(buffer[4 + data.len ..][0..pad], 0);
         return data.len + 4 + pad;
     }
