@@ -11,7 +11,6 @@ pub const bitmap_bits = 1024;
 cumulative_tsn: u32,
 highest_tsn_received: u32,
 bitmap: BitSet,
-all_acked: bool,
 
 /// Iterates the tsns acked by gap blocks, i.e. the set bits in (cumulative_tsn, highest_tsn_received], in tsn order.
 pub const GapAckedIterator = struct {
@@ -64,7 +63,6 @@ pub fn init(initial_tsn: u32) SackHandler {
         .cumulative_tsn = initial_tsn -% 1,
         .highest_tsn_received = initial_tsn -% 1,
         .bitmap = .empty,
-        .all_acked = true,
     };
 }
 
@@ -84,35 +82,52 @@ pub fn handleSack(self: *SackHandler, sack: *const message.Sack, highest_tsn_sen
     self.cumulative_tsn = sack.cumulative_tsn;
     self.highest_tsn_received = sack.cumulative_tsn;
 
-    var last_block = message.Sack.GapAckBlockIterator.Block{
-        .start = sack.cumulative_tsn,
-        .end = sack.cumulative_tsn,
-    };
-    self.all_acked = true;
-
     it = sack.iterateGapAckBlocks();
     while (it.nextBlock() catch unreachable) |block| {
         self.setRange(block.start, block.end, true);
         if (Helper.tsnGt(block.end, self.highest_tsn_received)) self.highest_tsn_received = block.end;
-
-        self.all_acked &= block.start == last_block.end +% 1;
-        last_block = block;
     }
-    self.all_acked &= last_block.end == highest_tsn_sent;
 }
 
-pub fn handleCumulativeTsn(self: *SackHandler, cumulative_tsn: u32, highest_tsn_sent: u32) void {
+pub fn handleCumulativeTsn(self: *SackHandler, cumulative_tsn: u32) void {
     if (!Helper.tsnGt(cumulative_tsn, self.cumulative_tsn)) return;
     self.setRange(self.cumulative_tsn +% 1, cumulative_tsn, false);
     self.cumulative_tsn = cumulative_tsn;
     if (Helper.tsnGt(cumulative_tsn, self.highest_tsn_received)) self.highest_tsn_received = cumulative_tsn;
-    self.all_acked = cumulative_tsn == highest_tsn_sent;
 }
 
 pub fn isAcked(self: *const SackHandler, tsn: u32) bool {
     if (Helper.tsnLte(tsn, self.cumulative_tsn)) return true;
     if (Helper.tsnGt(tsn, self.highest_tsn_received)) return false;
     return self.isBitSet(bitIndex(tsn));
+}
+
+pub fn isRangeAcked(self: *const SackHandler, start_tsn: u32, end_tsn: u32) bool {
+    const MaskInt = BitSet.MaskInt;
+    const word_bits = @bitSizeOf(MaskInt);
+
+    if (Helper.tsnLte(end_tsn, self.cumulative_tsn)) return true;
+
+    var tsn = if (Helper.tsnLte(start_tsn, self.cumulative_tsn)) self.cumulative_tsn +% 1 else start_tsn;
+    var remaining = end_tsn -% tsn +% 1;
+    while (remaining > 0) {
+        const index = bitIndex(tsn);
+        const shift: BitSet.ShiftInt = @intCast(index % word_bits);
+        const len = @min(word_bits - @as(u32, shift), remaining);
+
+        var unacked = ~self.bitmap.masks[index / word_bits] >> shift;
+        if (len < word_bits) unacked &= (@as(MaskInt, 1) << @intCast(len)) - 1;
+        if (unacked != 0) return false;
+
+        tsn +%= len;
+        remaining -= len;
+    }
+
+    return true;
+}
+
+pub fn allAcked(self: *const SackHandler, highest_tsn_sent: u32) bool {
+    return self.highest_tsn_received == highest_tsn_sent and self.isRangeAcked(self.cumulative_tsn, highest_tsn_sent);
 }
 
 pub fn iterateGapAcked(self: *const SackHandler) GapAckedIterator {
@@ -214,48 +229,10 @@ test "SackHandler.handleSack: a sack acknowledging tsns that were never sent is 
     try testing.expect(!h.isAcked(3));
 }
 
-test "SackHandler.handleSack: set all_acked" {
-    // the cumulative tsn reaches the highest tsn sent
-    {
-        var h = SackHandler.init(1);
-        try h.handleSack(&testSack(10, &.{}), 10);
-        try testing.expect(h.all_acked);
-    }
-
-    // contiguous gap blocks reach the highest tsn sent
-    {
-        var h = SackHandler.init(1);
-        try h.handleSack(&testSack(1, &.{ 0, 1, 0, 3, 0, 4, 0, 5 }), 6);
-        try testing.expect(h.all_acked);
-    }
-}
-
-test "SackHandler.handleSack: clear all_acked" {
-    // a hole or a trailing unacked tsn
-    {
-        var h = SackHandler.init(1);
-        try h.handleSack(&testSack(1, &.{ 0, 2, 0, 5 }), 6);
-        try testing.expect(!h.all_acked);
-
-        try h.handleSack(&testSack(1, &.{ 0, 1, 0, 4 }), 6);
-        try testing.expect(!h.all_acked);
-    }
-
-    // reneged gap blocks
-    {
-        var h = SackHandler.init(1);
-        try h.handleSack(&testSack(1, &.{ 0, 1, 0, 5 }), 6);
-        try testing.expect(h.all_acked);
-
-        try h.handleSack(&testSack(1, &.{}), 6);
-        try testing.expect(!h.all_acked);
-    }
-}
-
 test "SackHandler.handleCumulativeTsn: cumulative tsn clears the gap bits it passes" {
     var h = SackHandler.init(1);
     try h.handleSack(&testSack(1, &.{ 0, 2, 0, 3, 0, 5, 0, 5 }), 100);
-    h.handleCumulativeTsn(4, 100);
+    h.handleCumulativeTsn(4);
 
     try testing.expectEqual(4, h.cumulative_tsn);
     try testing.expect(!h.isBitSet(3));
@@ -266,7 +243,7 @@ test "SackHandler.handleCumulativeTsn: cumulative tsn clears the gap bits it pas
 
 test "SackHandler.handleCumulativeTsn: cumulative tsn past the highest tsn updates it" {
     var h = SackHandler.init(1);
-    h.handleCumulativeTsn(10, 100);
+    h.handleCumulativeTsn(10);
 
     try testing.expectEqual(10, h.highest_tsn_received);
     try h.handleSack(&testSack(10, &.{ 0, 2, 0, 2 }), 100);
@@ -277,18 +254,40 @@ test "SackHandler.handleCumulativeTsn: cumulative tsn past the highest tsn updat
 test "SackHandler.handleCumulativeTsn: older cumulative tsn is ignored" {
     var h = SackHandler.init(1);
     try h.handleSack(&testSack(5, &.{}), 100);
-    h.handleCumulativeTsn(3, 100);
+    h.handleCumulativeTsn(3);
 
     try testing.expectEqual(5, h.cumulative_tsn);
 }
 
-test "SackHandler.handleCumulativeTsn: all acked only when it reaches the highest tsn sent" {
+test "SackHandler.allAcked" {
     var h = SackHandler.init(1);
-    h.handleCumulativeTsn(5, 10);
-    try testing.expect(!h.all_acked);
+    try testing.expect(h.allAcked(0));
 
-    h.handleCumulativeTsn(10, 10);
-    try testing.expect(h.all_acked);
+    // a hole
+    try h.handleSack(&testSack(1, &.{ 0, 2, 0, 5 }), 6);
+    try testing.expect(!h.allAcked(6));
+
+    // a trailing unacked tsn
+    try h.handleSack(&testSack(1, &.{ 0, 1, 0, 4 }), 6);
+    try testing.expect(!h.allAcked(6));
+
+    // contiguous gap blocks reach the highest tsn sent
+    try h.handleSack(&testSack(1, &.{ 0, 1, 0, 3, 0, 4, 0, 5 }), 6);
+    try testing.expect(h.allAcked(6));
+
+    // reneged gap blocks
+    try h.handleSack(&testSack(1, &.{}), 6);
+    try testing.expect(!h.allAcked(6));
+
+    h.handleCumulativeTsn(5);
+    try testing.expect(!h.allAcked(6));
+    h.handleCumulativeTsn(6);
+    try testing.expect(h.allAcked(6));
+
+    // the cumulative tsn reaches the highest tsn sent
+    try h.handleSack(&testSack(10, &.{}), 10);
+    try testing.expect(h.allAcked(10));
+    try testing.expect(!h.allAcked(12));
 }
 
 test "GapAckedIterator: yields the gap acked tsns in order" {
@@ -334,4 +333,47 @@ test "GapAckedIterator: nothing to iterate without gap blocks" {
 
     var it = SackHandler.GapAckedIterator.init(&h);
     try testing.expectEqual(null, it.next());
+}
+
+test "SackHandler.isRangeAcked: ranges spanning multiple words" {
+    var h = SackHandler.init(1);
+    try h.handleSack(&testSack(1, &.{ 0, 2, 0, 3, 0, 5, 0, 5, 0, 14, 0, 200 }), 1000);
+
+    try testing.expect(h.isRangeAcked(3, 4));
+    try testing.expect(h.isRangeAcked(70, 189));
+    try testing.expect(!h.isRangeAcked(3, 5));
+}
+
+test "SackHandler.isRangeAcked: an unacked start tsn" {
+    var h = SackHandler.init(1);
+    try h.handleSack(&testSack(1, &.{ 0, 3, 0, 4 }), 1000);
+
+    try testing.expect(!h.isRangeAcked(3, 5));
+    try testing.expect(h.isRangeAcked(4, 5));
+}
+
+test "SackHandler.isRangeAcked: range ending on the last bit of a word" {
+    var h = SackHandler.init(1);
+    try h.handleSack(&testSack(1, &.{ 0, 60, 0, 70 }), 1000);
+
+    try testing.expect(h.isRangeAcked(61, 63));
+    try testing.expect(h.isRangeAcked(61, 71));
+}
+
+test "SackHandler.isRangeAcked: tsns wrapping around u32" {
+    const init_tsn: u32 = 0xFFFFFFF0;
+    var h = SackHandler.init(init_tsn);
+    try h.handleSack(&testSack(init_tsn, &.{ 0, 30, 0, 30 }), init_tsn +% 100);
+
+    try testing.expect(!h.isRangeAcked(0xFFFFFFF5, 5));
+    try testing.expect(h.isRangeAcked(init_tsn +% 30, init_tsn +% 30));
+}
+
+test "SackHandler.isRangeAcked: ranges starting at or below the cumulative tsn" {
+    var h = SackHandler.init(1);
+    try h.handleSack(&testSack(10, &.{ 0, 1, 0, 2 }), 1000);
+
+    try testing.expect(h.isRangeAcked(5, 10));
+    try testing.expect(h.isRangeAcked(5, 12));
+    try testing.expect(!h.isRangeAcked(5, 13));
 }

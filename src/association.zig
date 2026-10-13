@@ -553,7 +553,7 @@ fn updateT3Timer(self: *Association, prev_cumulative_tsn: u32, now: i64) void {
     if (cumulative_tsn_advanced or self.zero_wnd_probe) self.t3_timer.error_count = 0;
     if (cumulative_tsn_advanced) self.zero_wnd_probe = false;
 
-    if (self.sack_handler.all_acked) {
+    if (self.sack_handler.allAcked(self.message_queue.curr_tsn -% 1)) {
         self.t3_timer.stop();
     } else if (cumulative_tsn_advanced or self.t3_timer.deadline == std.math.maxInt(i64)) {
         // a stopped timer with unacked data means the peer reneged on gap acked tsns
@@ -603,17 +603,22 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
 
 fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
     const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
-    const curr_flight_size = self.message_queue.flight_size;
+    const prev_flight_size = self.message_queue.flight_size;
 
     self.updateGapAckedFlightSize(true);
     self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch {
-        self.message_queue.flight_size = curr_flight_size;
+        self.message_queue.flight_size = prev_flight_size;
         return;
     };
     self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
     self.updateGapAckedFlightSize(false);
 
     self.rwnd = sack.a_rwnd -| self.message_queue.flight_size;
+    // fast recovery will be checked later
+    if (self.cwnd <= self.ssthresh and prev_flight_size >= self.cwnd) {
+        self.cwnd += @min(message.mtu, prev_flight_size -| self.message_queue.flight_size);
+    }
+
     if (self.t3_timer.rtt_tsn) |tsn| if (self.sack_handler.isAcked(tsn)) self.t3_timer.calculateRto(now);
     self.updateT3Timer(prev_cumulative_tsn, now);
     try self.maybeSendShutdown();
@@ -634,7 +639,7 @@ fn handleShutdownChunk(self: *Association, cumulative_tsn: u32, now: i64) !void 
 
     const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
     self.updateGapAckedFlightSize(true);
-    self.sack_handler.handleCumulativeTsn(cumulative_tsn, self.message_queue.curr_tsn -% 1);
+    self.sack_handler.handleCumulativeTsn(cumulative_tsn);
     self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
     self.updateGapAckedFlightSize(false);
     self.updateT3Timer(prev_cumulative_tsn, now);
