@@ -4,7 +4,8 @@ const Helper = @import("helper.zig");
 
 pub const packet_header_size = 12;
 pub const data_chunk_header_size = 16;
-pub const mtu = 1200;
+pub const MTU = 1200;
+pub const PMDCS = MTU - packet_header_size;
 
 pub const Packet = struct {
     source_port: u16,
@@ -220,9 +221,8 @@ pub const Data = struct {
         return size;
     }
 
-    pub fn getSize(self: *const Data) usize {
-        const pad = (4 - (self.user_data.len % 4)) % 4;
-        return data_chunk_header_size + self.user_data.len + pad;
+    pub fn getSize(self: *const Data) u32 {
+        return std.mem.alignForward(u32, @intCast(data_chunk_header_size + self.user_data.len), 4);
     }
 
     pub fn isComplete(self: *const Data) bool {
@@ -273,6 +273,10 @@ pub const Sack = struct {
         return GapAckBlockIterator.init(sack.gap_ack_blocks, sack.cumulative_tsn);
     }
 
+    pub fn iterateDuplicateTsns(sack: *const Sack) TsnIterator {
+        return TsnIterator{ .bytes = sack.duplicate_tsns };
+    }
+
     pub const GapAckBlockIterator = struct {
         slice: []const u8,
         tsn: u32,
@@ -311,6 +315,17 @@ pub const Sack = struct {
 
             const tsn = self.tsn +% self.offset;
             self.offset += 1;
+            return tsn;
+        }
+    };
+
+    pub const TsnIterator = struct {
+        bytes: []const u8,
+
+        pub fn next(self: *TsnIterator) ?u32 {
+            if (self.bytes.len < 4) return null;
+            const tsn = std.mem.readInt(u32, self.bytes[0..4], .big);
+            self.bytes = self.bytes[4..];
             return tsn;
         }
     };

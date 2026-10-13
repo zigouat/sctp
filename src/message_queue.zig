@@ -126,8 +126,9 @@ pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buf
     }
 }
 
-pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_tsn: u32) void {
-    if (self.isEmpty()) return;
+pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_tsn: u32) u32 {
+    if (self.isEmpty()) return 0;
+    var data_size: u32 = 0;
 
     var dropped: u32 = 0;
     const retransmit_index = self.retransmit_index orelse self.chunks.len;
@@ -142,12 +143,15 @@ pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_t
 
         if (dropped < retransmit_index) self.flight_size -= @intCast(chunk.user_data.len);
         dropped += 1;
+        data_size += chunk.getSize();
         _ = self.chunks.popFront();
     }
 
     if (self.retransmit_index) |index| {
         self.retransmit_index = if (index -| dropped < self.chunks.len) index -| dropped else null;
     }
+
+    return data_size;
 }
 
 pub fn isEmpty(self: *const MessageQueue) bool {
@@ -163,6 +167,11 @@ pub fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void 
 pub fn getCurrentRetransmitTsn(self: *const MessageQueue) ?u32 {
     if (self.retransmit_index) |index| return self.chunks.atPtr(index).tsn;
     return null;
+}
+
+pub fn getChunkSizeAt(self: *const MessageQueue, tsn: u32) u32 {
+    const index = tsn -% self.chunks.atPtr(0).tsn;
+    return self.chunks.atPtr(index).getSize();
 }
 
 fn nextRetransmitIndex(self: *MessageQueue) void {
@@ -233,7 +242,7 @@ test "MessageQueue.dropAcknowledged: acknowledging every chunk during a retransm
     _ = (try msg_queue.nextRetransmit(&sack_handler, &buffer)).?;
     try testing.expectEqual(4, msg_queue.flight_size);
 
-    msg_queue.dropAcknowledged(testing.allocator, 3);
+    _ = msg_queue.dropAcknowledged(testing.allocator, 3);
 
     try testing.expectEqual(null, msg_queue.retransmit_index);
     try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());

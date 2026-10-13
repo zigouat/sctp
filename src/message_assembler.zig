@@ -136,10 +136,10 @@ fn assembleReadyMessages(self: *MessageAssembler, allocator: std.mem.Allocator, 
 
 fn updateAdvertisedWindow(self: *MessageAssembler) void {
     const avail = self.capacity -| self.buffered_data;
-    const thres = @min(message.mtu - message.data_chunk_header_size - message.packet_header_size, self.capacity / 2);
+    const thresh = @min(message.PMDCS - message.data_chunk_header_size, self.capacity / 2);
 
     self.advertised_wnd = @min(avail, self.advertised_wnd);
-    if (avail -| self.advertised_wnd >= thres) {
+    if (avail -| self.advertised_wnd >= thresh) {
         self.advertised_wnd = avail;
     }
 }
