@@ -110,39 +110,18 @@ pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8
     return .{ chunk.user_data.len, chunk.write(buffer) };
 }
 
-pub fn getOutstandingDataSize(self: *const MessageQueue, sack_handler: *const SackHandler) u32 {
-    var start: usize = 0;
-    const end: usize = if (self.retransmit_index) |index| index else self.chunks.len; // a retransmission in progress.
-
-    var size: u32 = 0;
-    while (start < end) : (start += 1) {
-        const chunk = self.chunks.atPtr(start);
-        if (sack_handler.isAcked(chunk.tsn)) continue;
-        size += @intCast(chunk.user_data.len);
-    }
-
-    return size;
-}
-
 pub fn nextRetransmit(self: *MessageQueue, sack_handler: *const SackHandler, buffer: []u8) error{WriteFailed}!?struct { u32, u32 } {
-    if (self.retransmit_index == null or self.retransmit_index.? >= self.chunks.len) {
-        self.retransmit_index = null;
-        return null;
-    }
-
     while (true) {
+        if (self.retransmit_index == null) return null;
         const chunk = self.chunks.atPtr(self.retransmit_index.?);
         if (sack_handler.isAcked(chunk.tsn)) {
-            self.retransmit_index = self.retransmit_index.? + 1;
-            if (self.retransmit_index.? >= self.chunks.len) {
-                self.retransmit_index = null;
-                return null;
-            }
+            self.nextRetransmitIndex();
             continue;
         }
 
         if (chunk.getSize() > buffer.len) return error.WriteFailed;
-        self.retransmit_index = self.retransmit_index.? + 1;
+        self.flight_size += @intCast(chunk.user_data.len);
+        self.nextRetransmitIndex();
         return .{ @intCast(chunk.user_data.len), @intCast(chunk.write(buffer)) };
     }
 }
@@ -151,6 +130,7 @@ pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_t
     if (self.isEmpty()) return;
 
     var dropped: u32 = 0;
+    const retransmit_index = self.retransmit_index orelse self.chunks.len;
     while (self.chunks.frontPtr()) |chunk| {
         if (!Helper.tsnLte(chunk.tsn, ack_tsn)) break;
 
@@ -160,12 +140,14 @@ pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_t
             self.curr_msg -= 1;
         }
 
-        self.flight_size -|= @intCast(chunk.user_data.len);
-        _ = self.chunks.popFront();
+        if (dropped < retransmit_index) self.flight_size -= @intCast(chunk.user_data.len);
         dropped += 1;
+        _ = self.chunks.popFront();
     }
 
-    if (self.retransmit_index) |*index| index.* -|= dropped;
+    if (self.retransmit_index) |index| {
+        self.retransmit_index = if (index -| dropped < self.chunks.len) index -| dropped else null;
+    }
 }
 
 pub fn isEmpty(self: *const MessageQueue) bool {
@@ -178,7 +160,28 @@ pub fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void 
     if (inc) self.flight_size += chunk_size else self.flight_size -= chunk_size;
 }
 
+pub fn getCurrentRetransmitTsn(self: *const MessageQueue) ?u32 {
+    if (self.retransmit_index) |index| return self.chunks.atPtr(index).tsn;
+    return null;
+}
+
+fn nextRetransmitIndex(self: *MessageQueue) void {
+    if (self.retransmit_index.? + 1 >= self.chunks.len) {
+        self.retransmit_index = null;
+    } else {
+        self.retransmit_index = self.retransmit_index.? + 1;
+    }
+}
+
 const testing = std.testing;
+
+fn testSendChunks(msg_queue: *MessageQueue, count: usize) !void {
+    var buffer: [64]u8 = undefined;
+    for (0..count) |_| {
+        try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 0, .ppid = 0 });
+        _ = try msg_queue.nextChunk(testing.allocator, &buffer);
+    }
+}
 
 test "MessageQueue.pushData: unordered data does not increment stream sequence number" {
     var msg_queue = MessageQueue.init(0x12345678);
@@ -197,4 +200,42 @@ test "MessageQueue.pushData: unordered data does not increment stream sequence n
         .unordered = true,
     });
     try testing.expectEqual(1, msg_queue.streams_seq.get(100).?);
+}
+
+test "MessageQueue.nextRetransmit: retransmitting the last chunk clears the retransmit index" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+    const sack_handler = SackHandler.init(1);
+
+    try testSendChunks(&msg_queue, 2);
+    msg_queue.retransmit_index = 0;
+    msg_queue.flight_size = 0;
+
+    var buffer: [64]u8 = undefined;
+    _ = (try msg_queue.nextRetransmit(&sack_handler, &buffer)).?;
+    _ = (try msg_queue.nextRetransmit(&sack_handler, &buffer)).?;
+
+    try testing.expectEqual(null, msg_queue.retransmit_index);
+    try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
+    try testing.expectEqual(8, msg_queue.flight_size);
+}
+
+test "MessageQueue.dropAcknowledged: acknowledging every chunk during a retransmission clears the retransmit index" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+    const sack_handler = SackHandler.init(1);
+
+    try testSendChunks(&msg_queue, 3);
+    msg_queue.retransmit_index = 0;
+    msg_queue.flight_size = 0;
+
+    var buffer: [64]u8 = undefined;
+    _ = (try msg_queue.nextRetransmit(&sack_handler, &buffer)).?;
+    try testing.expectEqual(4, msg_queue.flight_size);
+
+    msg_queue.dropAcknowledged(testing.allocator, 3);
+
+    try testing.expectEqual(null, msg_queue.retransmit_index);
+    try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
+    try testing.expectEqual(0, msg_queue.flight_size);
 }

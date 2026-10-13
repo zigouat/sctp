@@ -378,29 +378,6 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
     return self.messageIterator();
 }
 
-fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
-    const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
-    const curr_flight_size = self.message_queue.flight_size;
-
-    self.updateGapAckedFlightSize(true);
-    self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch {
-        self.message_queue.flight_size = curr_flight_size;
-        return;
-    };
-    self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
-    self.updateGapAckedFlightSize(false);
-
-    self.rwnd = sack.a_rwnd -| self.message_queue.flight_size;
-    if (self.t3_timer.rtt_tsn) |tsn| if (self.sack_handler.isAcked(tsn)) self.t3_timer.calculateRto(now);
-    self.updateT3Timer(prev_cumulative_tsn, now);
-    try self.maybeSendShutdown();
-}
-
-fn updateGapAckedFlightSize(self: *Association, comptime inc: bool) void {
-    var it = self.sack_handler.iterateGapAcked();
-    while (it.next()) |tsn| self.message_queue.updateFlightSize(tsn, inc);
-}
-
 pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void {
     if (now >= self.init_deadline) {
         if (self.init_attempts > max_init_retransmits) {
@@ -429,10 +406,10 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
             .shutdown_sent => try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn }),
             .shutdown_ack_sent => try self.transmits.pushBack(self.allocator, .shutdown_ack),
             else => {
-                // Must run before resetting retransmit_index: chunks already pending retransmission are not counted,
-                // since a previous timeout already added them back.
-                self.rwnd +|= @intCast(self.message_queue.getOutstandingDataSize(&self.sack_handler));
+                self.rwnd +|= self.message_queue.flight_size;
                 self.message_queue.retransmit_index = 0;
+                self.message_queue.flight_size = 0;
+                self.cwnd = message.mtu;
             },
         }
         self.t3_timer.backoffAndRestart(now);
@@ -492,6 +469,8 @@ pub fn pollTimeout(self: *Association) ?i64 {
 
 fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) TransmitError!?struct { ?Transmit, usize } {
     const chunk_type = self.transmits.front() orelse {
+        if (self.message_queue.flight_size >= self.cwnd) return null;
+
         if (try self.message_queue.nextRetransmit(&self.sack_handler, buffer)) |written| {
             self.rwnd -|= @intCast(written.@"0");
             return .{ null, written.@"1" };
@@ -620,6 +599,30 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     self.state = .cookie_echoed;
     self.resetInitTimer();
     self.transmits.pushBackAssumeCapacity(.{ .cookie_echo = self.peer_cookie });
+}
+
+fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
+    const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
+    const curr_flight_size = self.message_queue.flight_size;
+
+    self.updateGapAckedFlightSize(true);
+    self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch {
+        self.message_queue.flight_size = curr_flight_size;
+        return;
+    };
+    self.message_queue.dropAcknowledged(self.allocator, self.sack_handler.cumulative_tsn);
+    self.updateGapAckedFlightSize(false);
+
+    self.rwnd = sack.a_rwnd -| self.message_queue.flight_size;
+    if (self.t3_timer.rtt_tsn) |tsn| if (self.sack_handler.isAcked(tsn)) self.t3_timer.calculateRto(now);
+    self.updateT3Timer(prev_cumulative_tsn, now);
+    try self.maybeSendShutdown();
+}
+
+fn updateGapAckedFlightSize(self: *Association, comptime inc: bool) void {
+    var it = self.sack_handler.iterateGapAcked();
+    const max_tsn = if (self.message_queue.getCurrentRetransmitTsn()) |tsn| tsn -% 1 else self.sack_handler.highest_tsn_received;
+    while (it.next()) |tsn| if (Helper.tsnLte(tsn, max_tsn)) self.message_queue.updateFlightSize(tsn, inc);
 }
 
 fn handleShutdownChunk(self: *Association, cumulative_tsn: u32, now: i64) !void {
