@@ -8,6 +8,8 @@ const SackHandler = @import("sack_handler.zig");
 streams_seq: std.AutoHashMapUnmanaged(u16, u16),
 messages: std.Deque(message.UserMessage),
 chunks: std.Deque(message.Data),
+flight_size: u32,
+pending_size: u32,
 curr_tsn: u32,
 curr_msg: u32,
 message_offset: u32,
@@ -22,6 +24,8 @@ pub fn init(initial_tsn: u32) MessageQueue {
         .curr_msg = 0,
         .message_offset = 0,
         .retransmit_index = null,
+        .flight_size = 0,
+        .pending_size = 0,
     };
 }
 
@@ -57,11 +61,13 @@ pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const
         .stream_seq = if (config.unordered) 0 else result.value_ptr.*,
         .unordered = config.unordered,
     });
+    self.pending_size +|= @intCast(data.len);
     if (!config.unordered) result.value_ptr.* +%= 1;
 }
 
 pub fn nextChunkSize(self: *MessageQueue, buffer_size: usize) ?u32 {
     if (self.curr_msg >= self.messages.len) return null;
+    if (self.chunks.len >= 1024) return null;
     const msg = self.messages.atPtr(self.curr_msg);
     const curr_payload = msg.data.len - self.message_offset;
     const max_payload = std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4);
@@ -97,6 +103,9 @@ pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8
     } else {
         self.message_offset += @intCast(payload_size);
     }
+
+    self.pending_size -|= @intCast(payload_size);
+    self.flight_size += @intCast(payload_size);
 
     return .{ chunk.user_data.len, chunk.write(buffer) };
 }
@@ -151,6 +160,7 @@ pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_t
             self.curr_msg -= 1;
         }
 
+        self.flight_size -|= @intCast(chunk.user_data.len);
         _ = self.chunks.popFront();
         dropped += 1;
     }
@@ -160,6 +170,12 @@ pub fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator, ack_t
 
 pub fn isEmpty(self: *const MessageQueue) bool {
     return self.messages.len == 0;
+}
+
+pub fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void {
+    const index = tsn -% self.chunks.atPtr(0).tsn;
+    const chunk_size: u32 = @intCast(self.chunks.atPtr(index).user_data.len);
+    if (inc) self.flight_size += chunk_size else self.flight_size -= chunk_size;
 }
 
 const testing = std.testing;

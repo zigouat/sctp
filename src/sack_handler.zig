@@ -4,13 +4,60 @@ const message = @import("message.zig");
 const Helper = @import("helper.zig");
 
 const SackHandler = @This();
+const BitSet = std.bit_set.ArrayBitSet(usize, bitmap_bits);
 
 pub const bitmap_bits = 1024;
 
 cumulative_tsn: u32,
 highest_tsn_received: u32,
-bitmap: std.bit_set.StaticBitSet(bitmap_bits),
+bitmap: BitSet,
 all_acked: bool,
+
+/// Iterates the tsns acked by gap blocks, i.e. the set bits in (cumulative_tsn, highest_tsn_received], in tsn order.
+pub const GapAckedIterator = struct {
+    const MaskInt = BitSet.MaskInt;
+    const ShiftInt = BitSet.ShiftInt;
+    const word_bits = @bitSizeOf(MaskInt);
+
+    handler: *const SackHandler,
+    /// the next tsn to examine
+    next_tsn: u32,
+    /// the number of tsns left to examine
+    remaining: u32,
+
+    fn init(handler: *const SackHandler) GapAckedIterator {
+        return .{
+            .handler = handler,
+            .next_tsn = handler.cumulative_tsn +% 1,
+            .remaining = handler.highest_tsn_received -% handler.cumulative_tsn,
+        };
+    }
+
+    pub fn next(self: *GapAckedIterator) ?u32 {
+        while (self.remaining > 0) {
+            // bitmap_bits is a multiple of word_bits, so a word never crosses the end of the ring.
+            const index = bitIndex(self.next_tsn);
+            const shift: ShiftInt = @intCast(index % word_bits);
+            const len = @min(word_bits - @as(u32, shift), self.remaining);
+
+            var word = self.handler.bitmap.masks[index / word_bits] >> shift;
+            if (len < word_bits) word &= (@as(MaskInt, 1) << @intCast(len)) - 1;
+
+            if (word == 0) {
+                self.next_tsn +%= len;
+                self.remaining -= len;
+                continue;
+            }
+
+            const skip: u32 = @ctz(word);
+            const tsn = self.next_tsn +% skip;
+            self.next_tsn = tsn +% 1;
+            self.remaining -= skip + 1;
+            return tsn;
+        }
+        return null;
+    }
+};
 
 pub fn init(initial_tsn: u32) SackHandler {
     return .{
@@ -66,6 +113,10 @@ pub fn isAcked(self: *const SackHandler, tsn: u32) bool {
     if (Helper.tsnLte(tsn, self.cumulative_tsn)) return true;
     if (Helper.tsnGt(tsn, self.highest_tsn_received)) return false;
     return self.isBitSet(bitIndex(tsn));
+}
+
+pub fn iterateGapAcked(self: *const SackHandler) GapAckedIterator {
+    return GapAckedIterator.init(self);
 }
 
 fn setRange(self: *SackHandler, start_tsn: u32, end_tsn: u32, value: bool) void {
@@ -238,4 +289,49 @@ test "SackHandler.handleCumulativeTsn: all acked only when it reaches the highes
 
     h.handleCumulativeTsn(10, 10);
     try testing.expect(h.all_acked);
+}
+
+test "GapAckedIterator: yields the gap acked tsns in order" {
+    var h = SackHandler.init(1);
+    try h.handleSack(&testSack(1, &.{ 0, 2, 0, 3, 0, 5, 0, 5 }), 100);
+
+    var it = SackHandler.GapAckedIterator.init(&h);
+    try testing.expectEqual(3, it.next().?);
+    try testing.expectEqual(4, it.next().?);
+    try testing.expectEqual(6, it.next().?);
+    try testing.expectEqual(null, it.next());
+}
+
+test "GapAckedIterator: tsns wrapping around u32" {
+    const init_tsn: u32 = 0xFFFFFFFA;
+    var h = SackHandler.init(init_tsn);
+    try h.handleSack(&testSack(init_tsn, &.{ 0, 2, 0, 3, 0, 8, 0, 10 }), init_tsn +% 100);
+
+    var it = SackHandler.GapAckedIterator.init(&h);
+    try testing.expectEqual(0xFFFFFFFC, it.next().?);
+    try testing.expectEqual(0xFFFFFFFD, it.next().?);
+    try testing.expectEqual(2, it.next().?);
+    try testing.expectEqual(3, it.next().?);
+    try testing.expectEqual(4, it.next().?);
+    try testing.expectEqual(null, it.next());
+}
+
+test "GapAckedIterator: tsns wrapping around the bitmap and spanning words" {
+    const init_tsn: u32 = bitmap_bits * 5 - 3;
+    var h = SackHandler.init(init_tsn);
+    try h.handleSack(&testSack(init_tsn, &.{ 0, 1, 0, 1, 0, 3, 0, 4, 0, 70, 0, 70, 0, 200, 0, 202 }), init_tsn +% 500);
+
+    var it = SackHandler.GapAckedIterator.init(&h);
+    for ([_]u32{ 1, 3, 4, 70, 200, 201, 202 }) |offset| {
+        try testing.expectEqual(init_tsn +% offset, it.next().?);
+    }
+    try testing.expectEqual(null, it.next());
+}
+
+test "GapAckedIterator: nothing to iterate without gap blocks" {
+    var h = SackHandler.init(1);
+    try h.handleSack(&testSack(5, &.{}), 100);
+
+    var it = SackHandler.GapAckedIterator.init(&h);
+    try testing.expectEqual(null, it.next());
 }
