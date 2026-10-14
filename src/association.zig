@@ -165,7 +165,6 @@ cookie: [32]u8,
 peer_cookie: []const u8,
 
 // Congestion control state
-rwnd: u32,
 cwnd: u32,
 ssthresh: u32,
 partial_bytes_acked: u32,
@@ -207,7 +206,6 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .peer_verification_tag = 0,
         .cookie = config.random.array(u8, 32),
         .peer_cookie = &.{},
-        .rwnd = 0,
         .cwnd = @min(4 * message.PMDCS, @max(2 * message.PMDCS, 4404)),
         .ssthresh = std.math.maxInt(u32),
         .partial_bytes_acked = 0,
@@ -413,7 +411,6 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
                 self.ssthresh = @max(self.cwnd / 2, 4 * message.PMDCS);
                 self.partial_bytes_acked = 0;
                 self.cwnd = message.PMDCS;
-                self.rwnd +|= self.message_queue.flight_size;
                 self.message_queue.handleTimeout();
                 self.fast_retransmit = false;
             },
@@ -493,22 +490,18 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
 
         if (self.fast_recovery) if (try self.message_queue.nextFastRetransmit(buffer)) |size| return .{ null, size };
 
-        if (try self.message_queue.nextRetransmit(buffer)) |written| {
-            self.rwnd -|= @intCast(written.@"0");
-            return .{ null, written.@"1" };
-        }
+        if (try self.message_queue.nextRetransmit(buffer)) |written| return .{ null, written };
 
         const next_chunk_size = self.message_queue.nextChunkSize(buffer.len) orelse return null;
-        if (self.rwnd < next_chunk_size) {
+        if (self.message_queue.rwnd < next_chunk_size) {
             if (self.message_queue.chunks.len != 0) return null;
             self.zero_wnd_probe = true;
         }
 
         const written = try self.message_queue.nextChunk(self.allocator, buffer);
-        self.rwnd -|= @intCast(written.@"0");
         self.t3_timer.setDeadline(now);
-        self.t3_timer.setSample(self.message_queue.curr_tsn -% 1, now);
-        return .{ null, written.@"1" };
+        self.t3_timer.setSample(self.message_queue.highestTsnSent(), now);
+        return .{ null, written };
     };
 
     if (!first_chunk) switch (chunk_type) {
@@ -586,7 +579,7 @@ fn handleInitChunk(self: *Association, chunk: message.Init) !void {
         self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
         self.peer_initial_tsn = chunk.initial_tsn;
         self.peer_verification_tag = chunk.initiate_tag;
-        self.rwnd = chunk.a_rwnd;
+        self.message_queue.rwnd = chunk.a_rwnd;
     }
 }
 
@@ -611,7 +604,7 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
     self.peer_initial_tsn = chunk.initial_tsn;
     self.peer_verification_tag = chunk.initiate_tag;
-    self.rwnd = chunk.a_rwnd;
+    self.message_queue.rwnd = chunk.a_rwnd;
     self.state = .cookie_echoed;
     self.resetInitTimer();
     self.transmits.pushBackAssumeCapacity(.{ .cookie_echo = self.peer_cookie });
@@ -621,7 +614,6 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
     const prev_flight_size = self.message_queue.flight_size;
     const result = self.message_queue.handleSack(self.allocator, sack) orelse return;
 
-    self.rwnd = sack.a_rwnd -| self.message_queue.flight_size;
     if (self.cwnd <= self.ssthresh) {
         // Slow start
         if (prev_flight_size >= self.cwnd and !self.fast_recovery) self.cwnd += @min(message.PMDCS, result.acked_data);
@@ -646,7 +638,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
     } else if (result.has_fast_retransmit) {
         self.fast_recovery = true;
         self.fast_retransmit = true;
-        self.fast_recovery_exit_tsn = self.message_queue.curr_tsn -% 1;
+        self.fast_recovery_exit_tsn = self.message_queue.highestTsnSent();
 
         self.ssthresh = @max(self.cwnd / 2, 4 * message.PMDCS);
         self.cwnd = self.ssthresh;
@@ -865,7 +857,7 @@ fn testAssoc() Association {
     });
     assoc.peer_verification_tag = assoc.verification_tag;
     assoc.peer_initial_tsn = assoc.initial_tsn;
-    assoc.rwnd = 1024 * 1024;
+    assoc.message_queue.rwnd = 1024 * 1024;
     return assoc;
 }
 
@@ -1388,14 +1380,14 @@ test "Association.rwnd: sending subtracts the user data size, not the chunk size
     var assoc = testAssoc();
     defer assoc.deinit();
     try assoc.setStateToEstablished();
-    assoc.rwnd = 1000;
+    assoc.message_queue.rwnd = 1000;
 
     const data: [101]u8 = @splat('a');
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
     var out: [message.MTU]u8 = undefined;
     _ = (try assoc.pollTransmit(&out, 0)).?;
 
-    try testing.expectEqual(899, assoc.rwnd);
+    try testing.expectEqual(899, assoc.message_queue.rwnd);
 }
 
 test "Association.rwnd: a sack subtracts the outstanding data from the advertised window" {
@@ -1410,7 +1402,7 @@ test "Association.rwnd: a sack subtracts the outstanding data from the advertise
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn, &.{}, 1000), 0);
-    try testing.expectEqual(800, assoc.rwnd);
+    try testing.expectEqual(800, assoc.message_queue.rwnd);
 }
 
 test "Association.rwnd: gap acked chunks are not outstanding" {
@@ -1426,7 +1418,7 @@ test "Association.rwnd: gap acked chunks are not outstanding" {
     // acks the second chunk only
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, 1000), 0);
-    try testing.expectEqual(800, assoc.rwnd);
+    try testing.expectEqual(800, assoc.message_queue.rwnd);
 }
 
 test "Association.rwnd: a sack with a window smaller than the outstanding data saturates to zero" {
@@ -1441,7 +1433,7 @@ test "Association.rwnd: a sack with a window smaller than the outstanding data s
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 100), 0);
-    try testing.expectEqual(0, assoc.rwnd);
+    try testing.expectEqual(0, assoc.message_queue.rwnd);
 }
 
 test "Association.rwnd: a timeout adds back the unacked data and the retransmission subtracts it" {
@@ -1456,13 +1448,13 @@ test "Association.rwnd: a timeout adds back the unacked data and the retransmiss
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, 1000), 0);
-    try testing.expectEqual(900, assoc.rwnd);
+    try testing.expectEqual(900, assoc.message_queue.rwnd);
 
     try assoc.handleTimeout(10_000);
-    try testing.expectEqual(1000, assoc.rwnd);
+    try testing.expectEqual(1000, assoc.message_queue.rwnd);
 
     _ = (try assoc.pollTransmit(&out, 10_000)).?;
-    try testing.expectEqual(900, assoc.rwnd);
+    try testing.expectEqual(900, assoc.message_queue.rwnd);
 }
 
 test "Association.rwnd: a second timeout during a retransmission does not add the pending chunks twice" {
@@ -1477,17 +1469,17 @@ test "Association.rwnd: a second timeout during a retransmission does not add th
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 10_000), 0);
-    try testing.expectEqual(10_000 - 2 * data.len, assoc.rwnd);
+    try testing.expectEqual(10_000 - 2 * data.len, assoc.message_queue.rwnd);
 
     try assoc.handleTimeout(10_000);
-    try testing.expectEqual(10_000, assoc.rwnd);
+    try testing.expectEqual(10_000, assoc.message_queue.rwnd);
 
     // only the first chunk is retransmitted before the timer expires again
     _ = (try assoc.pollTransmit(&out, 10_000)).?;
-    try testing.expectEqual(10_000 - data.len, assoc.rwnd);
+    try testing.expectEqual(10_000 - data.len, assoc.message_queue.rwnd);
 
     try assoc.handleTimeout(20_000);
-    try testing.expectEqual(10_000, assoc.rwnd);
+    try testing.expectEqual(10_000, assoc.message_queue.rwnd);
 }
 
 test "Association.rwnd: adding back the outstanding data on a timeout saturates" {
@@ -1500,9 +1492,9 @@ test "Association.rwnd: adding back the outstanding data on a timeout saturates"
     var out: [message.MTU]u8 = undefined;
     _ = (try assoc.pollTransmit(&out, 0)).?;
 
-    assoc.rwnd = std.math.maxInt(u32) - 10;
+    assoc.message_queue.rwnd = std.math.maxInt(u32) - 10;
     try assoc.handleTimeout(10_000);
-    try testing.expectEqual(std.math.maxInt(u32), assoc.rwnd);
+    try testing.expectEqual(std.math.maxInt(u32), assoc.message_queue.rwnd);
 }
 
 test "Association.rwnd: new data is not sent while the window is smaller than the next chunk" {
@@ -1517,17 +1509,17 @@ test "Association.rwnd: new data is not sent while the window is smaller than th
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 150), 0);
-    try testing.expectEqual(50, assoc.rwnd);
+    try testing.expectEqual(50, assoc.message_queue.rwnd);
 
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
     try testing.expectEqual(null, try assoc.pollTransmit(&out, 0));
 
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn, &.{}, 1000), 0);
-    try testing.expectEqual(1000, assoc.rwnd);
+    try testing.expectEqual(1000, assoc.message_queue.rwnd);
 
     const packet = (try assoc.pollTransmit(&out, 0)).?;
     try testing.expectEqual(assoc.initial_tsn +% 1, std.mem.readInt(u32, packet[16..20], .big));
-    try testing.expectEqual(900, assoc.rwnd);
+    try testing.expectEqual(900, assoc.message_queue.rwnd);
 }
 
 test "Association.pollTransmit: send zero window probe" {
@@ -1542,7 +1534,7 @@ test "Association.pollTransmit: send zero window probe" {
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{}, 50), 0);
-    try testing.expectEqual(50, assoc.rwnd);
+    try testing.expectEqual(50, assoc.message_queue.rwnd);
 
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
     try testing.expect(try assoc.pollTransmit(&out, 0) != null);

@@ -11,6 +11,7 @@ messages: std.Deque(message.UserMessage),
 chunks: std.Deque(message.Data),
 flight_size: u32,
 pending_size: u32,
+rwnd: u32,
 curr_tsn: u32,
 curr_msg: u32,
 message_offset: u32,
@@ -28,6 +29,7 @@ pub fn init(initial_tsn: u32) MessageQueue {
         .retransmit_index = null,
         .flight_size = 0,
         .pending_size = 0,
+        .rwnd = 0,
     };
 }
 
@@ -80,7 +82,7 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     var acked_data: u32 = 0;
 
     const old_gap_size = self.updateGapAckedFlightSize(true);
-    const has_fast_retransmit = self.sack_handler.handleSack(&sack, self.curr_tsn -% 1) catch {
+    const has_fast_retransmit = self.sack_handler.handleSack(&sack, self.highestTsnSent()) catch {
         self.flight_size = prev_flight_size;
         return null;
     };
@@ -94,6 +96,7 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     acked_data += self.dropAcknowledged(allocator);
     acked_data += self.updateGapAckedFlightSize(false);
     acked_data -|= old_gap_size;
+    self.rwnd = sack.a_rwnd -| self.flight_size;
 
     return .{
         .acked_data = acked_data,
@@ -105,7 +108,7 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
 pub const CumulativeAck = enum { invalid, unchanged, advanced };
 
 pub fn handleShutdownChunk(self: *MessageQueue, allocator: std.mem.Allocator, cumulative_tsn: u32) CumulativeAck {
-    if (Helper.tsnGt(cumulative_tsn, self.curr_tsn -% 1)) return .invalid;
+    if (Helper.tsnGt(cumulative_tsn, self.highestTsnSent())) return .invalid;
     if (!Helper.tsnGt(cumulative_tsn, self.sack_handler.cumulative_tsn)) return .unchanged;
     _ = self.updateGapAckedFlightSize(true);
     self.sack_handler.handleCumulativeTsn(cumulative_tsn);
@@ -115,6 +118,7 @@ pub fn handleShutdownChunk(self: *MessageQueue, allocator: std.mem.Allocator, cu
 }
 
 pub fn handleTimeout(self: *MessageQueue) void {
+    self.rwnd +|= self.flight_size;
     self.retransmit_index = 0;
     self.flight_size = 0;
     self.sack_handler.clearFastRetransmit();
@@ -129,7 +133,7 @@ pub fn nextChunkSize(self: *MessageQueue, buffer_size: usize) ?u32 {
     return @intCast(@min(curr_payload, max_payload));
 }
 
-pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!struct { usize, usize } {
+pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!usize {
     std.debug.assert(self.curr_msg < self.messages.len);
     try self.chunks.ensureUnusedCapacity(allocator, 1);
 
@@ -161,11 +165,12 @@ pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8
 
     self.pending_size -|= @intCast(payload_size);
     self.flight_size += @intCast(payload_size);
+    self.rwnd -|= @intCast(payload_size);
 
-    return .{ chunk.user_data.len, chunk.write(buffer) };
+    return chunk.write(buffer);
 }
 
-pub fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?struct { u32, u32 } {
+pub fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
     while (true) {
         if (self.retransmit_index == null) return null;
         const chunk = self.chunks.atPtr(self.retransmit_index.?);
@@ -176,8 +181,9 @@ pub fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?str
 
         if (chunk.getSize() > buffer.len) return error.WriteFailed;
         self.flight_size += @intCast(chunk.user_data.len);
+        self.rwnd -|= @intCast(chunk.user_data.len);
         self.nextRetransmitIndex();
-        return .{ @intCast(chunk.user_data.len), @intCast(chunk.write(buffer)) };
+        return @intCast(chunk.write(buffer));
     }
 }
 
@@ -196,7 +202,11 @@ pub fn isEmpty(self: *const MessageQueue) bool {
 }
 
 pub fn isAllAcked(self: *const MessageQueue) bool {
-    return self.sack_handler.allAcked(self.curr_tsn -% 1);
+    return self.sack_handler.allAcked(self.highestTsnSent());
+}
+
+pub fn highestTsnSent(self: *const MessageQueue) u32 {
+    return self.curr_tsn -% 1;
 }
 
 pub fn isAcked(self: *const MessageQueue, tsn: u32) bool {
