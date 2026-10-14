@@ -642,7 +642,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
     var acked_data: u32 = 0;
 
     const old_gap_size = self.updateGapAckedFlightSize(true);
-    const has_fast_retransmit = self.sack_handler.handleSack(&sack,self.message_queue.curr_tsn -% 1) catch {
+    const has_fast_retransmit = self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch {
         self.message_queue.flight_size = prev_flight_size;
         return;
     };
