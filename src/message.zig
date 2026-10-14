@@ -273,8 +273,8 @@ pub const Sack = struct {
         return GapAckBlockIterator.init(sack.gap_ack_blocks, sack.cumulative_tsn);
     }
 
-    pub fn iterateDuplicateTsns(sack: *const Sack) TsnIterator {
-        return TsnIterator{ .bytes = sack.duplicate_tsns };
+    pub fn iterateDuplicateTsns(sack: *const Sack) DuplicateTsnIterator {
+        return DuplicateTsnIterator{ .bytes = sack.duplicate_tsns };
     }
 
     pub const GapAckBlockIterator = struct {
@@ -296,7 +296,6 @@ pub const Sack = struct {
 
         pub fn nextBlock(self: *GapAckBlockIterator) error{InvalidGapAckBlock}!?Block {
             if (self.slice.len == 0) return null;
-            if (self.slice.len < 4) return error.InvalidGapAckBlock;
 
             const start = std.mem.readInt(u16, self.slice[0..2], .big);
             const end = std.mem.readInt(u16, self.slice[2..4], .big);
@@ -319,10 +318,10 @@ pub const Sack = struct {
         }
     };
 
-    pub const TsnIterator = struct {
+    pub const DuplicateTsnIterator = struct {
         bytes: []const u8,
 
-        pub fn next(self: *TsnIterator) ?u32 {
+        pub fn next(self: *DuplicateTsnIterator) ?u32 {
             if (self.bytes.len < 4) return null;
             const tsn = std.mem.readInt(u32, self.bytes[0..4], .big);
             self.bytes = self.bytes[4..];

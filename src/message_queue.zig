@@ -169,6 +169,11 @@ pub fn getCurrentRetransmitTsn(self: *const MessageQueue) ?u32 {
     return null;
 }
 
+pub fn writeChunkAt(self: *const MessageQueue, tsn: u32, buffer: []u8) u32 {
+    const index = tsn -% self.chunks.atPtr(0).tsn;
+    return @intCast(self.chunks.at(index).write(buffer));
+}
+
 pub fn getChunkSizeAt(self: *const MessageQueue, tsn: u32) u32 {
     const index = tsn -% self.chunks.atPtr(0).tsn;
     return self.chunks.atPtr(index).getSize();

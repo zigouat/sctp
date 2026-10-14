@@ -171,6 +171,10 @@ cwnd: u32,
 ssthresh: u32,
 partial_bytes_acked: u32,
 
+fast_recovery: bool,
+fast_retransmit: bool,
+fast_recovery_exit_tsn: u32,
+
 init_deadline: i64,
 init_rto: u8,
 init_attempts: u8,
@@ -209,6 +213,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .cwnd = @min(4 * message.PMDCS, @max(2 * message.PMDCS, 4404)),
         .ssthresh = std.math.maxInt(u32),
         .partial_bytes_acked = 0,
+        .fast_recovery = false,
+        .fast_retransmit = false,
+        .fast_recovery_exit_tsn = 0,
         .transmits = .empty,
         .events = .empty,
         .message_assembler = .init(config.receive_buffer_size),
@@ -412,6 +419,8 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
                 self.rwnd +|= self.message_queue.flight_size;
                 self.message_queue.retransmit_index = 0;
                 self.message_queue.flight_size = 0;
+                self.sack_handler.clearFastRetransmit();
+                self.fast_retransmit = false;
             },
         }
         self.t3_timer.backoffAndRestart(now);
@@ -470,8 +479,31 @@ pub fn pollTimeout(self: *Association) ?i64 {
 }
 
 fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) TransmitError!?struct { ?Transmit, usize } {
+    if (self.fast_retransmit) {
+        if (self.sack_handler.firstTsnWithThreeMisses(self.sack_handler.cumulative_tsn +% 1)) |tsn| {
+            var size = self.message_queue.getChunkSizeAt(tsn);
+            if (size > buffer.len) {
+                if (first_chunk) return error.WriteFailed;
+                self.fast_retransmit = false;
+                return null;
+            }
+            size = self.message_queue.writeChunkAt(tsn, buffer);
+            self.sack_handler.markFastRetransmitted(tsn);
+            return .{ null, size };
+        }
+        self.fast_retransmit = false;
+    }
+
     const chunk_type = self.transmits.front() orelse {
         if (self.message_queue.flight_size >= self.cwnd) return null;
+
+        if (self.fast_recovery) if (self.sack_handler.firstTsnWithThreeMisses(self.sack_handler.cumulative_tsn +% 1)) |tsn| {
+            var size = self.message_queue.getChunkSizeAt(tsn);
+            if (size > buffer.len) return error.WriteFailed;
+            size = self.message_queue.writeChunkAt(tsn, buffer);
+            self.sack_handler.markFastRetransmitted(tsn);
+            return .{ null, size };
+        };
 
         if (try self.message_queue.nextRetransmit(&self.sack_handler, buffer)) |written| {
             self.rwnd -|= @intCast(written.@"0");
@@ -610,7 +642,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
     var acked_data: u32 = 0;
 
     const old_gap_size = self.updateGapAckedFlightSize(true);
-    self.sack_handler.handleSack(&sack, self.message_queue.curr_tsn -% 1) catch {
+    const has_fast_retransmit = self.sack_handler.handleSack(&sack,self.message_queue.curr_tsn -% 1) catch {
         self.message_queue.flight_size = prev_flight_size;
         return;
     };
@@ -628,8 +660,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
     self.rwnd = sack.a_rwnd -| self.message_queue.flight_size;
     if (self.cwnd <= self.ssthresh) {
         // Slow start
-        // fast recovery will be checked later
-        if (prev_flight_size >= self.cwnd) self.cwnd += @min(message.PMDCS, acked_data);
+        if (prev_flight_size >= self.cwnd and !self.fast_recovery) self.cwnd += @min(message.PMDCS, acked_data);
     } else {
         // Congestion avoidance
         self.partial_bytes_acked +|= acked_data;
@@ -641,6 +672,21 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
                 self.cwnd +|= message.PMDCS;
             }
         }
+    }
+
+    if (self.fast_recovery) {
+        if (Helper.tsnLte(self.fast_recovery_exit_tsn, self.sack_handler.cumulative_tsn)) {
+            self.fast_recovery = false;
+            self.fast_recovery_exit_tsn = 0;
+        }
+    } else if (has_fast_retransmit) {
+        self.fast_recovery = true;
+        self.fast_retransmit = true;
+        self.fast_recovery_exit_tsn = self.message_queue.curr_tsn -% 1;
+
+        self.ssthresh = @max(self.cwnd / 2, 4 * message.PMDCS);
+        self.cwnd = self.ssthresh;
+        self.partial_bytes_acked = 0;
     }
 
     if (self.t3_timer.rtt_tsn) |tsn| if (self.sack_handler.isAcked(tsn)) self.t3_timer.calculateRto(now);
