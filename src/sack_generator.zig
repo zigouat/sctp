@@ -24,7 +24,9 @@ pub fn init(initial_tsn: u32) SackGenerator {
     };
 }
 
-pub fn checkTsn(self: *SackGenerator, tsn: u32) error{ OutOfWindow, Duplicate }!void {
+pub const TsnError = error{ OutOfWindow, Duplicate };
+
+pub fn checkTsn(self: *SackGenerator, tsn: u32) TsnError!void {
     if (Helper.tsnLte(tsn, self.cumulative_tsn)) {
         self.recordDuplicate(tsn);
         return error.Duplicate;
@@ -55,7 +57,7 @@ pub fn clearDuplicates(self: *SackGenerator) void {
     self.duplicate_count = 0;
 }
 
-pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) usize {
+pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) u32 {
     std.debug.assert(buffer.len >= 16);
 
     buffer[0] = @intFromEnum(message.ChunkType.sack);
@@ -63,7 +65,7 @@ pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) usize {
     std.mem.writeInt(u32, buffer[4..8], self.cumulative_tsn, .big);
     std.mem.writeInt(u32, buffer[8..12], a_rwnd, .big);
 
-    var written: usize = 16;
+    var written: u32 = 16;
     var gap_block_count: u16 = 0;
     const limit = self.gapScanLimit();
     var offset: u32 = 1;
