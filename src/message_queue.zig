@@ -77,14 +77,14 @@ pub const SackResult = struct {
     cumulative_ack_advanced: bool,
 };
 
-pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: message.Sack) ?SackResult {
+pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: message.Sack, fast_recovery: bool) ?SackResult {
     const prev_flight_size = self.flight_size;
     const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
     var acked_data: u32 = 0;
     var duplicate_data: u32 = 0;
 
     const old_gap_size = self.updateGapAckedFlightSize(true);
-    const has_fast_retransmit = self.sack_handler.handleSack(&sack, self.highestTsnSent()) catch {
+    const has_fast_retransmit = self.sack_handler.handleSack(&sack, self.highestTsnSent(), fast_recovery) catch {
         self.flight_size = prev_flight_size;
         return null;
     };
@@ -349,7 +349,7 @@ test "MessageQueue.handleSack: acknowledging every chunk during a retransmission
         .a_rwnd = 0,
         .gap_ack_blocks = &.{},
         .duplicate_tsns = &.{},
-    });
+    }, false);
 
     try testing.expectEqual(null, msg_queue.retransmit_index);
     try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
