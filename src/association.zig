@@ -582,7 +582,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
         if (prev_flight_size >= self.cwnd and !self.fast_recovery) self.cwnd += @min(message.PMDCS, result.acked_data);
     } else {
         // Congestion avoidance
-        self.partial_bytes_acked +|= result.acked_data;
+        self.partial_bytes_acked +|= result.acked_data +| result.duplicate_data;
         if (self.partial_bytes_acked >= self.cwnd) {
             if (prev_flight_size < self.cwnd)
                 self.partial_bytes_acked = self.cwnd

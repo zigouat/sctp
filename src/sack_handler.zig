@@ -236,7 +236,7 @@ fn incrementMissCounts(self: *SackHandler, start_tsn: u32, end_tsn: u32) bool {
         const new_lo = (lo ^ missing) | (hi & lo);
         self.miss_hi.masks[word_index] = new_hi;
         self.miss_lo.masks[word_index] = new_lo;
-        fast_retransmit = fast_retransmit or (new_hi & new_lo & missing) != 0;
+        fast_retransmit = fast_retransmit or (new_hi & new_lo & missing & ~self.fast_retransmitted.masks[word_index]) != 0;
 
         tsn +%= len;
         remaining -= len;
@@ -657,7 +657,7 @@ test "SackHandler.handleSack: returns true when a missing tsn has 3 miss indicat
 
     h.markFastRetransmitted(2);
     h.markFastRetransmitted(3);
-    try testing.expect(try h.handleSack(&testSack(1, &.{ 0, 3, 0, 6 }), 100));
+    try testing.expect(!try h.handleSack(&testSack(1, &.{ 0, 3, 0, 6 }), 100));
     try testing.expect(!try h.handleSack(&testSack(1, &.{ 0, 3, 0, 6 }), 100));
     try testing.expect(!try h.handleSack(&testSack(3, &.{ 0, 4, 0, 4 }), 100));
 }
