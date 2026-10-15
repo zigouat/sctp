@@ -186,6 +186,15 @@ pub const Data = struct {
         unordered: bool = false,
         immediate: bool = false,
         _pad: u4 = 0,
+
+        pub const complete = Flags{ .end_fragment = true, .start_fragment = true };
+        pub const unordered_complete = Flags{ .end_fragment = true, .start_fragment = true, .unordered = true };
+        pub const start_frag = Flags{ .start_fragment = true };
+        pub const unordered_start_frag = Flags{ .start_fragment = true, .unordered = true };
+        pub const end_frag = Flags{ .end_fragment = true };
+        pub const unordered_end_frag = Flags{ .end_fragment = true, .unordered = true };
+        pub const middle_frag = Flags{};
+        pub const unordered_middle_frag = Flags{ .unordered = true };
     };
 
     pub fn parse(flags: u8, data: []const u8) error{InvalidChunk}!Data {

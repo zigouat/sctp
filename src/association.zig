@@ -1,6 +1,5 @@
 const std = @import("std");
 const message = @import("message.zig");
-const SackGenerator = @import("sack_generator.zig");
 const MessageAssembler = @import("message_assembler.zig");
 const MessageQueue = @import("message_queue.zig");
 const Helper = @import("helper.zig");
@@ -8,7 +7,6 @@ const Helper = @import("helper.zig");
 const Association = @This();
 const Io = std.Io;
 
-const sack_delay = 200;
 const max_init_retransmits = 8;
 const assoc_max_retransmits = 10;
 const max_rto = 60; // in seconds
@@ -158,7 +156,6 @@ dest_port: u16,
 outbound_streams: u16,
 inbound_streams: u16,
 initial_tsn: u32,
-peer_initial_tsn: u32,
 verification_tag: u32,
 peer_verification_tag: u32,
 cookie: [32]u8,
@@ -176,10 +173,6 @@ fast_recovery_exit_tsn: u32,
 init_deadline: i64,
 init_rto: u8,
 init_attempts: u8,
-
-sack_generator: SackGenerator,
-send_sack: bool = false,
-sack_deadline: i64 = std.math.maxInt(i64),
 
 message_queue: MessageQueue,
 message_assembler: MessageAssembler,
@@ -201,7 +194,6 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .outbound_streams = config.outbound_streams,
         .inbound_streams = config.inbound_streams,
         .initial_tsn = initial_tsn,
-        .peer_initial_tsn = 0,
         .verification_tag = config.random.int(u32),
         .peer_verification_tag = 0,
         .cookie = config.random.array(u8, 32),
@@ -218,7 +210,6 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .init_attempts = 0,
         .init_rto = 1,
         .init_deadline = std.math.maxInt(i64),
-        .sack_generator = undefined,
         .message_queue = .init(initial_tsn),
         .t3_timer = .init,
         .zero_wnd_probe = false,
@@ -313,31 +304,15 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                     else => break,
                 }
 
-                if (d.user_data.len == 0) {
-                    try self.transmits.pushBack(self.allocator, .{ .abort = d.tsn });
-                    try self.setStateToClosed();
-                    return self.messageIterator();
-                }
-
-                received_data = true;
-                self.sack_generator.checkTsn(d.tsn) catch |err| switch (err) {
-                    error.Duplicate => {
-                        immediate_sack = true;
-                        continue;
+                immediate_sack |= self.message_assembler.receiveData(self.allocator, d) catch |err| switch (err) {
+                    error.NoUserData => {
+                        try self.transmits.pushBack(self.allocator, .{ .abort = d.tsn });
+                        try self.setStateToClosed();
+                        return self.messageIterator();
                     },
-                    else => continue,
+                    else => |e| return e,
                 };
-
-                if (self.message_assembler.advertised_wnd == 0) {
-                    @branchHint(.unlikely);
-                    immediate_sack = true;
-                    if (!self.dropChunkWithHighestTsn(d)) continue;
-                }
-
-                self.sack_generator.receiveTsn(d.tsn);
-                immediate_sack |= d.flags.immediate;
-
-                try self.message_assembler.receiveData(self.allocator, d);
+                received_data = true;
             },
             .sack => |sack| switch (self.state) {
                 .established, .shutdown_pending, .shutdown_received, .cookie_echoed => try self.handleSack(sack, now),
@@ -360,22 +335,14 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
     }
 
     if (received_data and self.state == .shutdown_sent) {
-        try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn });
-        if (self.sack_generator.cumulative_tsn != self.sack_generator.highest_tsn_received) {
-            try self.pushSack();
-        }
+        try self.transmits.pushBack(self.allocator, .{ .shutdown = self.message_assembler.getCumulativeTsn() });
+        if (self.message_assembler.hasGaps()) try self.pushSack();
         return self.messageIterator();
     }
 
     if (!received_data or (self.state != .established and self.state != .shutdown_pending)) return null;
 
-    const has_gaps = self.sack_generator.highest_tsn_received != self.sack_generator.cumulative_tsn;
-    if (self.send_sack or immediate_sack or has_gaps) {
-        try self.pushSack();
-    } else {
-        self.send_sack = true;
-        self.sack_deadline = now + sack_delay;
-    }
+    if (self.message_assembler.scheduleSack(immediate_sack, now)) try self.pushSack();
 
     return self.messageIterator();
 }
@@ -394,7 +361,7 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
         }
     }
 
-    if (now >= self.sack_deadline) try self.pushSack();
+    if (now >= self.message_assembler.sack_deadline) try self.pushSack();
 
     // T3-rtx and T2-shutdown share the deadline, no data is in flight once shutdown starts
     if (now >= self.t3_timer.deadline) {
@@ -405,7 +372,7 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
         }
 
         switch (self.state) {
-            .shutdown_sent => try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn }),
+            .shutdown_sent => try self.transmits.pushBack(self.allocator, .{ .shutdown = self.message_assembler.getCumulativeTsn() }),
             .shutdown_ack_sent => try self.transmits.pushBack(self.allocator, .shutdown_ack),
             else => {
                 self.ssthresh = @max(self.cwnd / 2, 4 * message.PMDCS);
@@ -466,7 +433,7 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
 }
 
 pub fn pollTimeout(self: *Association) ?i64 {
-    const deadline = @min(@min(self.sack_deadline, self.init_deadline), self.t3_timer.deadline);
+    const deadline = @min(@min(self.message_assembler.sack_deadline, self.init_deadline), self.t3_timer.deadline);
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
@@ -515,7 +482,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
         .cookie_echo => |cookie| try writeCookieEcho(cookie, buffer),
         .cookie_ack => self.writeCookieAck(buffer),
         .abort => |tsn| self.writeNoUserDataAbort(tsn, buffer),
-        .sack => self.writeSack(buffer),
+        .sack => self.message_assembler.writeSack(buffer),
         .heartbeat_ack => |data| try writeHeartbeatAck(data, buffer),
         .shutdown => |tsn| writeShutdown(buffer, tsn),
         .shutdown_ack => writeShutdownAck(buffer),
@@ -539,9 +506,6 @@ fn messageIterator(self: *Association) ?MessageIterator {
 fn setStateToClosed(self: *Association) !void {
     try self.events.pushBack(self.allocator, .comm_down);
     self.state = .closed;
-    self.sack_generator = .init(0);
-    self.sack_deadline = std.math.maxInt(i64);
-    self.send_sack = false;
     self.resetInitTimer();
     self.message_queue.close(self.allocator, self.initial_tsn);
     self.message_assembler.reset(self.allocator);
@@ -553,7 +517,6 @@ fn setStateToEstablished(self: *Association) !void {
     if (self.state == .established) return;
     try self.events.ensureUnusedCapacity(self.allocator, 1);
     self.state = .established;
-    self.sack_generator = .init(self.peer_initial_tsn);
     self.events.pushBackAssumeCapacity(.comm_up);
 }
 
@@ -577,7 +540,7 @@ fn handleInitChunk(self: *Association, chunk: message.Init) !void {
     if (self.state == .closed) {
         self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
         self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
-        self.peer_initial_tsn = chunk.initial_tsn;
+        self.message_assembler.setInitTsn(chunk.initial_tsn);
         self.peer_verification_tag = chunk.initiate_tag;
         self.message_queue.rwnd = chunk.a_rwnd;
     }
@@ -602,7 +565,7 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
 
     self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
     self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
-    self.peer_initial_tsn = chunk.initial_tsn;
+    self.message_assembler.setInitTsn(chunk.initial_tsn);
     self.peer_verification_tag = chunk.initiate_tag;
     self.message_queue.rwnd = chunk.a_rwnd;
     self.state = .cookie_echoed;
@@ -690,7 +653,7 @@ fn maybeSendShutdown(self: *Association) !void {
             self.state = .shutdown_ack_sent;
         },
         .shutdown_pending => {
-            try self.transmits.pushBack(self.allocator, .{ .shutdown = self.sack_generator.cumulative_tsn });
+            try self.transmits.pushBack(self.allocator, .{ .shutdown = self.message_assembler.getCumulativeTsn() });
             self.state = .shutdown_sent;
         },
         else => {},
@@ -709,8 +672,7 @@ fn isValidVerificationTag(self: *const Association, packet: *const message.Packe
 
 fn pushSack(self: *Association) !void {
     try self.transmits.pushBack(self.allocator, .sack);
-    self.send_sack = false;
-    self.sack_deadline = std.math.maxInt(i64);
+    self.message_assembler.clearDelayedSack();
 }
 
 fn resetInitTimer(self: *Association) void {
@@ -723,12 +685,6 @@ fn setInitTimer(self: *Association, now: i64) void {
     self.init_deadline = now + @as(i64, self.init_rto) * std.time.ms_per_s;
     self.init_rto = @min(self.init_rto * 2, max_rto);
     self.init_attempts += 1;
-}
-
-fn writeSack(self: *Association, buffer: []u8) usize {
-    const written = self.sack_generator.writeSack(buffer, self.message_assembler.advertised_wnd);
-    self.sack_generator.clearDuplicates();
-    return written;
 }
 
 fn writeInit(self: *Association, buffer: []u8) usize {
@@ -831,20 +787,6 @@ fn writeCommonHeader(self: *const Association, buffer: []u8) void {
     std.mem.writeInt(u32, buffer[8..12], 0, .big); // checksum
 }
 
-fn dropChunkWithHighestTsn(self: *Association, d: message.Data) bool {
-    if (Helper.tsnLte(d.tsn, self.sack_generator.cumulative_tsn) or
-        Helper.tsnLte(self.sack_generator.highest_tsn_received, d.tsn)) return false;
-
-    var high = self.sack_generator.highest_tsn_received;
-    while (Helper.tsnGt(high, d.tsn)) : (high -%= 1) {
-        if (!self.message_assembler.dropChunk(self.allocator, high)) continue;
-        self.sack_generator.reneg(high);
-        return true;
-    }
-
-    return false;
-}
-
 const testing = std.testing;
 
 var test_prng = std.Random.DefaultPrng.init(0);
@@ -856,7 +798,7 @@ fn testAssoc() Association {
         .random = test_prng.random(),
     });
     assoc.peer_verification_tag = assoc.verification_tag;
-    assoc.peer_initial_tsn = assoc.initial_tsn;
+    assoc.message_assembler.setInitTsn(assoc.initial_tsn);
     assoc.message_queue.rwnd = 1024 * 1024;
     return assoc;
 }
@@ -950,7 +892,7 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
 test "Association.pollTransmit: control chunks are sent before retransmissions" {
     var assoc = testAssoc();
     defer assoc.deinit();
-    assoc.peer_initial_tsn = 100;
+    assoc.message_assembler.setInitTsn(100);
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
 
@@ -985,7 +927,7 @@ test "Association.pollTransmit: control chunks are sent before retransmissions" 
 test "Association.pollTransmit: a retransmission that does not fit is sent in the next packet" {
     var assoc = testAssoc();
     defer assoc.deinit();
-    assoc.peer_initial_tsn = 100;
+    assoc.message_assembler.setInitTsn(100);
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
 
@@ -1199,7 +1141,7 @@ test "Association.handleRead: shutdown complete with the T bit and the peer tag 
 test "Association.handleRead: data in shutdown sent is answered with a shutdown" {
     var assoc = testAssoc();
     defer assoc.deinit();
-    assoc.peer_initial_tsn = 100;
+    assoc.message_assembler.setInitTsn(100);
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
     assoc.state = .shutdown_sent;
@@ -1221,7 +1163,7 @@ test "Association.handleRead: data in shutdown sent is answered with a shutdown"
 test "Association.handleRead: data in shutdown pending is delivered and acknowledged" {
     var assoc = testAssoc();
     defer assoc.deinit();
-    assoc.peer_initial_tsn = 100;
+    assoc.message_assembler.setInitTsn(100);
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
     assoc.state = .shutdown_pending;
@@ -1235,7 +1177,7 @@ test "Association.handleRead: data in shutdown pending is delivered and acknowle
         &lens,
     );
     try testing.expectEqual(1, messages_len.len);
-    try testing.expect(assoc.send_sack);
+    try testing.expect(assoc.message_assembler.send_sack);
 }
 
 test "Association.handleRead: shutdown in shutdown pending moves to shutdown received" {
@@ -1308,66 +1250,43 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
 
-test "Association.handleRead: zero receive window drops or reneg chunks" {
+test "Association.handleRead: a duplicate followed by new data in the same packet is sacked immediately" {
     var assoc = testAssoc();
     defer assoc.deinit();
-    assoc.message_assembler = .init(100);
     try assoc.setStateToEstablished();
     _ = assoc.pollEvent();
 
-    var buffer: [1024]u8 = undefined;
-    const payload: [100]u8 = @splat(0xAA);
-    const tsn = assoc.initial_tsn;
+    var buffer: [64]u8 = undefined;
     var lens: [2]usize = undefined;
-
     var data = message.Data{
-        .flags = .{ .start_fragment = true, .end_fragment = true },
+        .flags = .complete,
         .ppid = 0,
-        .stream_id = 1,
-        .stream_seq = 1,
-        .tsn = tsn +% 1,
-        .user_data = payload[0..60],
+        .stream_id = 0,
+        .stream_seq = 0,
+        .tsn = assoc.initial_tsn,
+        .user_data = "ping",
     };
+    try testing.expectEqual(1, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 0, &lens)).len);
+    try assoc.handleTimeout(MessageAssembler.sack_delay);
+    try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
 
-    // ssn 1 waits for ssn 0
-    try testing.expectEqual(0, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 0, &lens)).len);
-    try testing.expect(assoc.message_assembler.pending.contains(tsn +% 1));
-    try testing.expectEqual(40, assoc.message_assembler.advertised_wnd);
+    assoc.writeCommonHeader(&buffer);
+    var len: usize = message.packet_header_size;
+    len += data.write(buffer[len..]);
+    data.tsn +%= 1;
+    data.stream_seq = 1;
+    len += data.write(buffer[len..]);
+    Helper.checkSum(buffer[0..len]);
 
-    // unordered message is delivered right away and closes the window
-    data.tsn = tsn +% 3;
-    data.flags.unordered = true;
-    data.user_data = payload[0..40];
-    try testing.expectEqualSlices(usize, &.{40}, try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 1, &lens));
-    try testing.expectEqual(0, assoc.message_assembler.advertised_wnd);
-    try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
-
-    // a tsn above the highest one is dropped
-    data.tsn = tsn +% 4;
-    try testing.expectEqual(0, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 2, &lens)).len);
-    try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
-
-    // the higher tsns are already delivered or never received, nothing to reneg
-    data.tsn = tsn +% 2;
-    try testing.expectEqual(0, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 3, &lens)).len);
-    try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
-    try testing.expectEqual(tsn -% 1, assoc.sack_generator.cumulative_tsn);
-
-    // ssn 1 held for reordering is reneged to accept ssn 0
-    data.tsn = tsn;
-    data.flags.unordered = false;
-    data.stream_seq = 0;
-    data.user_data = payload[0..10];
-    try testing.expectEqualSlices(usize, &.{10}, try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 4, &lens));
-    try testing.expect(!assoc.message_assembler.pending.contains(tsn +% 1));
-    try testing.expectEqual(tsn, assoc.sack_generator.cumulative_tsn);
-    try testing.expectEqual(tsn +% 3, assoc.sack_generator.highest_tsn_received);
+    try testing.expectEqual(1, (try testRead(&assoc, buffer[0..len], MessageAssembler.sack_delay, &lens)).len);
+    try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
+    try testing.expect(!assoc.message_assembler.send_sack);
 }
 
 test "Association.shutdown: an empty queue sends a shutdown right away" {
     var assoc = testAssoc();
     defer assoc.deinit();
-    assoc.peer_initial_tsn = 100;
+    assoc.message_assembler.setInitTsn(100);
     try assoc.setStateToEstablished();
 
     try assoc.shutdown();
