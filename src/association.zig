@@ -575,7 +575,7 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
 
 fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
     const prev_flight_size = self.message_queue.flight_size;
-    const result = self.message_queue.handleSack(self.allocator, sack) orelse return;
+    const result = self.message_queue.handleSack(self.allocator, sack, self.fast_recovery) orelse return;
 
     if (self.cwnd <= self.ssthresh) {
         // Slow start
