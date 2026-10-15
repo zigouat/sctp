@@ -30,7 +30,7 @@ pub const sack_delay = 200;
 sack_generator: SackGenerator,
 send_sack: bool,
 sack_deadline: i64,
-pending: std.AutoHashMapUnmanaged(u32, message.Data),
+pending: std.AutoArrayHashMapUnmanaged(u32, message.Data),
 streams: std.AutoHashMapUnmanaged(u16, StreamState),
 ready: std.Deque(UserMessage),
 capacity: u32,
@@ -52,8 +52,7 @@ pub fn init(capacity: u32) MessageAssembler {
 }
 
 pub fn deinit(self: *MessageAssembler, allocator: std.mem.Allocator) void {
-    var pending_it = self.pending.valueIterator();
-    while (pending_it.next()) |d| allocator.free(d.user_data);
+    for (self.pending.values()) |d| allocator.free(d.user_data);
     self.pending.deinit(allocator);
 
     var streams_it = self.streams.valueIterator();
@@ -148,7 +147,7 @@ fn dropChunkWithHighestTsn(self: *MessageAssembler, allocator: std.mem.Allocator
 }
 
 fn dropChunk(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32) bool {
-    if (self.pending.fetchRemove(tsn)) |d| {
+    if (self.pending.fetchSwapRemove(tsn)) |d| {
         allocator.free(d.value.user_data);
         self.buffered_data -= @intCast(d.value.user_data.len);
         self.updateAdvertisedWindow();
@@ -191,7 +190,7 @@ fn handleUnorderedChunk(self: *MessageAssembler, allocator: std.mem.Allocator, d
     }
 
     self.pending.putAssumeCapacity(d.tsn, d);
-    errdefer _ = self.pending.remove(d.tsn);
+    errdefer _ = self.pending.swapRemove(d.tsn);
     if (try self.tryReassemble(allocator, d.tsn)) |msg| self.ready.pushBackAssumeCapacity(msg);
 }
 
@@ -218,7 +217,7 @@ fn updateAdvertisedWindow(self: *MessageAssembler) void {
 fn tryReassemble(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32) !?UserMessage {
     var start_tsn = tsn;
     while (true) {
-        const frag = self.pending.get(start_tsn) orelse return null;
+        const frag = self.pending.getPtr(start_tsn) orelse return null;
         if (frag.flags.start_fragment) break;
         start_tsn -%= 1;
     }
@@ -226,7 +225,7 @@ fn tryReassemble(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32
     var end_tsn = start_tsn;
     var total_len: usize = 0;
     while (true) {
-        const frag = self.pending.get(end_tsn) orelse return null;
+        const frag = self.pending.getPtr(end_tsn) orelse return null;
         total_len += frag.user_data.len;
         if (frag.flags.end_fragment) break;
         end_tsn +%= 1;
@@ -239,7 +238,7 @@ fn tryReassemble(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32
     var t = start_tsn;
     const first = self.pending.get(start_tsn).?;
     while (true) : (t +%= 1) {
-        const entry = self.pending.fetchRemove(t).?.value;
+        const entry = self.pending.fetchSwapRemove(t).?.value;
         @memcpy(data[offset .. offset + entry.user_data.len], entry.user_data);
         offset += entry.user_data.len;
         allocator.free(entry.user_data);
