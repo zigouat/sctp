@@ -439,7 +439,7 @@ pub fn pollTimeout(self: *Association) ?i64 {
 
 fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) TransmitError!?struct { ?Transmit, usize } {
     if (self.fast_retransmit) {
-        if (self.message_queue.nextFastRetransmit(buffer) catch |err| {
+        if (self.nextFastRetransmit(buffer, now) catch |err| {
             if (first_chunk) return err;
             self.fast_retransmit = false;
             return null;
@@ -455,20 +455,13 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
 
         if (self.message_queue.flight_size >= self.cwnd) return null;
 
-        if (self.fast_recovery) if (try self.message_queue.nextFastRetransmit(buffer)) |size| return .{ null, size };
+        if (self.fast_recovery) if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
+        const result = try self.message_queue.nextChunk(self.allocator, buffer) orelse return null;
+        self.zero_wnd_probe |= result.zero_wnd_probe;
 
-        if (try self.message_queue.nextRetransmit(buffer)) |written| return .{ null, written };
-
-        const next_chunk_size = self.message_queue.nextChunkSize(buffer.len) orelse return null;
-        if (self.message_queue.rwnd < next_chunk_size) {
-            if (self.message_queue.chunks.len != 0) return null;
-            self.zero_wnd_probe = true;
-        }
-
-        const written = try self.message_queue.nextChunk(self.allocator, buffer);
         self.t3_timer.setDeadline(now);
-        self.t3_timer.setSample(self.message_queue.highestTsnSent(), now);
-        return .{ null, written };
+        if (!result.retransmit) self.t3_timer.setSample(self.message_queue.highestTsnSent(), now);
+        return .{ null, result.written };
     };
 
     if (!first_chunk) switch (chunk_type) {
@@ -497,6 +490,15 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
 
     _ = self.transmits.popFront();
     return .{ chunk_type, written };
+}
+
+fn nextFastRetransmit(self: *Association, buffer: []u8, now: i64) error{WriteFailed}!?u32 {
+    const retransmit = try self.message_queue.nextFastRetransmit(buffer) orelse return null;
+    // RFC9260 - 7.2.4. restarting T3-rtx for any other tsn would keep delaying the timeout of the lowest outstanding one.
+    if (retransmit.tsn == self.message_queue.lowestOutstandingTsn()) self.t3_timer.restart(now);
+    // RFC9260 - 6.3.1. C5 (Karn's algorithm), a retransmitted tsn gives an ambiguous rtt measurement.
+    if (self.t3_timer.rtt_tsn == retransmit.tsn) self.t3_timer.clearCurrentSample();
+    return retransmit.size;
 }
 
 fn messageIterator(self: *Association) ?MessageIterator {
@@ -803,6 +805,14 @@ fn testAssoc() Association {
     return assoc;
 }
 
+fn testEstablishedAssoc() !Association {
+    var assoc = testAssoc();
+    errdefer assoc.deinit();
+    try assoc.setStateToEstablished();
+    _ = assoc.pollEvent();
+    return assoc;
+}
+
 fn testPacket(buffer: *[16]u8, vtag: u32, chunk_type: message.ChunkType, flags: u8) []const u8 {
     std.mem.writeInt(u16, buffer[0..2], 5000, .big);
     std.mem.writeInt(u16, buffer[2..4], 5000, .big);
@@ -850,7 +860,7 @@ fn testRead(assoc: *Association, packet: []const u8, now: i64, lens: []usize) ![
     return lens[0..n];
 }
 
-fn testSackPacket(buffer: *[32]u8, assoc: *const Association, cumulative_tsn: u32, gaps: []const u16, a_rwnd: u32) []const u8 {
+fn testSackPacket(buffer: []u8, assoc: *const Association, cumulative_tsn: u32, gaps: []const u16, a_rwnd: u32) []const u8 {
     assoc.writeCommonHeader(buffer);
     buffer[12] = @intFromEnum(message.ChunkType.sack);
     buffer[13] = 0;
@@ -859,8 +869,8 @@ fn testSackPacket(buffer: *[32]u8, assoc: *const Association, cumulative_tsn: u3
     std.mem.writeInt(u16, buffer[24..26], @intCast(gaps.len / 2), .big);
     std.mem.writeInt(u16, buffer[26..28], 0, .big);
     for (0..gaps.len / 2) |idx| {
-        std.mem.writeInt(u16, buffer[28 + idx * 2 ..][0..2], gaps[idx * 2], .big);
-        std.mem.writeInt(u16, buffer[30 + idx * 2 ..][0..2], gaps[idx * 2 + 1], .big);
+        std.mem.writeInt(u16, buffer[28 + idx * 4 ..][0..2], gaps[idx * 2], .big);
+        std.mem.writeInt(u16, buffer[30 + idx * 4 ..][0..2], gaps[idx * 2 + 1], .big);
     }
     const len: u16 = @intCast(16 + gaps.len * 2);
     std.mem.writeInt(u16, buffer[14..16], len, .big);
@@ -870,10 +880,8 @@ fn testSackPacket(buffer: *[32]u8, assoc: *const Association, cumulative_tsn: u3
 }
 
 test "Association.pollTransmits: a timed out message that was gap acked is not retransmitted" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
@@ -890,11 +898,9 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
 }
 
 test "Association.pollTransmit: control chunks are sent before retransmissions" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
     assoc.message_assembler.setInitTsn(100);
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     var out: [message.MTU]u8 = undefined;
@@ -925,11 +931,9 @@ test "Association.pollTransmit: control chunks are sent before retransmissions" 
 }
 
 test "Association.pollTransmit: a retransmission that does not fit is sent in the next packet" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
     assoc.message_assembler.setInitTsn(100);
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
 
     const data: [message.MTU - message.packet_header_size - message.data_chunk_header_size]u8 = @splat('a');
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -980,10 +984,8 @@ test "Association.pollTransmit: a cookie echo that does not fit does not arm the
 }
 
 test "Association.pollTransmit: data chunk padding fits in a buffer not aligned to 4 bytes" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
 
     const data: [500]u8 = @splat('a');
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1008,9 +1010,8 @@ test "Association.pollTransmit: init, init_ack and shutdown_complete must not be
 }
 
 test "Association.pollTransmit: bundle control messages with data" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
@@ -1032,10 +1033,8 @@ test "Association.pollTransmit: bundle control messages with data" {
 }
 
 test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     var out: [message.MTU]u8 = undefined;
@@ -1053,10 +1052,8 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
 }
 
 test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
 
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
 
@@ -1074,10 +1071,8 @@ test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
 }
 
 test "Association.handleRead: a shutdown acknowledging gap acked chunks does not subtract them twice from the flight size" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
 
     const data: [100]u8 = @splat('a');
     for (0..4) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1139,11 +1134,9 @@ test "Association.handleRead: shutdown complete with the T bit and the peer tag 
 }
 
 test "Association.handleRead: data in shutdown sent is answered with a shutdown" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
     assoc.message_assembler.setInitTsn(100);
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
     assoc.state = .shutdown_sent;
 
     var buffer: [32]u8 = undefined;
@@ -1161,11 +1154,9 @@ test "Association.handleRead: data in shutdown sent is answered with a shutdown"
 }
 
 test "Association.handleRead: data in shutdown pending is delivered and acknowledged" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
     assoc.message_assembler.setInitTsn(100);
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
     assoc.state = .shutdown_pending;
 
     var buffer: [32]u8 = undefined;
@@ -1229,10 +1220,8 @@ test "Association.handleRead: out of the blue shutdown ack is answered with a re
 }
 
 test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
 
     for (0..6) |_| try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     var out: [message.MTU]u8 = undefined;
@@ -1250,11 +1239,36 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
 
-test "Association.handleRead: a duplicate followed by new data in the same packet is sacked immediately" {
-    var assoc = testAssoc();
+test "Association.pollTransmit: a fast retransmit restarts T3-rtx only for the lowest outstanding tsn" {
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
-    _ = assoc.pollEvent();
+
+    for (0..8) |_| try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.MTU]u8 = undefined;
+    while (try assoc.pollTransmit(&out, 0)) |_| {}
+    try testing.expectEqual(assoc.initial_tsn, assoc.t3_timer.rtt_tsn.?);
+
+    var buffer: [64]u8 = undefined;
+    const cumulative_tsn = assoc.initial_tsn -% 1;
+    const wnd = assoc.message_assembler.advertised_wnd;
+
+    // the lowest outstanding tsn
+    for ([_]u16{ 2, 3, 4 }) |end| _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, cumulative_tsn, &.{ 2, end }, wnd), 100);
+    var packet = (try assoc.pollTransmit(&out, 100)).?;
+    try testing.expectEqual(assoc.initial_tsn, std.mem.readInt(u32, packet[16..20], .big));
+    try testing.expectEqual(100 + initial_rto, assoc.t3_timer.deadline);
+    try testing.expectEqual(null, assoc.t3_timer.rtt_tsn);
+
+    // another tsn
+    for ([_]u16{ 6, 7, 8 }) |end| _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, cumulative_tsn, &.{ 2, 4, 6, end }, wnd), 200);
+    packet = (try assoc.pollTransmit(&out, 200)).?;
+    try testing.expectEqual(assoc.initial_tsn +% 4, std.mem.readInt(u32, packet[16..20], .big));
+    try testing.expectEqual(100 + initial_rto, assoc.t3_timer.deadline);
+}
+
+test "Association.handleRead: a duplicate followed by new data in the same packet is sacked immediately" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
 
     var buffer: [64]u8 = undefined;
     var lens: [2]usize = undefined;
@@ -1284,10 +1298,9 @@ test "Association.handleRead: a duplicate followed by new data in the same packe
 }
 
 test "Association.shutdown: an empty queue sends a shutdown right away" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
     assoc.message_assembler.setInitTsn(100);
-    try assoc.setStateToEstablished();
 
     try assoc.shutdown();
 
@@ -1296,9 +1309,8 @@ test "Association.shutdown: an empty queue sends a shutdown right away" {
 }
 
 test "Association.rwnd: sending subtracts the user data size, not the chunk size" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
     assoc.message_queue.rwnd = 1000;
 
     const data: [101]u8 = @splat('a');
@@ -1310,9 +1322,8 @@ test "Association.rwnd: sending subtracts the user data size, not the chunk size
 }
 
 test "Association.rwnd: a sack subtracts the outstanding data from the advertised window" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     const data: [100]u8 = @splat('a');
     for (0..3) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1325,9 +1336,8 @@ test "Association.rwnd: a sack subtracts the outstanding data from the advertise
 }
 
 test "Association.rwnd: gap acked chunks are not outstanding" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     const data: [100]u8 = @splat('a');
     for (0..3) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1341,9 +1351,8 @@ test "Association.rwnd: gap acked chunks are not outstanding" {
 }
 
 test "Association.rwnd: a sack with a window smaller than the outstanding data saturates to zero" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     const data: [100]u8 = @splat('a');
     for (0..3) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1356,9 +1365,8 @@ test "Association.rwnd: a sack with a window smaller than the outstanding data s
 }
 
 test "Association.rwnd: a timeout adds back the unacked data and the retransmission subtracts it" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     const data: [100]u8 = @splat('a');
     for (0..2) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1377,9 +1385,8 @@ test "Association.rwnd: a timeout adds back the unacked data and the retransmiss
 }
 
 test "Association.rwnd: a second timeout during a retransmission does not add the pending chunks twice" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     const data: [message.MTU - message.packet_header_size - message.data_chunk_header_size]u8 = @splat('a');
     for (0..2) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1402,9 +1409,8 @@ test "Association.rwnd: a second timeout during a retransmission does not add th
 }
 
 test "Association.rwnd: adding back the outstanding data on a timeout saturates" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     const data: [100]u8 = @splat('a');
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1417,9 +1423,8 @@ test "Association.rwnd: adding back the outstanding data on a timeout saturates"
 }
 
 test "Association.rwnd: new data is not sent while the window is smaller than the next chunk" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     const data: [100]u8 = @splat('a');
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
@@ -1442,9 +1447,8 @@ test "Association.rwnd: new data is not sent while the window is smaller than th
 }
 
 test "Association.pollTransmit: send zero window probe" {
-    var assoc = testAssoc();
+    var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    try assoc.setStateToEstablished();
 
     const data: [100]u8 = @splat('a');
     for (0..3) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });

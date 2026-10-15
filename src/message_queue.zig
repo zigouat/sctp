@@ -128,77 +128,50 @@ pub fn handleTimeout(self: *MessageQueue) void {
     self.sack_handler.clearFastRetransmit();
 }
 
-pub fn nextChunkSize(self: *MessageQueue, buffer_size: usize) ?u32 {
-    if (self.curr_msg >= self.messages.len) return null;
-    if (self.chunks.len >= 1024) return null;
-    const msg = self.messages.atPtr(self.curr_msg);
-    const curr_payload = msg.data.len - self.message_offset;
-    const max_payload = std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4);
-    return @intCast(@min(curr_payload, max_payload));
-}
+pub const NextChunkResult = packed struct {
+    written: u14,
+    zero_wnd_probe: bool = false,
+    retransmit: bool = false,
+};
 
-pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!usize {
-    std.debug.assert(self.curr_msg < self.messages.len);
-    try self.chunks.ensureUnusedCapacity(allocator, 1);
+pub const NextChunkError = error{WriteFailed} || std.mem.Allocator.Error;
 
-    const msg = self.messages.atPtr(self.curr_msg);
-    const max_payload = std.mem.alignBackward(usize, buffer.len - message.data_chunk_header_size, 4);
-    const payload_size = @min(msg.data.len - self.message_offset, max_payload);
-
-    const chunk = message.Data{
-        .flags = .{
-            .start_fragment = self.message_offset == 0,
-            .end_fragment = self.message_offset + payload_size == msg.data.len,
-            .unordered = msg.unordered,
-        },
-        .tsn = self.curr_tsn,
-        .ppid = msg.ppid,
-        .stream_id = msg.stream_id,
-        .stream_seq = msg.stream_seq,
-        .user_data = msg.data[self.message_offset .. self.message_offset + payload_size],
-    };
-    self.chunks.pushBackAssumeCapacity(chunk);
-    self.curr_tsn +%= 1;
-
-    if (chunk.flags.end_fragment) {
-        self.curr_msg += 1;
-        self.message_offset = 0;
-    } else {
-        self.message_offset += @intCast(payload_size);
-    }
-
-    self.pending_size -|= @intCast(payload_size);
-    self.flight_size += @intCast(payload_size);
-    self.rwnd -|= @intCast(payload_size);
-
-    return chunk.write(buffer);
-}
-
-pub fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
-    while (true) {
-        if (self.retransmit_index == null) return null;
-        const chunk = self.chunks.atPtr(self.retransmit_index.?);
-        if (self.sack_handler.isAcked(chunk.tsn)) {
-            self.nextRetransmitIndex();
-            continue;
+pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) NextChunkError!?NextChunkResult {
+    const size = try self.nextRetransmit(buffer) orelse {
+        var zero_wnd_probe = false;
+        const next_chunk_size = self.nextChunkSize(buffer.len) orelse return null;
+        if (self.rwnd < next_chunk_size) {
+            if (self.chunks.len != 0) return null;
+            zero_wnd_probe = true;
         }
 
-        if (chunk.getSize() > buffer.len) return error.WriteFailed;
-        self.flight_size += @intCast(chunk.user_data.len);
-        self.rwnd -|= @intCast(chunk.user_data.len);
-        self.nextRetransmitIndex();
-        return @intCast(chunk.write(buffer));
-    }
+        const written = try self.nextNewChunk(allocator, buffer);
+        return NextChunkResult{
+            .written = @intCast(written),
+            .zero_wnd_probe = zero_wnd_probe,
+        };
+    };
+
+    return NextChunkResult{ .written = @intCast(size), .retransmit = true };
 }
 
-pub fn nextFastRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
-    if (self.sack_handler.firstTsnWithThreeMisses(self.sack_handler.cumulative_tsn +% 1)) |tsn| {
+pub const FastRetransmit = struct {
+    tsn: u32,
+    size: u32,
+};
+
+pub fn nextFastRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?FastRetransmit {
+    if (self.sack_handler.firstTsnWithThreeMisses(self.lowestOutstandingTsn())) |tsn| {
         if (self.getChunkSizeAt(tsn) > buffer.len) return error.WriteFailed;
         self.sack_handler.markFastRetransmitted(tsn);
-        return self.writeChunkAt(tsn, buffer);
+        return .{ .tsn = tsn, .size = self.writeChunkAt(tsn, buffer) };
     }
 
     return null;
+}
+
+pub fn lowestOutstandingTsn(self: *const MessageQueue) u32 {
+    return self.sack_handler.cumulative_tsn +% 1;
 }
 
 pub fn isEmpty(self: *const MessageQueue) bool {
@@ -256,6 +229,69 @@ fn writeChunkAt(self: *const MessageQueue, tsn: u32, buffer: []u8) u32 {
     return @intCast(self.chunks.at(index).write(buffer));
 }
 
+fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
+    while (true) {
+        if (self.retransmit_index == null) return null;
+        const chunk = self.chunks.atPtr(self.retransmit_index.?);
+        if (self.sack_handler.isAcked(chunk.tsn)) {
+            self.nextRetransmitIndex();
+            continue;
+        }
+
+        if (chunk.getSize() > buffer.len) return error.WriteFailed;
+        self.flight_size += @intCast(chunk.user_data.len);
+        self.rwnd -|= @intCast(chunk.user_data.len);
+        self.nextRetransmitIndex();
+        return @intCast(chunk.write(buffer));
+    }
+}
+
+fn nextChunkSize(self: *MessageQueue, buffer_size: usize) ?u32 {
+    if (self.curr_msg >= self.messages.len) return null;
+    if (self.chunks.len >= 1024) return null;
+    const msg = self.messages.atPtr(self.curr_msg);
+    const curr_payload = msg.data.len - self.message_offset;
+    const max_payload = std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4);
+    return @intCast(@min(curr_payload, max_payload));
+}
+
+fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!usize {
+    std.debug.assert(self.curr_msg < self.messages.len);
+    try self.chunks.ensureUnusedCapacity(allocator, 1);
+
+    const msg = self.messages.atPtr(self.curr_msg);
+    const max_payload = std.mem.alignBackward(usize, buffer.len - message.data_chunk_header_size, 4);
+    const payload_size = @min(msg.data.len - self.message_offset, max_payload);
+
+    const chunk = message.Data{
+        .flags = .{
+            .start_fragment = self.message_offset == 0,
+            .end_fragment = self.message_offset + payload_size == msg.data.len,
+            .unordered = msg.unordered,
+        },
+        .tsn = self.curr_tsn,
+        .ppid = msg.ppid,
+        .stream_id = msg.stream_id,
+        .stream_seq = msg.stream_seq,
+        .user_data = msg.data[self.message_offset .. self.message_offset + payload_size],
+    };
+    self.chunks.pushBackAssumeCapacity(chunk);
+    self.curr_tsn +%= 1;
+
+    if (chunk.flags.end_fragment) {
+        self.curr_msg += 1;
+        self.message_offset = 0;
+    } else {
+        self.message_offset += @intCast(payload_size);
+    }
+
+    self.pending_size -|= @intCast(payload_size);
+    self.flight_size += @intCast(payload_size);
+    self.rwnd -|= @intCast(payload_size);
+
+    return chunk.write(buffer);
+}
+
 fn getChunkSizeAt(self: *const MessageQueue, tsn: u32) u32 {
     const index = tsn -% self.chunks.atPtr(0).tsn;
     return self.chunks.atPtr(index).getSize();
@@ -292,7 +328,7 @@ fn testSendChunks(msg_queue: *MessageQueue, count: usize) !void {
     var buffer: [64]u8 = undefined;
     for (0..count) |_| {
         try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 0, .ppid = 0 });
-        _ = try msg_queue.nextChunk(testing.allocator, &buffer);
+        _ = try msg_queue.nextNewChunk(testing.allocator, &buffer);
     }
 }
 
