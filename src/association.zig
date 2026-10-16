@@ -722,15 +722,15 @@ fn writeInitAck(self: *Association, buffer: []u8) usize {
 }
 
 fn writeCookieEcho(cookie: []const u8, buffer: []u8) error{WriteFailed}!usize {
-    const pad = (4 - (cookie.len % 4)) % 4;
-    if (4 + cookie.len + pad > buffer.len) return error.WriteFailed;
+    const size = std.mem.alignForward(usize, cookie.len + 4, 4);
+    if (buffer.len < size) return error.WriteFailed;
     buffer[0] = @intFromEnum(message.ChunkType.cookie_echo);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], @intCast(4 + cookie.len), .big);
     @memcpy(buffer[4..][0..cookie.len], cookie);
-    @memset(buffer[4 + cookie.len ..][0..pad], 0);
+    @memset(buffer[4 + cookie.len .. size], 0);
 
-    return 4 + cookie.len + pad;
+    return size;
 }
 
 fn writeCookieAck(self: *Association, buffer: []u8) usize {

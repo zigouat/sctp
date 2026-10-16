@@ -417,14 +417,14 @@ pub const Parameter = union(enum) {
     }
 
     fn writeTLV(typ: ParameterType, data: []const u8, buffer: []u8) !usize {
-        const pad = (4 - (data.len % 4)) % 4;
-        if (buffer.len < data.len + 4 + pad) return error.WriteFailed;
+        const total_size = std.mem.alignForward(usize, data.len + 4, 4);
+        if (buffer.len < total_size) return error.WriteFailed;
 
         std.mem.writeInt(u16, buffer[0..2], @intFromEnum(typ), .big);
         std.mem.writeInt(u16, buffer[2..4], @intCast(data.len + 4), .big);
         @memcpy(buffer[4..][0..data.len], data);
-        @memset(buffer[4 + data.len ..][0..pad], 0);
-        return data.len + 4 + pad;
+        @memset(buffer[4 + data.len .. total_size], 0);
+        return total_size;
     }
 };
 

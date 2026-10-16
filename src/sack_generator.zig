@@ -2,23 +2,20 @@ const std = @import("std");
 const testing = std.testing;
 const message = @import("message.zig");
 const Helper = @import("helper.zig");
+const TsnBitSet = @import("tsn_bit_set.zig");
 
 const SackGenerator = @This();
 
-pub const bitmap_bits = 1024;
+pub const bitmap_bits = TsnBitSet.bitmap_bits;
 pub const max_duplicates = 16;
 
-cumulative_tsn: u32,
-highest_tsn_received: u32,
-bitmap: std.StaticBitSet(bitmap_bits),
+received: TsnBitSet,
 duplicates: [max_duplicates]u32,
 duplicate_count: u8,
 
 pub fn init(initial_tsn: u32) SackGenerator {
     return .{
-        .cumulative_tsn = initial_tsn -% 1,
-        .highest_tsn_received = initial_tsn -% 1,
-        .bitmap = .empty,
+        .received = .init(initial_tsn),
         .duplicates = undefined,
         .duplicate_count = 0,
     };
@@ -27,30 +24,23 @@ pub fn init(initial_tsn: u32) SackGenerator {
 pub const TsnError = error{ OutOfWindow, Duplicate };
 
 pub fn checkTsn(self: *SackGenerator, tsn: u32) TsnError!void {
-    if (Helper.tsnLte(tsn, self.cumulative_tsn)) {
+    if (Helper.tsnLte(tsn, self.received.cumulative_tsn)) {
         self.recordDuplicate(tsn);
         return error.Duplicate;
     }
 
-    const offset = tsn -% (self.cumulative_tsn +% 1);
+    const offset = tsn -% (self.received.cumulative_tsn +% 1);
     if (offset >= bitmap_bits - 1) return error.OutOfWindow;
 
-    const index = bitIndex(tsn);
-    if (self.isBitSet(index)) {
+    if (self.received.isAcked(tsn)) {
         self.recordDuplicate(tsn);
         return error.Duplicate;
     }
 }
 
 pub fn receiveTsn(self: *SackGenerator, tsn: u32) void {
-    self.bitmap.set(bitIndex(tsn));
-    if (Helper.tsnGt(tsn, self.highest_tsn_received)) self.highest_tsn_received = tsn;
-    while (true) {
-        const next_index = bitIndex(self.cumulative_tsn +% 1);
-        if (!self.isBitSet(next_index)) break;
-        self.bitmap.unset(next_index);
-        self.cumulative_tsn +%= 1;
-    }
+    self.received.ack(tsn);
+    self.received.advanceCumulativeTsn();
 }
 
 pub fn clearDuplicates(self: *SackGenerator) void {
@@ -60,27 +50,19 @@ pub fn clearDuplicates(self: *SackGenerator) void {
 pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) u32 {
     std.debug.assert(buffer.len >= 16);
 
+    const cumulative_tsn = self.received.cumulative_tsn;
     buffer[0] = @intFromEnum(message.ChunkType.sack);
     buffer[1] = 0; // flags
-    std.mem.writeInt(u32, buffer[4..8], self.cumulative_tsn, .big);
+    std.mem.writeInt(u32, buffer[4..8], cumulative_tsn, .big);
     std.mem.writeInt(u32, buffer[8..12], a_rwnd, .big);
 
     var written: u32 = 16;
     var gap_block_count: u16 = 0;
-    const limit = self.gapScanLimit();
-    var offset: u32 = 1;
-    while (offset < limit) : (offset += 1) {
-        const index = bitIndex(self.cumulative_tsn +% offset);
-        if (!self.isBitSet(index)) continue;
-
-        const start = offset;
-        while (offset + 1 < limit and
-            self.isBitSet(bitIndex(self.cumulative_tsn +% (offset + 1)))) : (offset += 1)
-        {}
-
+    var it = self.received.iterateGapBlocks();
+    while (it.next()) |block| {
         if (buffer.len - written < 4) break;
-        std.mem.writeInt(u16, buffer[written..][0..2], @intCast(start), .big);
-        std.mem.writeInt(u16, buffer[written + 2 ..][0..2], @intCast(offset), .big);
+        std.mem.writeInt(u16, buffer[written..][0..2], @intCast(block.start -% cumulative_tsn), .big);
+        std.mem.writeInt(u16, buffer[written + 2 ..][0..2], @intCast(block.end -% cumulative_tsn), .big);
         written += 4;
         gap_block_count += 1;
     }
@@ -101,25 +83,7 @@ pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) u32 {
 
 /// Reneg the highest received TSN
 pub fn reneg(self: *SackGenerator, tsn: u32) void {
-    self.bitmap.unset(bitIndex(tsn));
-    if (tsn == self.highest_tsn_received) while (Helper.tsnGt(self.highest_tsn_received, self.cumulative_tsn)) : (self.highest_tsn_received -%= 1) {
-        const idx = bitIndex(self.highest_tsn_received);
-        if (self.isBitSet(idx)) break;
-    };
-}
-
-fn bitIndex(tsn: u32) u16 {
-    return @intCast(tsn % bitmap_bits);
-}
-
-fn isBitSet(self: *const SackGenerator, index: u16) bool {
-    const Bitmap = @TypeOf(self.bitmap);
-    const mask = self.bitmap.masks[index / @bitSizeOf(Bitmap.MaskInt)];
-    return (mask >> @as(Bitmap.ShiftInt, @truncate(index))) & 1 != 0;
-}
-
-fn gapScanLimit(self: *const SackGenerator) u32 {
-    return (self.highest_tsn_received -% self.cumulative_tsn) + 1;
+    self.received.unack(tsn);
 }
 
 fn recordDuplicate(self: *SackGenerator, tsn: u32) void {
@@ -136,27 +100,27 @@ fn testReceive(g: *SackGenerator, tsn: u32) !void {
 test "SackGenerator.receiveTsn: in-order delivery advances the cumulative tsn" {
     var g = SackGenerator.init(1);
     try testReceive(&g, 1);
-    try testing.expectEqual(@as(u32, 1), g.cumulative_tsn);
+    try testing.expectEqual(@as(u32, 1), g.received.cumulative_tsn);
     try testReceive(&g, 2);
-    try testing.expectEqual(@as(u32, 2), g.cumulative_tsn);
-    try testing.expectEqual(@as(u32, 2), g.highest_tsn_received);
+    try testing.expectEqual(@as(u32, 2), g.received.cumulative_tsn);
+    try testing.expectEqual(@as(u32, 2), g.received.highest_tsn_received);
 }
 
 test "SackGenerator.receiveTsn: out-of-order arrival is buffered without advancing the cumulative tsn" {
     var g = SackGenerator.init(1);
     try testReceive(&g, 3);
-    try testing.expectEqual(@as(u32, 0), g.cumulative_tsn);
-    try testing.expectEqual(@as(u32, 3), g.highest_tsn_received);
-    try testing.expect(g.bitmap.isSet(3));
+    try testing.expectEqual(@as(u32, 0), g.received.cumulative_tsn);
+    try testing.expectEqual(@as(u32, 3), g.received.highest_tsn_received);
+    try testing.expect(g.received.isAcked(3));
 }
 
 test "SackGenerator.receiveTsn: filling a gap advances the cumulative tsn across buffered bits" {
     var g = SackGenerator.init(1);
     try testReceive(&g, 3);
     try testReceive(&g, 2);
-    try testing.expectEqual(@as(u32, 0), g.cumulative_tsn);
+    try testing.expectEqual(@as(u32, 0), g.received.cumulative_tsn);
     try testReceive(&g, 1);
-    try testing.expectEqual(@as(u32, 3), g.cumulative_tsn);
+    try testing.expectEqual(@as(u32, 3), g.received.cumulative_tsn);
 }
 
 test "SackGenerator.receiveTsn: duplicate tsn are recorded" {
@@ -232,12 +196,12 @@ test "SackGenerator.writeSack: writeSack truncates gap ack blocks and duplicates
 
 test "SackGenerator.receiveTsn: tsn wraparound near 0xFFFFFFFF is handled correctly" {
     var g = SackGenerator.init(0xFFFFFFFF);
-    try testing.expectEqual(@as(u32, 0xFFFFFFFE), g.cumulative_tsn);
+    try testing.expectEqual(@as(u32, 0xFFFFFFFE), g.received.cumulative_tsn);
     try testReceive(&g, 0xFFFFFFFF);
-    try testing.expectEqual(@as(u32, 0xFFFFFFFF), g.cumulative_tsn);
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), g.received.cumulative_tsn);
     try testReceive(&g, 0);
-    try testing.expectEqual(@as(u32, 0), g.cumulative_tsn);
-    try testing.expectEqual(@as(u32, 0), g.highest_tsn_received);
+    try testing.expectEqual(@as(u32, 0), g.received.cumulative_tsn);
+    try testing.expectEqual(@as(u32, 0), g.received.highest_tsn_received);
 }
 
 test "SackGenerator.writeSack: gap ack blocks are offsets from the cumulative tsn and round-trip through the parser" {
@@ -261,7 +225,7 @@ test "SackGenerator.writeSack: gap ack blocks are offsets from the cumulative ts
 
 test "SackGenerator.receiveTsn: the furthest tsn inside the window still fits in a gap ack block" {
     var g = SackGenerator.init(1);
-    const last = g.cumulative_tsn +% (bitmap_bits - 1);
+    const last = g.received.cumulative_tsn +% (bitmap_bits - 1);
     try testReceive(&g, last);
     try testing.expectError(error.OutOfWindow, testReceive(&g, last +% 1));
 
@@ -279,20 +243,20 @@ test "SackGenerator.reneg: reneg received tsns" {
     try testReceive(&g, 5);
     try testReceive(&g, 7);
 
-    try testing.expect(g.isBitSet(bitIndex(7)));
-    try testing.expectEqual(@as(u32, 7), g.highest_tsn_received);
+    try testing.expect(g.received.isAcked(7));
+    try testing.expectEqual(@as(u32, 7), g.received.highest_tsn_received);
 
     g.reneg(7);
-    try testing.expect(!g.isBitSet(bitIndex(7)));
-    try testing.expectEqual(@as(u32, 5), g.highest_tsn_received);
+    try testing.expect(!g.received.isAcked(7));
+    try testing.expectEqual(@as(u32, 5), g.received.highest_tsn_received);
 
     g.reneg(5);
-    try testing.expect(!g.isBitSet(bitIndex(5)));
-    try testing.expectEqual(@as(u32, 3), g.highest_tsn_received);
+    try testing.expect(!g.received.isAcked(5));
+    try testing.expectEqual(@as(u32, 3), g.received.highest_tsn_received);
 
     try testReceive(&g, 6);
     try testReceive(&g, 8);
     g.reneg(6);
-    try testing.expect(!g.isBitSet(bitIndex(6)));
-    try testing.expectEqual(@as(u32, 8), g.highest_tsn_received);
+    try testing.expect(!g.received.isAcked(6));
+    try testing.expectEqual(@as(u32, 8), g.received.highest_tsn_received);
 }
