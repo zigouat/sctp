@@ -133,9 +133,7 @@ pub fn hasGaps(self: *const MessageAssembler) bool {
 }
 
 fn dropChunkWithHighestTsn(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) bool {
-    if (Helper.tsnLte(d.tsn, self.sack_generator.received.cumulative_tsn) or
-        Helper.tsnLte(self.sack_generator.received.highest_tsn_received, d.tsn)) return false;
-
+    if (!self.sack_generator.received.inGapRange(d.tsn)) return false;
     var high = self.sack_generator.received.highest_tsn_received;
     while (Helper.tsnGt(high, d.tsn)) : (high -%= 1) {
         if (!self.dropChunk(allocator, high)) continue;

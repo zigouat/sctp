@@ -144,6 +144,11 @@ pub fn allAcked(self: *const TsnBitSet, max_tsn: u32) bool {
     return self.highest_tsn_received == max_tsn and self.isRangeAcked(self.cumulative_tsn, max_tsn);
 }
 
+/// Returns true if the tsn is in the range (cumulative_tsn, highest_tsn_received].
+pub fn inGapRange(self: *const TsnBitSet, tsn: u32) bool {
+    return Helper.tsnGt(tsn, self.cumulative_tsn) and Helper.tsnLte(tsn, self.highest_tsn_received);
+}
+
 /// Acks a tsn above the cumulative tsn, without advancing the cumulative tsn.
 pub fn ack(self: *TsnBitSet, tsn: u32) void {
     if (Helper.tsnLte(tsn, self.cumulative_tsn)) return;
