@@ -68,6 +68,7 @@ const RetransmissionTimer = struct {
     rttvar: u32,
     rto: u16,
     deadline: i64,
+    idle_deadline: i64,
 
     rtt_tsn: ?u32,
     rtt_start: i64,
@@ -81,6 +82,7 @@ const RetransmissionTimer = struct {
         .rttvar = 0,
         .rto = initial_rto,
         .deadline = std.math.maxInt(i64),
+        .idle_deadline = std.math.maxInt(i64),
         .rtt_tsn = null,
         .rtt_start = 0,
         .first_sample = true,
@@ -127,6 +129,14 @@ const RetransmissionTimer = struct {
 
     fn stop(timer: *RetransmissionTimer) void {
         timer.deadline = std.math.maxInt(i64);
+    }
+
+    fn startIdle(timer: *RetransmissionTimer, now: i64) void {
+        timer.idle_deadline = now + timer.rto;
+    }
+
+    fn stopIdle(timer: *RetransmissionTimer) void {
+        timer.idle_deadline = std.math.maxInt(i64);
     }
 
     fn backoffAndRestart(timer: *RetransmissionTimer, now: i64) void {
@@ -385,6 +395,13 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
         self.t3_timer.backoffAndRestart(now);
         self.t3_timer.clearCurrentSample();
     }
+
+    if (now >= self.t3_timer.idle_deadline) {
+        // RFC9260 - 7.2.1. cwnd decays per RTO while no data is transmitted, the idle timer stops once cwnd no longer decays.
+        const curr_cwnd = self.cwnd;
+        self.cwnd = @min(self.cwnd, @max(self.cwnd / 2, 4 * message.PMDCS));
+        if (curr_cwnd != self.cwnd) self.t3_timer.startIdle(now) else self.t3_timer.stopIdle();
+    }
 }
 
 pub fn pollEvent(self: *Association) ?Event {
@@ -433,7 +450,10 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
 }
 
 pub fn pollTimeout(self: *Association) ?i64 {
-    const deadline = @min(@min(self.message_assembler.sack_deadline, self.init_deadline), self.t3_timer.deadline);
+    const deadline = @min(
+        @min(self.message_assembler.sack_deadline, self.init_deadline),
+        @min(self.t3_timer.deadline, self.t3_timer.idle_deadline),
+    );
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
@@ -460,6 +480,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
         self.zero_wnd_probe |= result.zero_wnd_probe;
 
         self.t3_timer.setDeadline(now);
+        self.t3_timer.stopIdle();
         if (!result.retransmit) self.t3_timer.setSample(self.message_queue.highestTsnSent(), now);
         return .{ null, result.written };
     };
@@ -527,6 +548,8 @@ fn updateT3Timer(self: *Association, cumulative_tsn_advanced: bool, now: i64) vo
     if (cumulative_tsn_advanced) self.zero_wnd_probe = false;
 
     if (self.message_queue.isAllAcked()) {
+        // SACKs received while idle must not postpone the decay
+        if (self.t3_timer.idle_deadline == std.math.maxInt(i64)) self.t3_timer.startIdle(now);
         self.t3_timer.stop();
         self.partial_bytes_acked = 0;
     } else if (cumulative_tsn_advanced or self.t3_timer.deadline == std.math.maxInt(i64)) {
@@ -1237,6 +1260,55 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 }, assoc.message_assembler.advertised_wnd);
     _ = try assoc.handleRead(sack, 10);
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
+}
+
+test "Association.handleTimeout: cwnd decays per rto while idle" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+
+    var out: [message.MTU]u8 = undefined;
+    var buffer: [32]u8 = undefined;
+    const wnd = assoc.message_assembler.advertised_wnd;
+
+    {
+        try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+        while (try assoc.pollTransmit(&out, 0)) |_| {}
+        const sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn, &.{}, wnd);
+        _ = try assoc.handleRead(sack, 10);
+        const idle_deadline = 10 + assoc.t3_timer.rto;
+        try testing.expectEqual(idle_deadline, assoc.pollTimeout().?);
+
+        // a duplicate sack doesn't postpone the idle deadline
+        _ = try assoc.handleRead(sack, 20);
+        try testing.expectEqual(idle_deadline, assoc.pollTimeout().?);
+
+        assoc.cwnd = 16 * message.PMDCS;
+        try assoc.handleTimeout(idle_deadline);
+        try testing.expectEqual(8 * message.PMDCS, assoc.cwnd);
+        try testing.expectEqual(idle_deadline + assoc.t3_timer.rto, assoc.pollTimeout().?);
+
+        // the idle timer stops once cwnd no longer decays
+        try assoc.handleTimeout(idle_deadline + assoc.t3_timer.rto);
+        try testing.expectEqual(4 * message.PMDCS, assoc.cwnd);
+        try testing.expectEqual(idle_deadline + 2 * assoc.t3_timer.rto, assoc.pollTimeout().?);
+        try assoc.handleTimeout(idle_deadline + 2 * assoc.t3_timer.rto);
+        try testing.expectEqual(4 * message.PMDCS, assoc.cwnd);
+        try testing.expectEqual(null, assoc.pollTimeout());
+    }
+
+    {
+        try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+        while (try assoc.pollTransmit(&out, 5000)) |_| {}
+        try testing.expectEqual(std.math.maxInt(i64), assoc.t3_timer.idle_deadline);
+        const sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}, wnd);
+        _ = try assoc.handleRead(sack, 5010);
+
+        // a cwnd below the floor doesn't grow while idle
+        assoc.cwnd = message.PMDCS;
+        try assoc.handleTimeout(assoc.pollTimeout().?);
+        try testing.expectEqual(message.PMDCS, assoc.cwnd);
+        try testing.expectEqual(null, assoc.pollTimeout());
+    }
 }
 
 test "Association.pollTransmit: a fast retransmit restarts T3-rtx only for the lowest outstanding tsn" {
