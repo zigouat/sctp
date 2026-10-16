@@ -125,18 +125,18 @@ pub fn drainReady(self: *MessageAssembler) ?UserMessage {
 }
 
 pub fn getCumulativeTsn(self: *const MessageAssembler) u32 {
-    return self.sack_generator.cumulative_tsn;
+    return self.sack_generator.received.cumulative_tsn;
 }
 
 pub fn hasGaps(self: *const MessageAssembler) bool {
-    return self.sack_generator.cumulative_tsn != self.sack_generator.highest_tsn_received;
+    return self.sack_generator.received.cumulative_tsn != self.sack_generator.received.highest_tsn_received;
 }
 
 fn dropChunkWithHighestTsn(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) bool {
-    if (Helper.tsnLte(d.tsn, self.sack_generator.cumulative_tsn) or
-        Helper.tsnLte(self.sack_generator.highest_tsn_received, d.tsn)) return false;
+    if (Helper.tsnLte(d.tsn, self.sack_generator.received.cumulative_tsn) or
+        Helper.tsnLte(self.sack_generator.received.highest_tsn_received, d.tsn)) return false;
 
-    var high = self.sack_generator.highest_tsn_received;
+    var high = self.sack_generator.received.highest_tsn_received;
     while (Helper.tsnGt(high, d.tsn)) : (high -%= 1) {
         if (!self.dropChunk(allocator, high)) continue;
         self.sack_generator.reneg(high);
@@ -338,22 +338,22 @@ test "MessageAssembler.receiveData: zero receive window drops or reneg chunks" {
     // unordered message is delivered right away and closes the window
     try testing.expect(!try r.receiveData(testing.allocator, testData(tsn +% 3, 1, 0, .unordered_complete, payload[0..40])));
     try testing.expectEqual(0, r.advertised_wnd);
-    try testing.expectEqual(tsn +% 3, r.sack_generator.highest_tsn_received);
+    try testing.expectEqual(tsn +% 3, r.sack_generator.received.highest_tsn_received);
 
     // a tsn above the highest one is dropped
     try testing.expect(try r.receiveData(testing.allocator, testData(tsn +% 4, 1, 0, .complete, payload[0..40])));
-    try testing.expectEqual(tsn +% 3, r.sack_generator.highest_tsn_received);
+    try testing.expectEqual(tsn +% 3, r.sack_generator.received.highest_tsn_received);
 
     // the higher tsns are already delivered or never received, nothing to reneg
     try testing.expect(try r.receiveData(testing.allocator, testData(tsn +% 2, 1, 0, .complete, payload[0..40])));
-    try testing.expectEqual(tsn +% 3, r.sack_generator.highest_tsn_received);
-    try testing.expectEqual(tsn -% 1, r.sack_generator.cumulative_tsn);
+    try testing.expectEqual(tsn +% 3, r.sack_generator.received.highest_tsn_received);
+    try testing.expectEqual(tsn -% 1, r.sack_generator.received.cumulative_tsn);
 
     // ssn 1 held for reordering is reneged to accept ssn 0
     try testing.expect(try r.receiveData(testing.allocator, testData(tsn, 1, 0, .complete, payload[0..10])));
     try testing.expect(!r.pending.contains(tsn +% 1));
-    try testing.expectEqual(tsn, r.sack_generator.cumulative_tsn);
-    try testing.expectEqual(tsn +% 3, r.sack_generator.highest_tsn_received);
+    try testing.expectEqual(tsn, r.sack_generator.received.cumulative_tsn);
+    try testing.expectEqual(tsn +% 3, r.sack_generator.received.highest_tsn_received);
 }
 
 test "MessageAssembler.drainReady: re-assemble messages" {

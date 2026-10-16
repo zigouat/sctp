@@ -79,7 +79,7 @@ pub const SackResult = struct {
 
 pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: message.Sack, fast_recovery: bool) ?SackResult {
     const prev_flight_size = self.flight_size;
-    const prev_cumulative_tsn = self.sack_handler.cumulative_tsn;
+    const prev_cumulative_tsn = self.sack_handler.acked.cumulative_tsn;
     var acked_data: u32 = 0;
     var duplicate_data: u32 = 0;
 
@@ -105,7 +105,7 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
         .acked_data = acked_data,
         .duplicate_data = duplicate_data,
         .has_fast_retransmit = has_fast_retransmit,
-        .cumulative_ack_advanced = prev_cumulative_tsn != self.sack_handler.cumulative_tsn,
+        .cumulative_ack_advanced = prev_cumulative_tsn != self.sack_handler.acked.cumulative_tsn,
     };
 }
 
@@ -113,7 +113,7 @@ pub const CumulativeAck = enum { invalid, unchanged, advanced };
 
 pub fn handleShutdownChunk(self: *MessageQueue, allocator: std.mem.Allocator, cumulative_tsn: u32) CumulativeAck {
     if (Helper.tsnGt(cumulative_tsn, self.highestTsnSent())) return .invalid;
-    if (!Helper.tsnGt(cumulative_tsn, self.sack_handler.cumulative_tsn)) return .unchanged;
+    if (!Helper.tsnGt(cumulative_tsn, self.sack_handler.acked.cumulative_tsn)) return .unchanged;
     _ = self.updateGapAckedFlightSize(true);
     self.sack_handler.handleCumulativeTsn(cumulative_tsn);
     _ = self.dropAcknowledged(allocator);
@@ -171,7 +171,7 @@ pub fn nextFastRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!
 }
 
 pub fn lowestOutstandingTsn(self: *const MessageQueue) u32 {
-    return self.sack_handler.cumulative_tsn +% 1;
+    return self.sack_handler.acked.cumulative_tsn +% 1;
 }
 
 pub fn isEmpty(self: *const MessageQueue) bool {
@@ -191,7 +191,7 @@ pub fn isAcked(self: *const MessageQueue, tsn: u32) bool {
 }
 
 pub fn isCumulativelyAcked(self: *const MessageQueue, tsn: u32) bool {
-    return Helper.tsnLte(tsn, self.sack_handler.cumulative_tsn);
+    return Helper.tsnLte(tsn, self.sack_handler.acked.cumulative_tsn);
 }
 
 fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator) u32 {
@@ -199,7 +199,7 @@ fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator) u32 {
     var data_size: u32 = 0;
 
     const retransmit_index = self.retransmit_index orelse self.chunks.len;
-    const dropped = self.sack_handler.cumulative_tsn -% self.chunks.frontPtr().?.tsn +% 1;
+    const dropped = self.sack_handler.acked.cumulative_tsn -% self.chunks.frontPtr().?.tsn +% 1;
     for (0..dropped) |index| {
         const chunk = self.chunks.popFront().?;
         if (chunk.flags.end_fragment) {
@@ -230,20 +230,26 @@ fn writeChunkAt(self: *const MessageQueue, tsn: u32, buffer: []u8) u32 {
 }
 
 fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
-    while (true) {
-        if (self.retransmit_index == null) return null;
-        const chunk = self.chunks.atPtr(self.retransmit_index.?);
-        if (self.sack_handler.isAcked(chunk.tsn)) {
-            self.nextRetransmitIndex();
-            continue;
-        }
+    const start_tsn = self.getCurrentRetransmitTsn() orelse return null;
+    const acked = &self.sack_handler.acked;
+    const highest_tsn = acked.highest_tsn_received;
+    const tsn = if (Helper.tsnGt(start_tsn, highest_tsn))
+        start_tsn
+    else
+        acked.firstUnacked(start_tsn, highest_tsn) orelse highest_tsn +% 1;
 
-        if (chunk.getSize() > buffer.len) return error.WriteFailed;
-        self.flight_size += @intCast(chunk.user_data.len);
-        self.rwnd -|= @intCast(chunk.user_data.len);
-        self.nextRetransmitIndex();
-        return @intCast(chunk.write(buffer));
+    if (Helper.tsnGt(tsn, self.highestTsnSent())) {
+        self.retransmit_index = null;
+        return null;
     }
+
+    self.retransmit_index = tsn -% self.chunks.atPtr(0).tsn;
+    const chunk = self.chunks.atPtr(self.retransmit_index.?);
+    if (chunk.getSize() > buffer.len) return error.WriteFailed;
+    self.flight_size += @intCast(chunk.user_data.len);
+    self.rwnd -|= @intCast(chunk.user_data.len);
+    self.nextRetransmitIndex();
+    return @intCast(chunk.write(buffer));
 }
 
 fn nextChunkSize(self: *MessageQueue, buffer_size: usize) ?u32 {
@@ -300,7 +306,7 @@ fn getChunkSizeAt(self: *const MessageQueue, tsn: u32) u32 {
 fn updateGapAckedFlightSize(self: *MessageQueue, comptime inc: bool) u32 {
     var it = self.sack_handler.iterateGapAcked();
     var acked_data: u32 = 0;
-    const max_tsn = if (self.getCurrentRetransmitTsn()) |tsn| tsn -% 1 else self.sack_handler.highest_tsn_received;
+    const max_tsn = if (self.getCurrentRetransmitTsn()) |tsn| tsn -% 1 else self.sack_handler.acked.highest_tsn_received;
     while (it.next()) |tsn| {
         if (Helper.tsnLte(tsn, max_tsn)) self.updateFlightSize(tsn, inc);
         acked_data += self.getChunkSizeAt(tsn);
@@ -366,6 +372,28 @@ test "MessageQueue.nextRetransmit: retransmitting the last chunk clears the retr
     try testing.expectEqual(null, msg_queue.retransmit_index);
     try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
     try testing.expectEqual(8, msg_queue.flight_size);
+}
+
+test "MessageQueue.nextRetransmit: gap acked chunks are skipped" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+
+    try testSendChunks(&msg_queue, 6);
+    _ = msg_queue.handleSack(testing.allocator, message.Sack{
+        .cumulative_tsn = 1,
+        .a_rwnd = 1000,
+        .gap_ack_blocks = &.{ 0, 2, 0, 3, 0, 5, 0, 5 },
+        .duplicate_tsns = &.{},
+    }, false);
+    msg_queue.handleTimeout();
+
+    var buffer: [64]u8 = undefined;
+    for ([_]u32{ 2, 5 }) |tsn| {
+        _ = (try msg_queue.nextRetransmit(&buffer)).?;
+        try testing.expectEqual(tsn, std.mem.readInt(u32, buffer[4..8], .big));
+    }
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(&buffer));
+    try testing.expectEqual(null, msg_queue.retransmit_index);
 }
 
 test "MessageQueue.handleSack: acknowledging every chunk during a retransmission clears the retransmit index" {
