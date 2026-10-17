@@ -192,6 +192,8 @@ events: std.Deque(Event),
 t3_timer: RetransmissionTimer,
 /// If `true`, the in-flight chunk is a window probe: it was sent while the window was smaller than its size.
 zero_wnd_probe: bool,
+/// If `true`, a SACK is queued in `transmits` and not yet sent.
+pending_sack: bool,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) Association {
     const initial_tsn = config.random.int(u32);
@@ -223,6 +225,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .message_queue = .init(initial_tsn),
         .t3_timer = .init,
         .zero_wnd_probe = false,
+        .pending_sack = false,
     };
 }
 
@@ -433,6 +436,7 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
             switch (chunk_type) {
                 .init_ack => |tag| std.mem.writeInt(u32, buffer[4..8], tag, .big),
                 .shutdown_complete => |reflected| if (reflected) std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big),
+                .sack => self.pending_sack = false,
                 else => {},
             }
 
@@ -696,8 +700,10 @@ fn isValidVerificationTag(self: *const Association, packet: *const message.Packe
 }
 
 fn pushSack(self: *Association) !void {
-    try self.transmits.pushBack(self.allocator, .sack);
     self.message_assembler.clearDelayedSack();
+    if (self.pending_sack) return;
+    try self.transmits.pushBack(self.allocator, .sack);
+    self.pending_sack = true;
 }
 
 fn resetInitTimer(self: *Association) void {
@@ -881,6 +887,13 @@ fn testRead(assoc: *Association, packet: []const u8, now: i64, lens: []usize) ![
         lens[n] = msg.data.len;
     }
     return lens[0..n];
+}
+
+fn testShutdownPacket(assoc: *const Association, buffer: []u8, tsn: u32) []const u8 {
+    assoc.writeCommonHeader(buffer);
+    const written = writeShutdown(buffer[message.packet_header_size..], tsn);
+    Helper.checkSum(buffer[0 .. message.packet_header_size + written]);
+    return buffer[0 .. message.packet_header_size + written];
 }
 
 fn testSackPacket(buffer: []u8, assoc: *const Association, cumulative_tsn: u32, gaps: []const u16, a_rwnd: u32) []const u8 {
@@ -1107,13 +1120,7 @@ test "Association.handleRead: a shutdown acknowledging gap acked chunks does not
     try testing.expectEqual(200, assoc.message_queue.flight_size);
 
     var buffer: [20]u8 = undefined;
-    assoc.writeCommonHeader(&buffer);
-    buffer[12] = @intFromEnum(message.ChunkType.shutdown);
-    buffer[13] = 0;
-    std.mem.writeInt(u16, buffer[14..16], 8, .big);
-    std.mem.writeInt(u32, buffer[16..20], assoc.initial_tsn +% 2, .big);
-    Helper.checkSum(&buffer);
-    _ = try assoc.handleRead(&buffer, 0);
+    _ = try assoc.handleRead(assoc.testShutdownPacket(&buffer, assoc.initial_tsn +% 2), 0);
 
     try testing.expectEqual(100, assoc.message_queue.flight_size);
 }
@@ -1200,13 +1207,7 @@ test "Association.handleRead: shutdown in shutdown pending moves to shutdown rec
     assoc.state = .shutdown_pending;
 
     var buffer: [20]u8 = undefined;
-    assoc.writeCommonHeader(&buffer);
-    buffer[12] = @intFromEnum(message.ChunkType.shutdown);
-    buffer[13] = 0;
-    std.mem.writeInt(u16, buffer[14..16], 8, .big);
-    std.mem.writeInt(u32, buffer[16..20], assoc.initial_tsn -% 1, .big);
-    Helper.checkSum(&buffer);
-    _ = try assoc.handleRead(&buffer, 0);
+    _ = try assoc.handleRead(assoc.testShutdownPacket(&buffer, assoc.initial_tsn -% 1), 0);
 
     try testing.expectEqual(.shutdown_ack_sent, assoc.state);
     try testing.expectEqual(Transmit.shutdown_ack, assoc.transmits.popFront().?);
@@ -1355,6 +1356,7 @@ test "Association.handleRead: a duplicate followed by new data in the same packe
     try testing.expectEqual(1, (try testRead(&assoc, testDataPacket2(&assoc, data, &buffer), 0, &lens)).len);
     try assoc.handleTimeout(MessageAssembler.sack_delay);
     try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
+    assoc.pending_sack = false;
 
     assoc.writeCommonHeader(&buffer);
     var len: usize = message.packet_header_size;
@@ -1367,6 +1369,26 @@ test "Association.handleRead: a duplicate followed by new data in the same packe
     try testing.expectEqual(1, (try testRead(&assoc, buffer[0..len], MessageAssembler.sack_delay, &lens)).len);
     try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
     try testing.expect(!assoc.message_assembler.send_sack);
+}
+
+test "Association.handleRead: only one sack is queued until it is sent" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+
+    var buffer: [128]u8 = undefined;
+    var lens: [1]usize = undefined;
+    // tsns after a gap are sacked immediately
+    _ = try testRead(&assoc, testDataPacket(buffer[0..32], assoc.verification_tag, assoc.initial_tsn +% 1), 0, &lens);
+    _ = try testRead(&assoc, testDataPacket(buffer[0..32], assoc.verification_tag, assoc.initial_tsn +% 2), 0, &lens);
+    try testing.expectEqual(1, assoc.transmits.len);
+    try testing.expect(assoc.pending_sack);
+
+    _ = try assoc.pollTransmit(&buffer, 0);
+    try testing.expectEqual(0, assoc.transmits.len);
+    try testing.expect(!assoc.pending_sack);
+
+    _ = try testRead(&assoc, testDataPacket(buffer[0..32], assoc.verification_tag, assoc.initial_tsn +% 3), 0, &lens);
+    try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
 }
 
 test "Association.shutdown: an empty queue sends a shutdown right away" {
