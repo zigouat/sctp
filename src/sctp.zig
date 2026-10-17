@@ -3,6 +3,7 @@ pub const Association = @import("association.zig");
 
 test {
     _ = @import("association.zig");
+    _ = @import("crc32c.zig");
     _ = @import("sack_generator.zig");
     _ = @import("message_assembler.zig");
     _ = @import("message_queue.zig");

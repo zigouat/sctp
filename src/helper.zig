@@ -1,12 +1,5 @@
 const std = @import("std");
-
-const Crc32c = @import("std").hash.crc.Crc(u32, .{
-    .polynomial = 0x1EDC6F41,
-    .initial = 0xffffffff,
-    .reflect_input = true,
-    .reflect_output = true,
-    .xor_output = 0xffffffff,
-});
+const Crc32c = @import("crc32c.zig").Crc32c;
 
 pub fn tsnLte(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) <= 0;
