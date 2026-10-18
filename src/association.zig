@@ -29,6 +29,7 @@ pub const Config = struct {
 pub const Event = union(enum) {
     comm_up: void,
     comm_down: void,
+    buffered_amount_low_threshold: u16,
 };
 
 pub const MessageIterator = struct {
@@ -250,6 +251,14 @@ pub fn shutdown(self: *Association) Error!void {
     try self.maybeSendShutdown();
 }
 
+pub fn bufferedAmount(self: *const Association, stream: u16) ?u32 {
+    return self.message_queue.bufferedAmount(stream);
+}
+
+pub fn setBufferedAmountLowThreshold(self: *Association, stream: u16, threshold: u32) std.mem.Allocator.Error!void {
+    return self.message_queue.setBufferedAmountLowThreshold(self.allocator, stream, threshold);
+}
+
 /// Write a message to the association.
 ///
 /// The `data` is copied internally.
@@ -408,7 +417,13 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
 }
 
 pub fn pollEvent(self: *Association) ?Event {
-    return self.events.popFront();
+    return self.events.popFront() orelse {
+        if (self.message_queue.popEvent()) |event| switch (event) {
+            .buffered_amount_low_threshold => |value| return .{ .buffered_amount_low_threshold = value },
+        };
+
+        return null;
+    };
 }
 
 pub const TransmitError = error{ WriteFailed, OutOfMemory };
@@ -604,7 +619,7 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
 
 fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
     const prev_flight_size = self.message_queue.flight_size;
-    const result = self.message_queue.handleSack(self.allocator, sack, self.fast_recovery) orelse return;
+    const result = try self.message_queue.handleSack(self.allocator, sack, self.fast_recovery) orelse return;
 
     if (self.cwnd <= self.ssthresh) {
         // Slow start
