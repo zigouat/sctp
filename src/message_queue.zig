@@ -5,12 +5,38 @@ const Helper = @import("helper.zig");
 const MessageQueue = @This();
 const SackHandler = @import("sack_handler.zig");
 
+pub const Event = union(enum) {
+    buffered_amount_low_threshold: u16,
+};
+
+const StreamState = struct {
+    stream_seq: u16,
+    buffered_low_thresh: u32,
+    buffered: u32,
+
+    const init = StreamState{
+        .stream_seq = 0,
+        .buffered_low_thresh = 0,
+        .buffered = 0,
+    };
+
+    fn incSeq(self: *StreamState) void {
+        self.stream_seq +%= 1;
+    }
+
+    fn subBuffered(self: *StreamState, amount: u32) bool {
+        const old_value = self.buffered;
+        self.buffered -|= amount;
+        return old_value > self.buffered_low_thresh and self.buffered <= self.buffered_low_thresh;
+    }
+};
+
 sack_handler: SackHandler,
-streams_seq: std.AutoHashMapUnmanaged(u16, u16),
+streams: std.AutoHashMapUnmanaged(u16, StreamState),
 messages: std.Deque(message.UserMessage),
 chunks: std.Deque(message.Data),
+events: std.Deque(Event),
 flight_size: u32,
-pending_size: u32,
 rwnd: u32,
 curr_tsn: u32,
 curr_msg: u32,
@@ -20,30 +46,32 @@ retransmit_index: ?u32,
 pub fn init(initial_tsn: u32) MessageQueue {
     return .{
         .sack_handler = .init(initial_tsn),
-        .streams_seq = .empty,
+        .streams = .empty,
         .messages = .empty,
         .chunks = .empty,
+        .events = .empty,
         .curr_tsn = initial_tsn,
         .curr_msg = 0,
         .message_offset = 0,
         .retransmit_index = null,
         .flight_size = 0,
-        .pending_size = 0,
         .rwnd = 0,
     };
 }
 
 pub fn deinit(self: *MessageQueue, allocator: std.mem.Allocator) void {
     while (self.messages.popFront()) |msg| allocator.free(msg.data);
-    self.streams_seq.deinit(allocator);
+    self.streams.deinit(allocator);
     self.chunks.deinit(allocator);
     self.messages.deinit(allocator);
+    self.events.deinit(allocator);
 }
 
 pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32) void {
-    self.streams_seq.clearAndFree(allocator);
+    self.streams.clearAndFree(allocator);
     while (self.chunks.popFront()) |_| {}
     while (self.messages.popFront()) |msg| allocator.free(msg.data);
+    while (self.events.popFront()) |_| {}
     self.curr_tsn = initial_tsn;
     self.curr_msg = 0;
     self.message_offset = 0;
@@ -53,21 +81,21 @@ pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32
 
 pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const u8, config: message.UserMessageConfig) !void {
     try self.messages.ensureUnusedCapacity(allocator, 1);
-    try self.streams_seq.ensureUnusedCapacity(allocator, 1);
+    try self.streams.ensureUnusedCapacity(allocator, 1);
     const data_copy = try allocator.dupe(u8, data);
 
-    const result = self.streams_seq.getOrPutAssumeCapacity(config.stream_id);
-    if (!result.found_existing) result.value_ptr.* = 0;
+    const result = self.streams.getOrPutAssumeCapacity(config.stream_id);
+    if (!result.found_existing) result.value_ptr.* = .init;
 
     self.messages.pushBackAssumeCapacity(.{
         .data = data_copy,
         .ppid = config.ppid,
         .stream_id = config.stream_id,
-        .stream_seq = if (config.unordered) 0 else result.value_ptr.*,
+        .stream_seq = if (config.unordered) 0 else result.value_ptr.stream_seq,
         .unordered = config.unordered,
     });
-    self.pending_size +|= @intCast(data.len);
-    if (!config.unordered) result.value_ptr.* +%= 1;
+    if (!config.unordered) result.value_ptr.incSeq();
+    result.value_ptr.buffered +|= @intCast(data.len);
 }
 
 pub const SackResult = struct {
@@ -77,7 +105,7 @@ pub const SackResult = struct {
     cumulative_ack_advanced: bool,
 };
 
-pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: message.Sack, fast_recovery: bool) ?SackResult {
+pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: message.Sack, fast_recovery: bool) std.mem.Allocator.Error!?SackResult {
     const prev_flight_size = self.flight_size;
     const prev_cumulative_tsn = self.sack_handler.acked.cumulative_tsn;
     var acked_data: u32 = 0;
@@ -96,7 +124,8 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
         duplicate_data += self.getChunkSizeAt(tsn);
     }
 
-    acked_data += self.dropAcknowledged(allocator);
+    errdefer _ = self.updateGapAckedFlightSize(false);
+    acked_data += try self.dropAcknowledged(allocator);
     acked_data += self.updateGapAckedFlightSize(false);
     acked_data -|= old_gap_size;
     self.rwnd = sack.a_rwnd -| self.flight_size;
@@ -109,6 +138,16 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     };
 }
 
+pub fn bufferedAmount(self: *const MessageQueue, stream_id: u16) ?u32 {
+    return if (self.streams.getPtr(stream_id)) |stream| stream.buffered else null;
+}
+
+pub fn setBufferedAmountLowThreshold(self: *MessageQueue, allocator: std.mem.Allocator, stream_id: u16, threshold: u32) !void {
+    const entry = try self.streams.getOrPut(allocator, stream_id);
+    if (!entry.found_existing) entry.value_ptr.* = .init;
+    entry.value_ptr.buffered_low_thresh = threshold;
+}
+
 pub const CumulativeAck = enum { invalid, unchanged, advanced };
 
 pub fn handleShutdownChunk(self: *MessageQueue, allocator: std.mem.Allocator, cumulative_tsn: u32) CumulativeAck {
@@ -116,7 +155,7 @@ pub fn handleShutdownChunk(self: *MessageQueue, allocator: std.mem.Allocator, cu
     if (!Helper.tsnGt(cumulative_tsn, self.sack_handler.acked.cumulative_tsn)) return .unchanged;
     _ = self.updateGapAckedFlightSize(true);
     self.sack_handler.handleCumulativeTsn(cumulative_tsn);
-    _ = self.dropAcknowledged(allocator);
+    _ = self.dropAcknowledged(allocator) catch {};
     _ = self.updateGapAckedFlightSize(false);
     return .advanced;
 }
@@ -126,6 +165,10 @@ pub fn handleTimeout(self: *MessageQueue) void {
     self.retransmit_index = 0;
     self.flight_size = 0;
     self.sack_handler.clearFastRetransmit();
+}
+
+pub fn popEvent(self: *MessageQueue) ?Event {
+    return self.events.popFront();
 }
 
 pub const NextChunkResult = packed struct {
@@ -194,28 +237,49 @@ pub fn isCumulativelyAcked(self: *const MessageQueue, tsn: u32) bool {
     return Helper.tsnLte(tsn, self.sack_handler.acked.cumulative_tsn);
 }
 
-fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator) u32 {
+fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator) !u32 {
     if (self.chunks.len == 0) return 0;
     var data_size: u32 = 0;
+
+    // A message's chunks share one stream and only shrink its buffered amount,
+    // so each message crosses the threshold at most once: one event slot per message.
+    try self.events.ensureUnusedCapacity(allocator, 1);
 
     const retransmit_index = self.retransmit_index orelse self.chunks.len;
     const dropped = self.sack_handler.acked.cumulative_tsn -% self.chunks.frontPtr().?.tsn +% 1;
     for (0..dropped) |index| {
         const chunk = self.chunks.popFront().?;
+
+        const stream_state = self.streams.getPtr(chunk.stream_id).?;
+        if (stream_state.subBuffered(@intCast(chunk.user_data.len))) {
+            self.events.pushBackAssumeCapacity(.{ .buffered_amount_low_threshold = chunk.stream_id });
+        }
+
+        if (index < retransmit_index) self.flight_size -= @intCast(chunk.user_data.len);
+        data_size +|= chunk.getSize();
+
         if (chunk.flags.end_fragment) {
             const msg = self.messages.popFront().?;
             allocator.free(msg.data);
             self.curr_msg -= 1;
+
+            if (index + 1 < dropped) {
+                self.events.ensureUnusedCapacity(allocator, 1) catch |err| {
+                    self.subRetransmitIndex(@intCast(index + 1));
+                    return err;
+                };
+            }
         }
-        if (index < retransmit_index) self.flight_size -= @intCast(chunk.user_data.len);
-        data_size +|= chunk.getSize();
     }
 
-    if (self.retransmit_index) |index| {
-        self.retransmit_index = if (index -| dropped < self.chunks.len) index -| dropped else null;
-    }
-
+    self.subRetransmitIndex(dropped);
     return data_size;
+}
+
+fn subRetransmitIndex(self: *MessageQueue, count: u32) void {
+    if (self.retransmit_index) |index| {
+        self.retransmit_index = if (index -| count < self.chunks.len) index -| count else null;
+    }
 }
 
 fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void {
@@ -291,7 +355,6 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
         self.message_offset += @intCast(payload_size);
     }
 
-    self.pending_size -|= @intCast(payload_size);
     self.flight_size += @intCast(payload_size);
     self.rwnd -|= @intCast(payload_size);
 
@@ -338,7 +401,7 @@ fn testSendChunks(msg_queue: *MessageQueue, count: usize) !void {
     }
 }
 
-test "MessageQueue.pushData: unordered data does not increment stream sequence number" {
+test "MessageQueue.pushData: increment sequence and buffered size" {
     var msg_queue = MessageQueue.init(0x12345678);
     defer msg_queue.deinit(testing.allocator);
 
@@ -347,14 +410,16 @@ test "MessageQueue.pushData: unordered data does not increment stream sequence n
         .stream_id = 100,
         .unordered = false,
     });
-    try testing.expectEqual(1, msg_queue.streams_seq.get(100).?);
+    try testing.expectEqual(1, msg_queue.streams.get(100).?.stream_seq);
+    try testing.expectEqual(5, msg_queue.streams.get(100).?.buffered);
 
     try msg_queue.pushData(testing.allocator, "World", .{
         .ppid = 43,
-        .stream_id = 1,
+        .stream_id = 100,
         .unordered = true,
     });
-    try testing.expectEqual(1, msg_queue.streams_seq.get(100).?);
+    try testing.expectEqual(1, msg_queue.streams.get(100).?.stream_seq);
+    try testing.expectEqual(10, msg_queue.streams.get(100).?.buffered);
 }
 
 test "MessageQueue.nextRetransmit: retransmitting the last chunk clears the retransmit index" {
@@ -379,7 +444,7 @@ test "MessageQueue.nextRetransmit: gap acked chunks are skipped" {
     defer msg_queue.deinit(testing.allocator);
 
     try testSendChunks(&msg_queue, 6);
-    _ = msg_queue.handleSack(testing.allocator, message.Sack{
+    _ = try msg_queue.handleSack(testing.allocator, message.Sack{
         .cumulative_tsn = 1,
         .a_rwnd = 1000,
         .gap_ack_blocks = &.{ 0, 2, 0, 3, 0, 5, 0, 5 },
@@ -408,7 +473,7 @@ test "MessageQueue.handleSack: acknowledging every chunk during a retransmission
     _ = (try msg_queue.nextRetransmit(&buffer)).?;
     try testing.expectEqual(4, msg_queue.flight_size);
 
-    _ = msg_queue.handleSack(testing.allocator, message.Sack{
+    _ = try msg_queue.handleSack(testing.allocator, message.Sack{
         .cumulative_tsn = 3,
         .a_rwnd = 0,
         .gap_ack_blocks = &.{},
@@ -418,4 +483,101 @@ test "MessageQueue.handleSack: acknowledging every chunk during a retransmission
     try testing.expectEqual(null, msg_queue.retransmit_index);
     try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
     try testing.expectEqual(0, msg_queue.flight_size);
+}
+
+fn testAckUpTo(msg_queue: *MessageQueue, allocator: std.mem.Allocator, cumulative_tsn: u32) !void {
+    _ = try msg_queue.handleSack(allocator, message.Sack{
+        .cumulative_tsn = cumulative_tsn,
+        .a_rwnd = 1000,
+        .gap_ack_blocks = &.{},
+        .duplicate_tsns = &.{},
+    }, false);
+}
+
+test "MessageQueue.setBufferedAmountLowThreshold: initializes the stream state of a new stream" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+
+    try msg_queue.setBufferedAmountLowThreshold(testing.allocator, 7, 100);
+    try testing.expectEqual(StreamState{ .stream_seq = 0, .buffered_low_thresh = 100, .buffered = 0 }, msg_queue.streams.get(7).?);
+
+    try msg_queue.pushData(testing.allocator, "Hello", .{ .stream_id = 7, .ppid = 0 });
+    try testing.expectEqual(0, msg_queue.messages.at(0).stream_seq);
+    try testing.expectEqual(StreamState{ .stream_seq = 1, .buffered_low_thresh = 100, .buffered = 5 }, msg_queue.streams.get(7).?);
+}
+
+test "MessageQueue.handleSack: buffered amount low event is emitted only when crossing the threshold" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+
+    try msg_queue.setBufferedAmountLowThreshold(testing.allocator, 0, 4);
+    try testSendChunks(&msg_queue, 3);
+
+    // 12 -> 8: still above the threshold
+    try testAckUpTo(&msg_queue, testing.allocator, 1);
+    try testing.expectEqual(0, msg_queue.events.len);
+
+    // 8 -> 4: crosses the threshold
+    try testAckUpTo(&msg_queue, testing.allocator, 2);
+    try testing.expectEqual(1, msg_queue.events.len);
+    try testing.expectEqual(Event{ .buffered_amount_low_threshold = 0 }, msg_queue.events.at(0));
+
+    // 4 -> 0: was already at or below the threshold
+    try testAckUpTo(&msg_queue, testing.allocator, 3);
+    try testing.expectEqual(1, msg_queue.events.len);
+}
+
+test "MessageQueue.handleSack: one buffered amount low event per stream crossing its threshold" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+
+    try msg_queue.setBufferedAmountLowThreshold(testing.allocator, 1, 4);
+    try msg_queue.pushData(testing.allocator, "aaaabbbbcccc", .{ .stream_id = 1, .ppid = 0 });
+    try msg_queue.pushData(testing.allocator, "dddd", .{ .stream_id = 2, .ppid = 0 });
+
+    // Room for 4 bytes of payload: stream 1 is sent as three fragments
+    var buffer: [message.data_chunk_header_size + 4]u8 = undefined;
+    for (0..4) |_| _ = try msg_queue.nextNewChunk(testing.allocator, &buffer);
+
+    try testAckUpTo(&msg_queue, testing.allocator, 4);
+    try testing.expectEqual(2, msg_queue.events.len);
+    try testing.expectEqual(Event{ .buffered_amount_low_threshold = 1 }, msg_queue.events.at(0));
+    try testing.expectEqual(Event{ .buffered_amount_low_threshold = 2 }, msg_queue.events.at(1));
+}
+
+test "MessageQueue.handleSack: running out of memory for events keeps the queue consistent" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(allocator);
+
+    var buffer: [64]u8 = undefined;
+    for ([_]u16{ 1, 0, 0, 0 }) |stream_id| {
+        try msg_queue.pushData(allocator, "aaaa", .{ .stream_id = stream_id, .ppid = 0 });
+        _ = try msg_queue.nextNewChunk(allocator, &buffer);
+    }
+
+    // Dropping tsn 1 fills the only event slot, reserving the next one fails
+    try msg_queue.events.ensureTotalCapacityPrecise(allocator, 1);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    const sack = message.Sack{
+        .cumulative_tsn = 2,
+        .a_rwnd = 1000,
+        .gap_ack_blocks = &.{ 0, 2, 0, 2 },
+        .duplicate_tsns = &.{},
+    };
+    try testing.expectError(error.OutOfMemory, msg_queue.handleSack(allocator, sack, false));
+    try testing.expectEqual(3, msg_queue.chunks.len);
+    try testing.expectEqual(1, msg_queue.events.len);
+    // tsn 1 is dropped and the gap acked tsn 4 is still excluded
+    try testing.expectEqual(8, msg_queue.flight_size);
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    _ = try msg_queue.handleSack(allocator, sack, false);
+    try testing.expectEqual(2, msg_queue.chunks.len);
+    try testing.expectEqual(4, msg_queue.flight_size);
 }
