@@ -314,12 +314,9 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 if (!std.mem.eql(u8, cookie, &self.cookie)) break;
 
                 self.transmits.pushBackAssumeCapacity(.cookie_ack);
-                if (self.state == .closed) try self.setStateToEstablished();
+                if (self.state == .closed or self.state == .cookie_wait) try self.setStateToEstablished();
             },
-            .cookie_ack => if (self.state == .cookie_echoed) {
-                try self.setStateToEstablished();
-                self.resetInitTimer();
-            },
+            .cookie_ack => if (self.state == .cookie_echoed) try self.setStateToEstablished(),
             .data => |d| {
                 switch (self.state) {
                     .established, .shutdown_pending, .shutdown_sent => {},
@@ -559,6 +556,7 @@ fn setStateToEstablished(self: *Association) !void {
     if (self.state == .established) return;
     try self.events.ensureUnusedCapacity(self.allocator, 1);
     self.state = .established;
+    self.resetInitTimer();
     self.events.pushBackAssumeCapacity(.comm_up);
 }
 
@@ -580,8 +578,7 @@ fn updateT3Timer(self: *Association, cumulative_tsn_advanced: bool, now: i64) vo
 fn handleInitChunk(self: *Association, chunk: message.Init) !void {
     try self.transmits.pushBack(self.allocator, .{ .init_ack = chunk.initiate_tag });
 
-    // In cookie wait or cookie echoed state, we should not update the state.
-    if (self.state == .closed) {
+    if (self.state == .closed or self.state == .cookie_wait) {
         self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
         self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
         self.message_assembler.setInitTsn(chunk.initial_tsn);
@@ -1584,4 +1581,36 @@ test "Association.pollTransmit: send zero window probe" {
 
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{}, 50), 0);
     try testing.expect(!assoc.zero_wnd_probe);
+}
+
+test "Association: connect two peers" {
+    var peer1 = testAssoc();
+    defer peer1.deinit();
+
+    var peer2 = testAssoc();
+    defer peer2.deinit();
+
+    var buffer: [message.MTU]u8 = undefined;
+
+    try peer1.connect();
+    try peer2.connect();
+
+    var counter: u32 = 0;
+    while (true) : (counter += 1) {
+        while (try peer1.pollTransmit(&buffer, 0)) |data| {
+            if (counter == 0) continue; // Simulate connect packet loss
+            _ = try peer2.handleRead(data, 0);
+        }
+
+        while (try peer2.pollTransmit(&buffer, 0)) |data| {
+            _ = try peer1.handleRead(data, 0);
+        }
+
+        if (peer1.state == .established and peer2.state == .established) break;
+
+        if (counter > 100) return error.UnexpectedFailedTest;
+    }
+
+    try testing.expectEqual(null, peer1.pollTimeout());
+    try testing.expectEqual(null, peer2.pollTimeout());
 }
