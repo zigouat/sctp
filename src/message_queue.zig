@@ -401,6 +401,15 @@ fn testSendChunks(msg_queue: *MessageQueue, count: usize) !void {
     }
 }
 
+fn testAckUpTo(msg_queue: *MessageQueue, allocator: std.mem.Allocator, cumulative_tsn: u32) !void {
+    _ = try msg_queue.handleSack(allocator, message.Sack{
+        .cumulative_tsn = cumulative_tsn,
+        .a_rwnd = 1000,
+        .gap_ack_blocks = &.{},
+        .duplicate_tsns = &.{},
+    }, false);
+}
+
 test "MessageQueue.pushData: increment sequence and buffered size" {
     var msg_queue = MessageQueue.init(0x12345678);
     defer msg_queue.deinit(testing.allocator);
@@ -461,6 +470,18 @@ test "MessageQueue.nextRetransmit: gap acked chunks are skipped" {
     try testing.expectEqual(null, msg_queue.retransmit_index);
 }
 
+test "MessageQueue.setBufferedAmountLowThreshold: initializes the stream state of a new stream" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+
+    try msg_queue.setBufferedAmountLowThreshold(testing.allocator, 7, 100);
+    try testing.expectEqual(StreamState{ .stream_seq = 0, .buffered_low_thresh = 100, .buffered = 0 }, msg_queue.streams.get(7).?);
+
+    try msg_queue.pushData(testing.allocator, "Hello", .{ .stream_id = 7, .ppid = 0 });
+    try testing.expectEqual(0, msg_queue.messages.at(0).stream_seq);
+    try testing.expectEqual(StreamState{ .stream_seq = 1, .buffered_low_thresh = 100, .buffered = 5 }, msg_queue.streams.get(7).?);
+}
+
 test "MessageQueue.handleSack: acknowledging every chunk during a retransmission clears the retransmit index" {
     var msg_queue = MessageQueue.init(1);
     defer msg_queue.deinit(testing.allocator);
@@ -483,27 +504,6 @@ test "MessageQueue.handleSack: acknowledging every chunk during a retransmission
     try testing.expectEqual(null, msg_queue.retransmit_index);
     try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
     try testing.expectEqual(0, msg_queue.flight_size);
-}
-
-fn testAckUpTo(msg_queue: *MessageQueue, allocator: std.mem.Allocator, cumulative_tsn: u32) !void {
-    _ = try msg_queue.handleSack(allocator, message.Sack{
-        .cumulative_tsn = cumulative_tsn,
-        .a_rwnd = 1000,
-        .gap_ack_blocks = &.{},
-        .duplicate_tsns = &.{},
-    }, false);
-}
-
-test "MessageQueue.setBufferedAmountLowThreshold: initializes the stream state of a new stream" {
-    var msg_queue = MessageQueue.init(1);
-    defer msg_queue.deinit(testing.allocator);
-
-    try msg_queue.setBufferedAmountLowThreshold(testing.allocator, 7, 100);
-    try testing.expectEqual(StreamState{ .stream_seq = 0, .buffered_low_thresh = 100, .buffered = 0 }, msg_queue.streams.get(7).?);
-
-    try msg_queue.pushData(testing.allocator, "Hello", .{ .stream_id = 7, .ppid = 0 });
-    try testing.expectEqual(0, msg_queue.messages.at(0).stream_seq);
-    try testing.expectEqual(StreamState{ .stream_seq = 1, .buffered_low_thresh = 100, .buffered = 5 }, msg_queue.streams.get(7).?);
 }
 
 test "MessageQueue.handleSack: buffered amount low event is emitted only when crossing the threshold" {
