@@ -427,12 +427,12 @@ pub const TransmitError = error{ WriteFailed, OutOfMemory };
 
 /// Poll the association for data to transmit.
 ///
-/// Chunks are bundled into packets of at most `message.mtu` bytes. `buffer` must be at least 128 bytes;
-/// `error.WriteFailed` is returned when the buffer is too small to write one chunk.
+/// Chunks are bundled into packets of at most `message.MTU` bytes. `buffer` must be at least `message.MTU` bytes,
+/// otherwise `error.WriteFailed` is returned.
 pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[]const u8 {
-    if (buffer.len < min_buffer_size) return error.WriteFailed;
+    if (buffer.len < message.MTU) return error.WriteFailed;
     var written: usize = message.packet_header_size;
-    var slice = buffer[written..@min(buffer.len, message.MTU)];
+    var slice = buffer[written..message.MTU];
     self.writeCommonHeader(buffer);
 
     while (true) {
@@ -1031,18 +1031,6 @@ test "Association.pollTransmit: a cookie echo that does not fit does not arm the
     try testing.expectEqual(1, assoc.transmits.len);
 }
 
-test "Association.pollTransmit: data chunk padding fits in a buffer not aligned to 4 bytes" {
-    var assoc = try testEstablishedAssoc();
-    defer assoc.deinit();
-
-    const data: [500]u8 = @splat('a');
-    try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
-    var out: [min_buffer_size + 2]u8 = undefined;
-    const packet = (try assoc.pollTransmit(&out, 0)).?;
-    try testing.expectEqual(0, packet.len % 4);
-    try testing.expect(packet.len <= out.len);
-}
-
 test "Association.pollTransmit: init, init_ack and shutdown_complete must not be bundled" {
     var assoc = testAssoc();
     defer assoc.deinit();
@@ -1387,7 +1375,7 @@ test "Association.handleRead: only one sack is queued until it is sent" {
     var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
 
-    var buffer: [128]u8 = undefined;
+    var buffer: [message.MTU]u8 = undefined;
     var lens: [1]usize = undefined;
     // tsns after a gap are sacked immediately
     _ = try testRead(&assoc, testDataPacket(buffer[0..32], assoc.verification_tag, assoc.initial_tsn +% 1), 0, &lens);

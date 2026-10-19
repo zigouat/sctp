@@ -182,7 +182,7 @@ pub const NextChunkError = error{WriteFailed} || std.mem.Allocator.Error;
 pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) NextChunkError!?NextChunkResult {
     const size = try self.nextRetransmit(buffer) orelse {
         var zero_wnd_probe = false;
-        const next_chunk_size = self.nextChunkSize(buffer.len) orelse return null;
+        const next_chunk_size = try self.nextChunkSize(buffer.len) orelse return null;
         if (self.rwnd < next_chunk_size) {
             if (self.chunks.len != 0) return null;
             zero_wnd_probe = true;
@@ -316,12 +316,18 @@ fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
     return @intCast(chunk.write(buffer));
 }
 
-fn nextChunkSize(self: *MessageQueue, buffer_size: usize) ?u32 {
+fn nextChunkSize(self: *MessageQueue, buffer_size: usize) error{WriteFailed}!?u32 {
     if (self.curr_msg >= self.messages.len) return null;
     if (self.chunks.len >= 1024) return null;
     const msg = self.messages.atPtr(self.curr_msg);
     const curr_payload = msg.data.len - self.message_offset;
     const max_payload = std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4);
+
+    // A message that fits in one packet is not fragmented when the buffer is too small, it's sent whole
+    // on a later call to nextChunk() with a big enough buffer.
+    if (self.message_offset == 0 and curr_payload > max_payload and
+        msg.data.len <= message.PMDCS - message.data_chunk_header_size) return error.WriteFailed;
+
     return @intCast(@min(curr_payload, max_payload));
 }
 
@@ -468,6 +474,34 @@ test "MessageQueue.nextRetransmit: gap acked chunks are skipped" {
     }
     try testing.expectEqual(null, try msg_queue.nextRetransmit(&buffer));
     try testing.expectEqual(null, msg_queue.retransmit_index);
+}
+
+test "MessageQueue.nextChunk: a message that fits in one packet is not fragmented" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+    msg_queue.rwnd = 10_000;
+
+    const data: [500]u8 = @splat('a');
+    try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 0, .ppid = 0 });
+
+    var buffer: [message.PMDCS]u8 = undefined;
+    try testing.expectError(error.WriteFailed, msg_queue.nextChunk(testing.allocator, buffer[0..200]));
+    const result = (try msg_queue.nextChunk(testing.allocator, &buffer)).?;
+    try testing.expectEqual(message.data_chunk_header_size + data.len, result.written);
+}
+
+test "MessageQueue.nextChunk: data chunk padding fits in a buffer not aligned to 4 bytes" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+    msg_queue.rwnd = 10_000;
+
+    const data: [2000]u8 = @splat('a');
+    try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 0, .ppid = 0 });
+
+    var buffer: [130]u8 = undefined;
+    const result = (try msg_queue.nextChunk(testing.allocator, &buffer)).?;
+    try testing.expectEqual(0, result.written % 4);
+    try testing.expect(result.written <= buffer.len);
 }
 
 test "MessageQueue.setBufferedAmountLowThreshold: initializes the stream state of a new stream" {
