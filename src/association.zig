@@ -3,6 +3,7 @@ const message = @import("message.zig");
 const MessageAssembler = @import("message_assembler.zig");
 const MessageQueue = @import("message_queue.zig");
 const Helper = @import("helper.zig");
+const StreamReset = @import("stream_reset.zig");
 
 const Association = @This();
 const Io = std.Io;
@@ -30,6 +31,9 @@ pub const Event = union(enum) {
     comm_up: void,
     comm_down: void,
     buffered_amount_low_threshold: u16,
+    outgoing_stream_reset: u16,
+    outgoing_stream_reset_failed: u16,
+    incoming_stream_reset: u16,
 };
 
 pub const MessageIterator = struct {
@@ -188,6 +192,7 @@ init_attempts: u8,
 
 message_queue: MessageQueue,
 message_assembler: MessageAssembler,
+stream_reset: StreamReset,
 transmits: std.Deque(Transmit),
 events: std.Deque(Event),
 
@@ -222,11 +227,12 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .fast_recovery_exit_tsn = 0,
         .transmits = .empty,
         .events = .empty,
+        .message_queue = .init(initial_tsn),
         .message_assembler = .init(config.receive_buffer_size),
+        .stream_reset = .init(initial_tsn),
         .init_attempts = 0,
         .init_rto = 1,
         .init_deadline = std.math.maxInt(i64),
-        .message_queue = .init(initial_tsn),
         .t3_timer = .init,
         .zero_wnd_probe = false,
         .pending_sack = false,
@@ -238,6 +244,7 @@ pub fn deinit(self: *Association) void {
     self.events.deinit(self.allocator);
     self.message_assembler.deinit(self.allocator);
     self.message_queue.deinit(self.allocator);
+    self.stream_reset.deinit(self.allocator);
     self.allocator.free(self.peer_cookie);
 }
 
@@ -263,6 +270,11 @@ pub fn setBufferedAmountLowThreshold(self: *Association, stream: u16, threshold:
     return self.message_queue.setBufferedAmountLowThreshold(self.allocator, stream, threshold);
 }
 
+pub fn resetStreams(self: *Association, streams: []const u16) !void {
+    try self.stream_reset.resetStreams(self.allocator, streams);
+    self.stream_reset.maybeStartTransmitting(&self.message_queue);
+}
+
 /// Write a message to the association.
 ///
 /// The `data` is copied internally.
@@ -272,7 +284,9 @@ pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMe
         .established, .cookie_wait, .cookie_echoed => {},
         else => return error.InvalidState,
     }
-    try self.message_queue.pushData(self.allocator, data, options);
+    if (!try self.stream_reset.bufferMessage(self.allocator, data, options)) {
+        try self.message_queue.pushData(self.allocator, data, options);
+    }
 }
 
 /// Handle an incoming sctp packet.
@@ -371,7 +385,20 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 try self.setStateToClosed();
                 return null;
             },
+            .reconfig => |config| {
+                if (config.reconfig_response) |*resp| try self.handleReconfigResponse(resp);
+                if (config.outgoing_ssn_reset_req) |*req| {
+                    const cumulative_tsn = self.message_assembler.getCumulativeTsn();
+                    const streams = try self.stream_reset.handleOutgoingResetRequest(self.allocator, req, cumulative_tsn);
+                    if (streams) |s| try self.resetIncomingStreams(s);
+                }
+            },
         }
+    }
+
+    // The deferred reset may wait for data received in this packet
+    if (self.stream_reset.handleCumulativeTsn(self.message_assembler.getCumulativeTsn())) |streams| {
+        try self.resetIncomingStreams(streams);
     }
 
     if (received_data and self.state == .shutdown_sent) {
@@ -432,12 +459,14 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
         self.cwnd = @min(self.cwnd, @max(self.cwnd / 2, 4 * message.PMDCS));
         if (curr_cwnd != self.cwnd) self.t3_timer.startIdle(now) else self.t3_timer.stopIdle();
     }
+
+    self.stream_reset.handleTimeout(now);
 }
 
 pub fn pollEvent(self: *Association) ?Event {
     return self.events.popFront() orelse {
-        if (self.message_queue.popEvent()) |event| switch (event) {
-            .buffered_amount_low_threshold => |value| return .{ .buffered_amount_low_threshold = value },
+        if (self.message_queue.popEvent()) |event| return switch (event) {
+            .buffered_amount_low_threshold => |value| .{ .buffered_amount_low_threshold = value },
         };
 
         return null;
@@ -455,6 +484,8 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
     var written: usize = message.packet_header_size;
     var slice = buffer[written..message.MTU];
     self.writeCommonHeader(buffer);
+
+    const prve_curr_msg = self.message_queue.curr_msg;
 
     while (true) {
         const next = self.nextChunk(slice, now, written == message.packet_header_size) catch |err| {
@@ -482,16 +513,24 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
 
         if (slice.len < min_buffer_size) break;
     }
-
     Helper.checkSum(buffer[0..written]);
+
+    if (prve_curr_msg != self.message_queue.curr_msg) self.stream_reset.maybeStartTransmitting(&self.message_queue);
     return buffer[0..written];
 }
 
 pub fn pollTimeout(self: *Association) ?i64 {
-    const deadline = @min(
-        @min(self.message_assembler.sack_deadline, self.init_deadline),
-        @min(self.t3_timer.deadline, self.t3_timer.idle_deadline),
-    );
+    var deadline: i64 = std.math.maxInt(i64);
+    for (&[_]i64{
+        self.message_assembler.sack_deadline,
+        self.init_deadline,
+        self.t3_timer.deadline,
+        self.t3_timer.idle_deadline,
+        self.stream_reset.pollTimeout(),
+    }) |d| {
+        if (d < deadline) deadline = d;
+    }
+
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
@@ -606,6 +645,7 @@ fn handleInitChunk(self: *Association, chunk: message.Init) !void {
         self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
         self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
         self.message_assembler.setInitTsn(chunk.initial_tsn);
+        self.stream_reset.setPeerInitTsn(chunk.initial_tsn);
         self.peer_verification_tag = chunk.initiate_tag;
         self.message_queue.rwnd = chunk.a_rwnd;
     }
@@ -631,6 +671,7 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
     self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
     self.message_assembler.setInitTsn(chunk.initial_tsn);
+    self.stream_reset.setPeerInitTsn(chunk.initial_tsn);
     self.peer_verification_tag = chunk.initiate_tag;
     self.message_queue.rwnd = chunk.a_rwnd;
     self.state = .cookie_echoed;
@@ -725,6 +766,38 @@ fn maybeSendShutdown(self: *Association) !void {
         else => {},
     }
 }
+
+/// Takes ownership of `streams`.
+fn resetIncomingStreams(self: *Association, streams: []u16) !void {
+    defer self.allocator.free(streams);
+    self.message_assembler.resetStreams(streams);
+
+    try self.events.ensureUnusedCapacity(self.allocator, streams.len);
+    for (streams) |stream_id| self.events.pushBackAssumeCapacity(.{ .incoming_stream_reset = stream_id });
+}
+
+fn handleReconfigResponse(self: *Association, resp: *const message.ReConfigResponse) !void {
+    const result = self.stream_reset.handleResponse(resp) orelse return;
+    defer self.allocator.free(result.streams);
+    self.stream_reset.maybeStartTransmitting(&self.message_queue);
+    if (result.succeeded) {
+        // reset streams of message queue
+    }
+
+    while (self.stream_reset.popMessage()) |user_msg| {
+        try self.message_queue.pushUserMessage(self.allocator, user_msg);
+    }
+
+    // events
+    try self.events.ensureUnusedCapacity(self.allocator, result.streams.len);
+    for (result.streams) |stream_id| {
+        if (result.succeeded)
+            self.events.pushBackAssumeCapacity(.{ .outgoing_stream_reset = stream_id })
+        else
+            self.events.pushBackAssumeCapacity(.{ .outgoing_stream_reset_failed = stream_id });
+    }
+}
+
 
 fn isValidVerificationTag(self: *const Association, packet: *const message.Packet) bool {
     if (packet.chunks.len < 2) return packet.verification_tag == self.verification_tag;
@@ -1744,4 +1817,72 @@ test "Association: connect two peers" {
 
     try testing.expectEqual(null, peer1.pollTimeout());
     try testing.expectEqual(null, peer2.pollTimeout());
+}
+
+fn testOutgoingResetPacket(assoc: *const Association, buffer: []u8, req_seq_num: u32, last_assigned_tsn: u32, streams: []const u16) []const u8 {
+    assoc.writeCommonHeader(buffer);
+    const chunk = buffer[message.packet_header_size..];
+    const param_length: u16 = @intCast(16 + 2 * streams.len);
+    chunk[0] = @intFromEnum(message.ChunkType.reconfig);
+    chunk[1] = 0;
+    std.mem.writeInt(u16, chunk[2..4], 4 + param_length, .big);
+    std.mem.writeInt(u16, chunk[4..6], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
+    std.mem.writeInt(u16, chunk[6..8], param_length, .big);
+    std.mem.writeInt(u32, chunk[8..12], req_seq_num, .big);
+    std.mem.writeInt(u32, chunk[12..16], 0, .big);
+    std.mem.writeInt(u32, chunk[16..20], last_assigned_tsn, .big);
+    for (streams, 0..) |stream, index| std.mem.writeInt(u16, chunk[20 + 2 * index ..][0..2], stream, .big);
+
+    const size = message.packet_header_size + std.mem.alignForward(usize, 4 + param_length, 4);
+    @memset(buffer[message.packet_header_size + 4 + param_length .. size], 0);
+    Helper.checkSum(buffer[0..size]);
+    return buffer[0..size];
+}
+
+fn testStreamData(tsn: u32, stream_id: u16, stream_seq: u16) message.Data {
+    return .{
+        .flags = .complete,
+        .tsn = tsn,
+        .stream_id = stream_id,
+        .stream_seq = stream_seq,
+        .ppid = 0,
+        .user_data = "ping",
+    };
+}
+
+test "Association.handleRead: the peer's outgoing stream reset restarts the incoming ssn" {
+    var buffer: [64]u8 = undefined;
+    var lens: [4]usize = undefined;
+
+    {
+        var assoc = try testEstablishedAssoc();
+        defer assoc.deinit();
+        assoc.stream_reset.setPeerInitTsn(assoc.initial_tsn);
+        const tsn = assoc.initial_tsn;
+
+        _ = try testRead(&assoc, testDataPacket2(&assoc, testStreamData(tsn, 1, 0), &buffer), 0, &lens);
+        _ = try testRead(&assoc, testOutgoingResetPacket(&assoc, &buffer, tsn, tsn, &.{1}), 0, &lens);
+        try testing.expectEqual(Event{ .incoming_stream_reset = 1 }, assoc.pollEvent().?);
+        try testing.expectEqual(null, assoc.pollEvent());
+
+        const read = try testRead(&assoc, testDataPacket2(&assoc, testStreamData(tsn +% 1, 1, 0), &buffer), 0, &lens);
+        try testing.expectEqualSlices(usize, &.{4}, read);
+    }
+
+    // Deferred until the data sent before the request is received
+    {
+        var assoc = try testEstablishedAssoc();
+        defer assoc.deinit();
+        assoc.stream_reset.setPeerInitTsn(assoc.initial_tsn);
+        const tsn = assoc.initial_tsn;
+
+        _ = try testRead(&assoc, testOutgoingResetPacket(&assoc, &buffer, tsn, tsn, &.{1}), 0, &lens);
+        try testing.expectEqual(null, assoc.pollEvent());
+
+        _ = try testRead(&assoc, testDataPacket2(&assoc, testStreamData(tsn, 1, 0), &buffer), 0, &lens);
+        try testing.expectEqual(Event{ .incoming_stream_reset = 1 }, assoc.pollEvent().?);
+
+        const read = try testRead(&assoc, testDataPacket2(&assoc, testStreamData(tsn +% 1, 1, 0), &buffer), 0, &lens);
+        try testing.expectEqualSlices(usize, &.{4}, read);
+    }
 }

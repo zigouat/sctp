@@ -101,6 +101,7 @@ pub const ChunkIterator = struct {
                 if (length != 4) return error.InvalidChunk;
                 chunk = .shutdown_ack;
             },
+            .reconfig => chunk = .{ .reconfig = try Reconfig.parse(self.slice[4..length]) },
             .heartbeat_ack, .@"error", .ecne, .cwr => {},
             _ => if (self.slice[0] & 0x80 == 0) return error.UnrecognizedChunkType,
         }
@@ -126,6 +127,7 @@ pub const ChunkType = enum(u8) {
     ecne,
     cwr,
     shutdown_complete,
+    reconfig = 0x82,
     _,
 };
 
@@ -141,6 +143,7 @@ pub const Chunk = union(enum) {
     shutdown: u32,
     shutdown_complete: bool, // T bit
     shutdown_ack,
+    reconfig: Reconfig,
 };
 
 pub const Init = struct {
@@ -397,16 +400,130 @@ pub const Error = union(ErrorCode) {
     }
 };
 
+// Reconfig chunk
+pub const Reconfig = struct {
+    outgoing_ssn_reset_req: ?OutgoingSsnResetRequest,
+    incoming_ssn_reset_req: ?IncomingSsnResetRequest,
+    reconfig_response: ?ReConfigResponse,
+
+    pub fn parse(data: []const u8) error{InvalidChunk}!Reconfig {
+        var it = ParameterIterator.init(data);
+        var outgoing_ssn_reset_req: ?OutgoingSsnResetRequest = null;
+        var incoming_ssn_reset_req: ?IncomingSsnResetRequest = null;
+        var reconfig_response: ?ReConfigResponse = null;
+
+        while (it.next() catch return error.InvalidChunk) |param| switch (param) {
+            .outgoing_ssn_reset_req => outgoing_ssn_reset_req = param.outgoing_ssn_reset_req,
+            .incoming_ssn_reset_req => incoming_ssn_reset_req = param.incoming_ssn_reset_req,
+            .reconfig_response => reconfig_response = param.reconfig_response,
+            else => {},
+        };
+
+        return Reconfig{
+            .outgoing_ssn_reset_req = outgoing_ssn_reset_req,
+            .incoming_ssn_reset_req = incoming_ssn_reset_req,
+            .reconfig_response = reconfig_response,
+        };
+    }
+};
+
 pub const ParameterType = enum(u16) {
     heartbeat_info = 0x0001,
     state_cookie = 0x0007,
+    outgoing_ssn_reset_req = 0x000D,
+    incoming_ssn_reset_req = 0x000E,
+    reconfig_response = 0x0010,
     supported_extensions = 0x8008,
     _,
+};
+
+pub const OutgoingSsnResetRequest = struct {
+    req_seq_num: u32,
+    resp_seq_num: u32,
+    last_assigned_tsn: u32,
+    streams: []const u8,
+
+    pub fn parse(data: []const u8) error{InvalidParameter}!OutgoingSsnResetRequest {
+        if (data.len < 12 or data.len % 2 != 0) return error.InvalidParameter;
+
+        return OutgoingSsnResetRequest{
+            .req_seq_num = std.mem.readInt(u32, data[0..4], .big),
+            .resp_seq_num = std.mem.readInt(u32, data[4..8], .big),
+            .last_assigned_tsn = std.mem.readInt(u32, data[8..12], .big),
+            .streams = data[12..],
+        };
+    }
+
+    pub fn countStreams(self: *const OutgoingSsnResetRequest) u16 {
+        return @intCast(self.streams.len / 2);
+    }
+
+    pub fn getStreamAt(self: *const OutgoingSsnResetRequest, index: u16) u16 {
+        std.debug.assert(index < self.countStreams());
+        return std.mem.readInt(u16, self.streams[index * 2 ..][0..2], .big);
+    }
+};
+
+pub const IncomingSsnResetRequest = struct {
+    req_seq_num: u32,
+    streams: []const u8,
+
+    pub fn parse(data: []const u8) error{InvalidParameter}!IncomingSsnResetRequest {
+        if (data.len < 4 or data.len % 2 != 0) return error.InvalidParameter;
+
+        return IncomingSsnResetRequest{
+            .req_seq_num = std.mem.readInt(u32, data[0..4], .big),
+            .streams = data[4..],
+        };
+    }
+
+    pub fn countStreams(self: *const IncomingSsnResetRequest) u16 {
+        return @intCast(self.streams.len / 2);
+    }
+
+    pub fn getStreamAt(self: *const IncomingSsnResetRequest, index: u16) u16 {
+        std.debug.assert(index < self.countStreams());
+        return std.mem.readInt(u16, self.streams[index * 2 ..][0..2], .big);
+    }
+};
+
+pub const ReConfigResponse = struct {
+    resp_seq_num: u32,
+    result: Result,
+    sender_next_tsn: ?u32,
+    receiver_next_tsn: ?u32,
+
+    pub const Result = enum(u32) {
+        success_nothing_to_do = 0,
+        success_performed,
+        denied,
+        wrong_tsn,
+        request_in_progress,
+        bad_sequence_number,
+        in_progress,
+    };
+
+    pub fn parse(data: []const u8) error{InvalidParameter}!ReConfigResponse {
+        if (data.len != 8 and data.len != 16) return error.InvalidParameter;
+
+        const result = std.mem.readInt(u32, data[4..8], .big);
+        if (result > @intFromEnum(Result.in_progress)) return error.InvalidParameter;
+
+        return ReConfigResponse{
+            .resp_seq_num = std.mem.readInt(u32, data[0..4], .big),
+            .result = @enumFromInt(result),
+            .sender_next_tsn = if (data.len == 16) std.mem.readInt(u32, data[8..12], .big) else null,
+            .receiver_next_tsn = if (data.len == 16) std.mem.readInt(u32, data[12..16], .big) else null,
+        };
+    }
 };
 
 pub const Parameter = union(enum) {
     heartbeat_info: []const u8,
     state_cookie: []const u8,
+    outgoing_ssn_reset_req: OutgoingSsnResetRequest,
+    incoming_ssn_reset_req: IncomingSsnResetRequest,
+    reconfig_response: ReConfigResponse,
     supported_extensions: []const ChunkType,
     unknown: struct { param_type: u16, value: []const u8 },
 
@@ -416,6 +533,7 @@ pub const Parameter = union(enum) {
             .state_cookie => |value| writeTLV(ParameterType.state_cookie, value, buffer),
             .supported_extensions => |value| writeTLV(ParameterType.supported_extensions, std.mem.sliceAsBytes(value), buffer),
             .unknown => |param| writeTLV(@enumFromInt(param.param_type), param.value, buffer),
+            else => @panic("Must not be called"),
         };
     }
 
@@ -438,7 +556,7 @@ pub const ParameterIterator = struct {
         return ParameterIterator{ .slice = slice };
     }
 
-    pub fn next(self: *ParameterIterator) !?Parameter {
+    pub fn next(self: *ParameterIterator) error{InvalidParameter}!?Parameter {
         if (self.slice.len == 0) return null;
         if (self.slice.len < 4) return error.InvalidParameter;
 
@@ -454,6 +572,9 @@ pub const ParameterIterator = struct {
         return switch (param_type) {
             .heartbeat_info => .{ .heartbeat_info = value },
             .state_cookie => .{ .state_cookie = value },
+            .outgoing_ssn_reset_req => .{ .outgoing_ssn_reset_req = try OutgoingSsnResetRequest.parse(value) },
+            .incoming_ssn_reset_req => .{ .incoming_ssn_reset_req = try IncomingSsnResetRequest.parse(value) },
+            .reconfig_response => .{ .reconfig_response = try ReConfigResponse.parse(value) },
             .supported_extensions => .{ .supported_extensions = std.mem.bytesAsSlice(ChunkType, value) },
             else => .{ .unknown = .{ .param_type = @intFromEnum(param_type), .value = value } },
         };
@@ -747,4 +868,34 @@ test "ParameterIterator: round-trip supported extensions parameter" {
     var buffer: [16]u8 = undefined;
     const n = try param.writeBuffer(&buffer);
     try std.testing.expectEqualSlices(u8, &data, buffer[0..n]);
+}
+
+test "ReConfigResponse.parse" {
+    {
+        const data = [_]u8{ 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x01 };
+        const response = try ReConfigResponse.parse(&data);
+        try std.testing.expectEqual(42, response.resp_seq_num);
+        try std.testing.expectEqual(.success_performed, response.result);
+        try std.testing.expectEqual(null, response.sender_next_tsn);
+        try std.testing.expectEqual(null, response.receiver_next_tsn);
+    }
+
+    // With the optional sender and receiver next tsn
+    {
+        const data = [_]u8{
+            0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x14,
+        };
+        const response = try ReConfigResponse.parse(&data);
+        try std.testing.expectEqual(.denied, response.result);
+        try std.testing.expectEqual(10, response.sender_next_tsn);
+        try std.testing.expectEqual(20, response.receiver_next_tsn);
+    }
+
+    // Invalid length and unknown result
+    {
+        const data = [_]u8{ 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00 };
+        try std.testing.expectError(error.InvalidParameter, ReConfigResponse.parse(&data));
+        try std.testing.expectError(error.InvalidParameter, ReConfigResponse.parse(data[0..8]));
+    }
 }

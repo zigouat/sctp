@@ -132,6 +132,19 @@ pub fn hasGaps(self: *const MessageAssembler) bool {
     return self.sack_generator.received.cumulative_tsn != self.sack_generator.received.highest_tsn_received;
 }
 
+/// Restart the incoming stream sequence number of `streams` at 0, an empty slice resets all the streams.
+pub fn resetStreams(self: *MessageAssembler, streams: []const u16) void {
+    if (streams.len == 0) {
+        var it = self.streams.valueIterator();
+        while (it.next()) |state| state.next_ssn = 0;
+        return;
+    }
+
+    for (streams) |stream| {
+        if (self.streams.getPtr(stream)) |state| state.next_ssn = 0;
+    }
+}
+
 fn dropChunkWithHighestTsn(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) bool {
     if (!self.sack_generator.received.inGapRange(d.tsn)) return false;
     var high = self.sack_generator.received.highest_tsn_received;
@@ -433,6 +446,47 @@ test "MessageAssembler: independent streams track ssn separately" {
     const b = r.drainReady().?;
     defer b.deinit(testing.allocator);
     try testing.expectEqualStrings("stream0", b.data);
+}
+
+fn testExpectReady(r: *MessageAssembler, expected: []const []const u8) !void {
+    for (expected) |data| {
+        const msg = r.drainReady().?;
+        defer msg.deinit(testing.allocator);
+        try testing.expectEqualStrings(data, msg.data);
+    }
+    try testing.expectEqual(null, r.drainReady());
+}
+
+test "MessageAssembler.resetStreams: restarts the incoming ssn at 0" {
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+
+        _ = try r.receiveData(testing.allocator, testData(1, 1, 0, .complete, "a"));
+        _ = try r.receiveData(testing.allocator, testData(2, 2, 0, .complete, "b"));
+        try testExpectReady(&r, &.{ "a", "b" });
+
+        // Streams that are not reset keep their ssn
+        r.resetStreams(&.{ 1, 3 });
+        _ = try r.receiveData(testing.allocator, testData(3, 1, 0, .complete, "c"));
+        _ = try r.receiveData(testing.allocator, testData(4, 2, 1, .complete, "d"));
+        try testExpectReady(&r, &.{ "c", "d" });
+    }
+
+    // An empty slice resets all the streams
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+
+        _ = try r.receiveData(testing.allocator, testData(1, 1, 0, .complete, "a"));
+        _ = try r.receiveData(testing.allocator, testData(2, 2, 0, .complete, "b"));
+        try testExpectReady(&r, &.{ "a", "b" });
+
+        r.resetStreams(&.{});
+        _ = try r.receiveData(testing.allocator, testData(3, 1, 0, .complete, "c"));
+        _ = try r.receiveData(testing.allocator, testData(4, 2, 0, .complete, "d"));
+        try testExpectReady(&r, &.{ "c", "d" });
+    }
 }
 
 test "MessageAssembler: ssn wraparound at 0xFFFF advances to 0" {

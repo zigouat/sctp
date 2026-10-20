@@ -80,22 +80,30 @@ pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32
 }
 
 pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const u8, config: message.UserMessageConfig) !void {
-    try self.messages.ensureUnusedCapacity(allocator, 1);
-    try self.streams.ensureUnusedCapacity(allocator, 1);
     const data_copy = try allocator.dupe(u8, data);
+    errdefer allocator.free(data_copy);
 
-    const result = self.streams.getOrPutAssumeCapacity(config.stream_id);
-    if (!result.found_existing) result.value_ptr.* = .init;
-
-    self.messages.pushBackAssumeCapacity(.{
+    const msg = message.UserMessage{
         .data = data_copy,
         .ppid = config.ppid,
         .stream_id = config.stream_id,
-        .stream_seq = if (config.unordered) 0 else result.value_ptr.stream_seq,
+        .stream_seq = 0,
         .unordered = config.unordered,
-    });
-    if (!config.unordered) result.value_ptr.incSeq();
-    result.value_ptr.buffered +|= @intCast(data.len);
+    };
+
+    return try self.pushUserMessage(allocator, msg);
+}
+
+pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: message.UserMessage) !void {
+    try self.messages.ensureUnusedCapacity(allocator, 1);
+    try self.streams.ensureUnusedCapacity(allocator, 1);
+
+    const result = self.streams.getOrPutAssumeCapacity(msg.stream_id);
+    if (!result.found_existing) result.value_ptr.* = .init;
+
+    self.messages.pushBackAssumeCapacity(msg);
+    if (!msg.unordered) result.value_ptr.incSeq();
+    result.value_ptr.buffered +|= @intCast(msg.data.len);
 }
 
 pub const SackResult = struct {

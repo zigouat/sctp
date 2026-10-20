@@ -9,5 +9,6 @@ test {
     _ = @import("message_queue.zig");
     _ = @import("message.zig");
     _ = @import("sack_handler.zig");
+    _ = @import("stream_reset.zig");
     _ = @import("tsn_bit_set.zig");
 }
