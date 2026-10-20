@@ -57,11 +57,12 @@ const Transmit = union(enum) {
     sack,
     cookie_ack,
     abort: u32,
+    ootb_abort: u32,
     cookie_echo: []const u8,
     heartbeat_ack: []const u8,
     shutdown: u32,
     shutdown_ack,
-    shutdown_complete: bool,
+    shutdown_complete: ?u32,
 };
 
 const RetransmissionTimer = struct {
@@ -197,7 +198,9 @@ zero_wnd_probe: bool,
 pending_sack: bool,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) Association {
-    const initial_tsn = config.random.int(u32);
+    const initial_tsn: u32 = config.random.int(u32);
+    var verification_tag: u32 = 0;
+    while (verification_tag == 0) verification_tag = config.random.int(u32);
 
     return Association{
         .allocator = allocator,
@@ -207,7 +210,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .outbound_streams = config.outbound_streams,
         .inbound_streams = config.inbound_streams,
         .initial_tsn = initial_tsn,
-        .verification_tag = config.random.int(u32),
+        .verification_tag = verification_tag,
         .peer_verification_tag = 0,
         .cookie = config.random.array(u8, 32),
         .peer_cookie = &.{},
@@ -239,7 +242,8 @@ pub fn deinit(self: *Association) void {
 }
 
 pub fn connect(self: *Association) Error!void {
-    if (self.state != .closed) return error.InvalidState;
+    // Verification tag must be non-zero to avoid re-using association.
+    if (self.state != .closed or self.verification_tag == 0) return error.InvalidState;
     try self.transmits.pushBack(self.allocator, .init);
     self.peer_verification_tag = 0;
     self.state = .cookie_wait;
@@ -296,11 +300,28 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
     while (true) {
         const chunk = chunk_it.next() catch |err| switch (err) {
             error.InvalidChunk => break,
-            error.UnrecognizedChunkType => break, // send error chunk
+            error.UnrecognizedChunkType => {
+                if (self.state != .closed or packet.verification_tag == 0) break; // send error chunk
+                try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
+                return null;
+            },
         } orelse break;
 
+        // RFC9260 - 8.5.1. (A)
+        if (packet.verification_tag == 0 and chunk != .init) break;
+
+        // RFC9260 - 8.4. (8)
+        if (self.state == .closed) switch (chunk) {
+            .data, .init_ack, .sack, .heartbeat, .shutdown => {
+                try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
+                return null;
+            },
+            else => {},
+        };
+
         switch (chunk) {
-            .init => |c| try self.handleInitChunk(c),
+            // the tag is only checked against the first chunk of the packet
+            .init => |c| if (packet.verification_tag == 0) try self.handleInitChunk(c) else break,
             .init_ack => |c| switch (self.state) {
                 .cookie_wait => self.handleInitAckChunk(c) catch |err| switch (err) {
                     error.MissingCookie => continue,
@@ -311,7 +332,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
             },
             .cookie_echo => |cookie| {
                 try self.transmits.ensureUnusedCapacity(self.allocator, 2);
-                if (!std.mem.eql(u8, cookie, &self.cookie)) break;
+                if (packet.verification_tag != self.verification_tag or !std.mem.eql(u8, cookie, &self.cookie)) break;
 
                 self.transmits.pushBackAssumeCapacity(.cookie_ack);
                 if (self.state == .closed or self.state == .cookie_wait) try self.setStateToEstablished();
@@ -340,12 +361,12 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
             .heartbeat => |hb| if (self.state == .established and hb.len <= max_heartbeat_info) {
                 try self.transmits.pushBack(self.allocator, .{ .heartbeat_ack = hb });
             },
-            .abort => if (self.state != .closed) {
-                try self.setStateToClosed();
+            .abort => {
+                if (self.state != .closed) try self.setStateToClosed();
                 return null;
             },
             .shutdown => |cumulative_tsn| try self.handleShutdownChunk(cumulative_tsn, now),
-            .shutdown_ack => try self.handleShutdownAck(),
+            .shutdown_ack => try self.handleShutdownAck(packet.verification_tag),
             .shutdown_complete => if (self.state == .shutdown_ack_sent) {
                 try self.setStateToClosed();
                 return null;
@@ -447,13 +468,14 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
         if (maybe_control_chunk) |chunk_type| {
             switch (chunk_type) {
                 .init_ack => |tag| std.mem.writeInt(u32, buffer[4..8], tag, .big),
-                .shutdown_complete => |reflected| if (reflected) std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big),
+                .shutdown_complete => |reflected_tag| if (reflected_tag) |tag| std.mem.writeInt(u32, buffer[4..8], tag, .big),
+                .ootb_abort => |tag| std.mem.writeInt(u32, buffer[4..8], tag, .big),
                 .sack => self.pending_sack = false,
                 else => {},
             }
 
             switch (chunk_type) {
-                .init, .init_ack, .shutdown_complete => break,
+                .init, .init_ack, .shutdown_complete, .ootb_abort => break,
                 else => {},
             }
         }
@@ -502,7 +524,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
     };
 
     if (!first_chunk) switch (chunk_type) {
-        .init, .init_ack, .shutdown_complete => return null,
+        .init, .init_ack, .shutdown_complete, .ootb_abort => return null,
         else => {},
     };
 
@@ -512,11 +534,12 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
         .cookie_echo => |cookie| try writeCookieEcho(cookie, buffer),
         .cookie_ack => self.writeCookieAck(buffer),
         .abort => |tsn| self.writeNoUserDataAbort(tsn, buffer),
+        .ootb_abort => writeReflectedAbort(buffer),
         .sack => self.message_assembler.writeSack(buffer),
         .heartbeat_ack => |data| try writeHeartbeatAck(data, buffer),
         .shutdown => |tsn| writeShutdown(buffer, tsn),
         .shutdown_ack => writeShutdownAck(buffer),
-        .shutdown_complete => |reflected| writeShutdownComplete(buffer, reflected),
+        .shutdown_complete => |reflected_tag| writeShutdownComplete(buffer, reflected_tag != null),
     };
 
     switch (chunk_type) {
@@ -545,6 +568,7 @@ fn messageIterator(self: *Association) ?MessageIterator {
 fn setStateToClosed(self: *Association) !void {
     try self.events.pushBack(self.allocator, .comm_down);
     self.state = .closed;
+    self.verification_tag = 0;
     self.resetInitTimer();
     self.message_queue.close(self.allocator, self.initial_tsn);
     self.message_assembler.reset(self.allocator);
@@ -675,13 +699,14 @@ fn handleShutdownChunk(self: *Association, cumulative_tsn: u32, now: i64) !void 
     }
 }
 
-fn handleShutdownAck(self: *Association) !void {
+fn handleShutdownAck(self: *Association, verification_tag: u32) !void {
     switch (self.state) {
         .shutdown_sent, .shutdown_ack_sent => {
-            try self.transmits.pushBack(self.allocator, .{ .shutdown_complete = false });
+            try self.transmits.pushBack(self.allocator, .{ .shutdown_complete = null });
             try self.setStateToClosed();
         },
-        .closed => try self.transmits.pushBack(self.allocator, .{ .shutdown_complete = true }),
+        // RFC9260 - 8.5.1. (E) a shutdown ack received before the association is established is out of the blue
+        .closed, .cookie_wait, .cookie_echoed => try self.transmits.pushBack(self.allocator, .{ .shutdown_complete = verification_tag }),
         else => return,
     }
 }
@@ -707,7 +732,12 @@ fn isValidVerificationTag(self: *const Association, packet: *const message.Packe
     return switch (@as(message.ChunkType, @enumFromInt(packet.chunks[0]))) {
         .init => packet.verification_tag == 0,
         .abort, .shutdown_complete => packet.verification_tag == if (reflected) self.peer_verification_tag else self.verification_tag,
-        else => packet.verification_tag == self.verification_tag,
+        .shutdown_ack => switch (self.state) {
+            .closed, .cookie_wait, .cookie_echoed => true,
+            else => packet.verification_tag == self.verification_tag,
+        },
+        // RFC9260 - 8.4. out of the blue packets have no association to check the tag against
+        else => self.state == .closed or packet.verification_tag == self.verification_tag,
     };
 }
 
@@ -812,6 +842,13 @@ fn writeShutdown(buffer: []u8, tsn: u32) usize {
 fn writeShutdownAck(buffer: []u8) usize {
     buffer[0] = @intFromEnum(message.ChunkType.shutdown_ack);
     buffer[1] = 0; // flags
+    std.mem.writeInt(u16, buffer[2..4], 4, .big);
+    return 4;
+}
+
+fn writeReflectedAbort(buffer: []u8) usize {
+    buffer[0] = @intFromEnum(message.ChunkType.abort);
+    buffer[1] = 0x01; // T bit
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
     return 4;
 }
@@ -1038,7 +1075,7 @@ test "Association.pollTransmit: init, init_ack and shutdown_complete must not be
     try assoc.transmits.pushBack(testing.allocator, .init);
     try assoc.transmits.pushBack(testing.allocator, .{ .init_ack = assoc.verification_tag });
     try assoc.transmits.pushBack(testing.allocator, .{ .heartbeat_ack = &.{ 1, 2, 3 } });
-    try assoc.transmits.pushBack(testing.allocator, .{ .shutdown_complete = true });
+    try assoc.transmits.pushBack(testing.allocator, .{ .shutdown_complete = assoc.verification_tag });
 
     var out: [message.MTU]u8 = undefined;
     for (0..4) |_| try testing.expect(try assoc.pollTransmit(&out, 0) != null);
@@ -1222,7 +1259,7 @@ test "Association.handleRead: shutdown ack in shutdown ack sent closes the assoc
     _ = try assoc.handleRead(testPacket(&buffer, assoc.verification_tag, .shutdown_ack, 0), 0);
 
     try testing.expectEqual(.closed, assoc.state);
-    try testing.expectEqual(Transmit{ .shutdown_complete = false }, assoc.transmits.popFront().?);
+    try testing.expectEqual(Transmit{ .shutdown_complete = null }, assoc.transmits.popFront().?);
 }
 
 test "Association.handleRead: out of the blue shutdown ack is answered with a reflected shutdown complete" {
@@ -1231,16 +1268,122 @@ test "Association.handleRead: out of the blue shutdown ack is answered with a re
     assoc.peer_verification_tag = 0x11223344;
 
     var buffer: [16]u8 = undefined;
-    _ = try assoc.handleRead(testPacket(&buffer, assoc.verification_tag, .shutdown_ack, 0), 0);
+    _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, .shutdown_ack, 0), 0);
 
     try testing.expectEqual(.closed, assoc.state);
     try testing.expectEqual(null, assoc.pollEvent());
 
     var out: [message.MTU]u8 = undefined;
     const packet = (try assoc.pollTransmit(&out, 0)).?;
-    try testing.expectEqual(assoc.verification_tag, std.mem.readInt(u32, packet[4..8], .big));
+    try testing.expectEqual(0x55667788, std.mem.readInt(u32, packet[4..8], .big));
     try testing.expectEqual(@intFromEnum(message.ChunkType.shutdown_complete), packet[12]);
     try testing.expectEqual(0x01, packet[13]);
+}
+
+test "Association.handleRead: shutdown ack in cookie wait is answered with a reflected shutdown complete" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    assoc.state = .cookie_wait;
+
+    var buffer: [16]u8 = undefined;
+    _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, .shutdown_ack, 0), 0);
+
+    try testing.expectEqual(.cookie_wait, assoc.state);
+    try testing.expectEqual(Transmit{ .shutdown_complete = 0x55667788 }, assoc.transmits.popFront().?);
+}
+
+test "Association.handleRead: out of the blue packets are answered with a reflected abort" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    var out: [message.MTU]u8 = undefined;
+
+    // data
+    {
+        var buffer: [32]u8 = undefined;
+        try testing.expectEqual(null, try assoc.handleRead(testDataPacket(&buffer, 0x55667788, 100), 0));
+
+        const packet = (try assoc.pollTransmit(&out, 0)).?;
+        try testing.expectEqual(message.packet_header_size + 4, packet.len);
+        try testing.expectEqual(0x55667788, std.mem.readInt(u32, packet[4..8], .big));
+        try testing.expectEqual(@intFromEnum(message.ChunkType.abort), packet[12]);
+        try testing.expectEqual(0x01, packet[13]);
+        try testing.expectEqual(0, assoc.message_assembler.ready.len);
+    }
+
+    // unrecognized chunk type
+    {
+        var buffer: [16]u8 = undefined;
+        _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, @enumFromInt(0x40), 0), 0);
+        try testing.expectEqual(Transmit{ .ootb_abort = 0x55667788 }, assoc.transmits.popFront().?);
+    }
+
+    try testing.expectEqual(.closed, assoc.state);
+    try testing.expectEqual(null, assoc.pollEvent());
+}
+
+test "Association.handleRead: out of the blue cookie echo with a wrong tag is discarded" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+
+    // a cookie ack first, so the tag isn't checked before reaching the cookie echo
+    var buffer: [message.packet_header_size + 4 + 36]u8 = undefined;
+    std.mem.writeInt(u16, buffer[0..2], 5000, .big);
+    std.mem.writeInt(u16, buffer[2..4], 5000, .big);
+    std.mem.writeInt(u32, buffer[4..8], assoc.verification_tag +% 1, .big);
+    std.mem.writeInt(u32, buffer[8..12], 0, .big);
+    buffer[12] = @intFromEnum(message.ChunkType.cookie_ack);
+    buffer[13] = 0;
+    std.mem.writeInt(u16, buffer[14..16], 4, .big);
+    buffer[16] = @intFromEnum(message.ChunkType.cookie_echo);
+    buffer[17] = 0;
+    std.mem.writeInt(u16, buffer[18..20], 36, .big);
+    @memcpy(buffer[20..], &assoc.cookie);
+    Helper.checkSum(&buffer);
+    _ = try assoc.handleRead(&buffer, 0);
+
+    try testing.expectEqual(.closed, assoc.state);
+    try testing.expectEqual(0, assoc.transmits.len);
+}
+
+test "Association.handleRead: a replayed cookie echo does not reopen a closed association" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    const tag = assoc.verification_tag;
+
+    var abort: [16]u8 = undefined;
+    _ = try assoc.handleRead(testPacket(&abort, tag, .abort, 0), 0);
+    try testing.expectEqual(.closed, assoc.state);
+    _ = assoc.pollEvent();
+
+    var buffer: [message.packet_header_size + 36]u8 = undefined;
+    std.mem.writeInt(u16, buffer[0..2], 5000, .big);
+    std.mem.writeInt(u16, buffer[2..4], 5000, .big);
+    buffer[12] = @intFromEnum(message.ChunkType.cookie_echo);
+    buffer[13] = 0;
+    std.mem.writeInt(u16, buffer[14..16], 36, .big);
+    @memcpy(buffer[16..], &assoc.cookie);
+
+    // the old tag
+    {
+        std.mem.writeInt(u32, buffer[4..8], tag, .big);
+        std.mem.writeInt(u32, buffer[8..12], 0, .big);
+        Helper.checkSum(&buffer);
+        _ = try assoc.handleRead(&buffer, 0);
+        try testing.expectEqual(.closed, assoc.state);
+        try testing.expectEqual(0, assoc.transmits.len);
+    }
+
+    // the zeroed tag
+    {
+        std.mem.writeInt(u32, buffer[4..8], 0, .big);
+        std.mem.writeInt(u32, buffer[8..12], 0, .big);
+        Helper.checkSum(&buffer);
+        _ = try assoc.handleRead(&buffer, 0);
+        try testing.expectEqual(.closed, assoc.state);
+        try testing.expectEqual(0, assoc.transmits.len);
+    }
+
+    try testing.expectEqual(null, assoc.pollEvent());
 }
 
 test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
