@@ -101,7 +101,7 @@ pub const ChunkIterator = struct {
                 if (length != 4) return error.InvalidChunk;
                 chunk = .shutdown_ack;
             },
-            .reconfig => chunk = .{ .reconfig = try Reconfig.parse(self.slice[4..length]) },
+            .reconfig => chunk = .{ .reconfig = ParameterIterator.init(self.slice[4..length]) },
             .heartbeat_ack, .@"error", .ecne, .cwr => {},
             _ => if (self.slice[0] & 0x80 == 0) return error.UnrecognizedChunkType,
         }
@@ -143,7 +143,7 @@ pub const Chunk = union(enum) {
     shutdown: u32,
     shutdown_complete: bool, // T bit
     shutdown_ack,
-    reconfig: Reconfig,
+    reconfig: ParameterIterator,
 };
 
 pub const Init = struct {
@@ -255,8 +255,9 @@ pub const Data = struct {
 pub const Sack = struct {
     cumulative_tsn: u32,
     a_rwnd: u32,
-    gap_ack_blocks: []const u8,
-    duplicate_tsns: []const u8,
+    /// Gap ack blocks followed by the duplicate TSNs.
+    blocks: []const u8,
+    num_gap_ack_blocks: u16,
 
     pub fn parse(data: []const u8) error{InvalidChunk}!Sack {
         if (data.len < 12) {
@@ -267,7 +268,7 @@ pub const Sack = struct {
         const num_gap_ack_blocks = std.mem.readInt(u16, data[8..10], .big);
         const num_duplicate_tsns = std.mem.readInt(u16, data[10..12], .big);
 
-        const expected_length = @as(u32, num_gap_ack_blocks + num_duplicate_tsns) * 4 + 12;
+        const expected_length = (@as(u32, num_gap_ack_blocks) + num_duplicate_tsns) * 4 + 12;
         if (data.len != expected_length) {
             @branchHint(.unlikely);
             return error.InvalidChunk;
@@ -276,17 +277,17 @@ pub const Sack = struct {
         return Sack{
             .cumulative_tsn = std.mem.readInt(u32, data[0..4], .big),
             .a_rwnd = std.mem.readInt(u32, data[4..8], .big),
-            .gap_ack_blocks = data[12..(12 + num_gap_ack_blocks * 4)],
-            .duplicate_tsns = data[(12 + num_gap_ack_blocks * 4)..expected_length],
+            .blocks = data[12..expected_length],
+            .num_gap_ack_blocks = num_gap_ack_blocks,
         };
     }
 
     pub fn iterateGapAckBlocks(sack: *const Sack) GapAckBlockIterator {
-        return GapAckBlockIterator.init(sack.gap_ack_blocks, sack.cumulative_tsn);
+        return GapAckBlockIterator.init(sack.blocks[0 .. @as(u32, sack.num_gap_ack_blocks) * 4], sack.cumulative_tsn);
     }
 
     pub fn iterateDuplicateTsns(sack: *const Sack) DuplicateTsnIterator {
-        return DuplicateTsnIterator{ .bytes = sack.duplicate_tsns };
+        return DuplicateTsnIterator{ .bytes = sack.blocks[@as(u32, sack.num_gap_ack_blocks) * 4 ..] };
     }
 
     pub const GapAckBlockIterator = struct {
@@ -397,33 +398,6 @@ pub const Error = union(ErrorCode) {
         std.mem.writeInt(u16, buffer[2..4], 8, .big);
         std.mem.writeInt(u32, buffer[4..8], tsn, .big);
         return 8;
-    }
-};
-
-// Reconfig chunk
-pub const Reconfig = struct {
-    outgoing_ssn_reset_req: ?OutgoingSsnResetRequest,
-    incoming_ssn_reset_req: ?IncomingSsnResetRequest,
-    reconfig_response: ?ReConfigResponse,
-
-    pub fn parse(data: []const u8) error{InvalidChunk}!Reconfig {
-        var it = ParameterIterator.init(data);
-        var outgoing_ssn_reset_req: ?OutgoingSsnResetRequest = null;
-        var incoming_ssn_reset_req: ?IncomingSsnResetRequest = null;
-        var reconfig_response: ?ReConfigResponse = null;
-
-        while (it.next() catch return error.InvalidChunk) |param| switch (param) {
-            .outgoing_ssn_reset_req => outgoing_ssn_reset_req = param.outgoing_ssn_reset_req,
-            .incoming_ssn_reset_req => incoming_ssn_reset_req = param.incoming_ssn_reset_req,
-            .reconfig_response => reconfig_response = param.reconfig_response,
-            else => {},
-        };
-
-        return Reconfig{
-            .outgoing_ssn_reset_req = outgoing_ssn_reset_req,
-            .incoming_ssn_reset_req = incoming_ssn_reset_req,
-            .reconfig_response = reconfig_response,
-        };
     }
 };
 
@@ -607,7 +581,7 @@ fn parseHeartbeat(data: []const u8) error{InvalidChunk}![]const u8 {
 }
 
 fn collectGapAcks(blocks: []const u8, out: []u32) ![]u32 {
-    const sack = Sack{ .cumulative_tsn = 10, .a_rwnd = 0, .gap_ack_blocks = blocks, .duplicate_tsns = &.{} };
+    const sack = Sack{ .cumulative_tsn = 10, .a_rwnd = 0, .blocks = blocks, .num_gap_ack_blocks = @intCast(blocks.len / 4) };
     var it = sack.iterateGapAckBlocks();
     var n: usize = 0;
     while (try it.next()) |tsn| : (n += 1) out[n] = tsn;
@@ -746,22 +720,22 @@ test "Sack.parse" {
         const s = try Sack.parse(&payload);
         try std.testing.expectEqual(100, s.cumulative_tsn);
         try std.testing.expectEqual(0x10000, s.a_rwnd);
-        try std.testing.expectEqualSlices(u8, payload[12..20], s.gap_ack_blocks);
-        try std.testing.expectEqualSlices(u8, payload[20..24], s.duplicate_tsns);
+        try std.testing.expectEqualSlices(u8, payload[12..24], s.blocks);
+        try std.testing.expectEqual(2, s.num_gap_ack_blocks);
     }
 
     {
         const s = try Sack.parse(&.{ 0, 0, 0, 1, 0, 0, 0x10, 0, 0, 0, 0, 0 });
         try std.testing.expectEqual(1, s.cumulative_tsn);
         try std.testing.expectEqual(0x1000, s.a_rwnd);
-        try std.testing.expectEqual(0, s.gap_ack_blocks.len);
-        try std.testing.expectEqual(0, s.duplicate_tsns.len);
+        try std.testing.expectEqual(0, s.blocks.len);
+        try std.testing.expectEqual(0, s.num_gap_ack_blocks);
     }
 
     {
         const s = try Sack.parse(&.{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1 });
-        try std.testing.expectEqual(0, s.gap_ack_blocks.len);
-        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1 }, s.duplicate_tsns);
+        try std.testing.expectEqual(0, s.num_gap_ack_blocks);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1 }, s.blocks);
     }
 
     try std.testing.expectError(error.InvalidChunk, Sack.parse(payload[0..11]));
@@ -771,6 +745,9 @@ test "Sack.parse" {
         const extended = payload ++ [_]u8{ 0, 0, 0, 0 };
         try std.testing.expectError(error.InvalidChunk, Sack.parse(&extended));
     }
+
+    // The block counts sum beyond u16
+    try std.testing.expectError(error.InvalidChunk, Sack.parse(&.{ 0, 0, 0, 1, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x01 }));
 }
 
 test "Sack.iterateGapAckBlocks" {

@@ -6,8 +6,8 @@ const MessageQueue = @import("message_queue.zig");
 const StreamReset = @This();
 const Allocator = std.mem.Allocator;
 
-/// Outgoing SSN Reset Request parameters are sent alone in a RE-CONFIG chunk, which must fit in a packet.
-const max_streams_per_request = (message.PMDCS - 4 - 16) / 2;
+/// A RE-CONFIG chunk bundling a Re-configuration Response and an Outgoing SSN Reset Request must fit in a packet.
+const max_streams_per_request = (message.PMDCS - 4 - 12 - 16) / 2;
 
 const Request = struct {
     streams: []u16,
@@ -236,39 +236,51 @@ pub fn pollTimeout(self: *const StreamReset) i64 {
     return self.deadline;
 }
 
+/// Write a RE-CONFIG chunk bundling the pending response and our outgoing request (RFC6525 - 3.1).
 pub fn pollTransmit(self: *StreamReset, buffer: []u8, now: i64, rto: u32) error{WriteFailed}!?u32 {
-    if (self.send_response) {
-        const written = try writeResponse(self.response, buffer);
-        self.send_response = false;
-        return written;
-    }
+    const request = self.requestToSend();
+    if (request == null and !self.send_response) return null;
 
-    const request = self.requests.frontPtr() orelse return null;
-    if (request.last_assigned_tsn == null or !self.retransmit) return null;
-
-    const written = try writeOutgoingRequest(request, self.resp_seq_num, buffer);
-    self.deadline = now + rto;
-    self.retransmit = false;
-    return written;
-}
-
-fn writeOutgoingRequest(req: *const Request, resp_seq_num: u32, buffer: []u8) error{WriteFailed}!u32 {
-    const param_length: u32 = 16 + 2 * @as(u32, @intCast(req.streams.len));
-    const size = std.mem.alignForward(u32, 4 + param_length, 4);
+    const response_length: u32 = if (self.send_response) 12 else 0;
+    const request_length: u32 = if (request) |req| 16 + 2 * @as(u32, @intCast(req.streams.len)) else 0;
+    const length = 4 + response_length + request_length;
+    const size = std.mem.alignForward(u32, length, 4);
     if (buffer.len < size) return error.WriteFailed;
 
     buffer[0] = @intFromEnum(message.ChunkType.reconfig);
     buffer[1] = 0; // flags
-    std.mem.writeInt(u16, buffer[2..4], @intCast(4 + param_length), .big);
-    std.mem.writeInt(u16, buffer[4..6], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
-    std.mem.writeInt(u16, buffer[6..8], @intCast(param_length), .big);
-    std.mem.writeInt(u32, buffer[8..12], req.seq_num, .big);
-    std.mem.writeInt(u32, buffer[12..16], resp_seq_num, .big);
-    std.mem.writeInt(u32, buffer[16..20], req.last_assigned_tsn.?, .big);
-    for (req.streams, 0..) |stream, index| std.mem.writeInt(u16, buffer[20 + 2 * index ..][0..2], stream, .big);
-    @memset(buffer[4 + param_length .. size], 0);
+    std.mem.writeInt(u16, buffer[2..4], @intCast(length), .big);
+
+    if (self.send_response) {
+        writeResponse(self.response, buffer[4..]);
+        self.send_response = false;
+    }
+
+    if (request) |req| {
+        writeOutgoingRequest(req, self.resp_seq_num, buffer[4 + response_length .. size]);
+        self.deadline = now + rto;
+        self.retransmit = false;
+    }
 
     return size;
+}
+
+fn requestToSend(self: *const StreamReset) ?*const Request {
+    const request = self.requests.frontPtr() orelse return null;
+    return if (request.last_assigned_tsn != null and self.retransmit) request else null;
+}
+
+/// `buffer` holds exactly the parameter and its padding.
+fn writeOutgoingRequest(req: *const Request, resp_seq_num: u32, buffer: []u8) void {
+    const param_length: u32 = 16 + 2 * @as(u32, @intCast(req.streams.len));
+
+    std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
+    std.mem.writeInt(u16, buffer[2..4], @intCast(param_length), .big);
+    std.mem.writeInt(u32, buffer[4..8], req.seq_num, .big);
+    std.mem.writeInt(u32, buffer[8..12], resp_seq_num, .big);
+    std.mem.writeInt(u32, buffer[12..16], req.last_assigned_tsn.?, .big);
+    for (req.streams, 0..) |stream, index| std.mem.writeInt(u16, buffer[16 + 2 * index ..][0..2], stream, .big);
+    @memset(buffer[param_length..], 0);
 }
 
 fn setResponse(self: *StreamReset, seq_num: u32, result: message.ReConfigResponse.Result) void {
@@ -276,27 +288,23 @@ fn setResponse(self: *StreamReset, seq_num: u32, result: message.ReConfigRespons
     self.send_response = true;
 }
 
-fn writeResponse(response: Response, buffer: []u8) error{WriteFailed}!u32 {
-    if (buffer.len < 16) return error.WriteFailed;
-
-    buffer[0] = @intFromEnum(message.ChunkType.reconfig);
-    buffer[1] = 0; // flags
-    std.mem.writeInt(u16, buffer[2..4], 16, .big);
-    std.mem.writeInt(u16, buffer[4..6], @intFromEnum(message.ParameterType.reconfig_response), .big);
-    std.mem.writeInt(u16, buffer[6..8], 12, .big);
-    std.mem.writeInt(u32, buffer[8..12], response.seq_num, .big);
-    std.mem.writeInt(u32, buffer[12..16], @intFromEnum(response.result), .big);
-
-    return 16;
+fn writeResponse(response: Response, buffer: []u8) void {
+    std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.reconfig_response), .big);
+    std.mem.writeInt(u16, buffer[2..4], 12, .big);
+    std.mem.writeInt(u32, buffer[4..8], response.seq_num, .big);
+    std.mem.writeInt(u32, buffer[8..12], @intFromEnum(response.result), .big);
 }
 
 const testing = std.testing;
 
 fn testParseRequest(chunk: []const u8) !message.OutgoingSsnResetRequest {
     var it = message.ChunkIterator.init(chunk);
-    const reconfig = (try it.next()).?.reconfig;
+    var params = (try it.next()).?.reconfig;
     try testing.expectEqual(null, try it.next());
-    return reconfig.outgoing_ssn_reset_req.?;
+
+    const request = (try params.next()).?.outgoing_ssn_reset_req;
+    try testing.expectEqual(null, try params.next());
+    return request;
 }
 
 fn testExpectStreams(request: message.OutgoingSsnResetRequest, streams: []const u16) !void {
@@ -463,8 +471,11 @@ test "StreamReset.resetStreams: large stream lists are split into multiple reque
     try testing.expectEqual(1, r.requests.at(1).streams.len);
     try testing.expectEqual(102, r.req_seq_num);
 
+    // The largest request bundled with a response fills the packet
     var buffer: [message.PMDCS]u8 = undefined;
+    r.setPeerInitTsn(500);
     testStart(&r, 10);
+    testing.allocator.free((try testPeerRequest(&r, 500, 10, &.{1}, 10)).?);
     try testing.expectEqual(message.PMDCS, (try r.pollTransmit(&buffer, 0, 1000)).?);
 }
 
@@ -609,7 +620,8 @@ fn testExpectResponse(r: *StreamReset, seq_num: u32, result: message.ReConfigRes
     try testing.expectEqual(16, written);
 
     var it = message.ChunkIterator.init(buffer[0..written]);
-    const response = (try it.next()).?.reconfig.reconfig_response.?;
+    var params = (try it.next()).?.reconfig;
+    const response = (try params.next()).?.reconfig_response;
     try testing.expectEqual(seq_num, response.resp_seq_num);
     try testing.expectEqual(result, response.result);
 }
@@ -631,6 +643,41 @@ test "StreamReset.handleOutgoingResetRequest: resets the streams when the data b
     testStart(&r, 20);
     const written = (try r.pollTransmit(&buffer, 0, 1000)).?;
     try testing.expectEqual(500, (try testParseRequest(buffer[0..written])).resp_seq_num);
+}
+
+test "StreamReset.pollTransmit: bundles the response with our request" {
+    var r = StreamReset.init(100);
+    defer r.deinit(testing.allocator);
+    r.setPeerInitTsn(500);
+    var buffer: [64]u8 = undefined;
+
+    try r.resetStreams(testing.allocator, &.{3});
+    testStart(&r, 20);
+    testing.allocator.free((try testPeerRequest(&r, 500, 10, &.{1}, 10)).?);
+
+    // 4 bytes chunk header + 12 bytes response + 16 bytes request header + 1 stream, padded
+    const written = (try r.pollTransmit(&buffer, 0, 1000)).?;
+    try testing.expectEqual(36, written);
+    try testing.expectEqual(34, std.mem.readInt(u16, buffer[2..4], .big));
+    try testing.expectEqual(@intFromEnum(message.ParameterType.reconfig_response), std.mem.readInt(u16, buffer[4..6], .big));
+
+    var it = message.ChunkIterator.init(buffer[0..written]);
+    var params = (try it.next()).?.reconfig;
+    try testing.expectEqual(null, try it.next());
+
+    const response = (try params.next()).?.reconfig_response;
+    try testing.expectEqual(500, response.resp_seq_num);
+    try testing.expectEqual(.success_performed, response.result);
+
+    const request = (try params.next()).?.outgoing_ssn_reset_req;
+    try testing.expectEqual(100, request.req_seq_num);
+    try testing.expectEqual(500, request.resp_seq_num);
+    try testing.expectEqual(20, request.last_assigned_tsn);
+    try testExpectStreams(request, &.{3});
+    try testing.expectEqual(null, try params.next());
+
+    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
+    try testing.expectEqual(1000, r.pollTimeout());
 }
 
 test "StreamReset.handleOutgoingResetRequest: an empty stream list resets all the streams" {

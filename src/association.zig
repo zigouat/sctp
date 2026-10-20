@@ -385,13 +385,17 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 try self.setStateToClosed();
                 return null;
             },
-            .reconfig => |config| {
-                if (config.reconfig_response) |*resp| try self.handleReconfigResponse(resp);
-                if (config.outgoing_ssn_reset_req) |*req| {
-                    const cumulative_tsn = self.message_assembler.getCumulativeTsn();
-                    const streams = try self.stream_reset.handleOutgoingResetRequest(self.allocator, req, cumulative_tsn);
-                    if (streams) |s| try self.resetIncomingStreams(s);
-                }
+            .reconfig => |params| {
+                var it = params;
+                while (it.next() catch break) |param| switch (param) {
+                    .reconfig_response => |*resp| try self.handleReconfigResponse(resp),
+                    .outgoing_ssn_reset_req => |*req| {
+                        const cumulative_tsn = self.message_assembler.getCumulativeTsn();
+                        const streams = try self.stream_reset.handleOutgoingResetRequest(self.allocator, req, cumulative_tsn);
+                        if (streams) |s| try self.resetIncomingStreams(s);
+                    },
+                    else => {},
+                };
             },
         }
     }
@@ -545,6 +549,11 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
     }
 
     const chunk_type = self.transmits.front() orelse {
+        if (try self.stream_reset.pollTransmit(buffer, now, self.t3_timer.rto)) |written| {
+            @branchHint(.cold);
+            return .{ null, written };
+        }
+
         switch (self.state) {
             .established, .shutdown_received, .shutdown_pending => {},
             else => return null,
@@ -785,7 +794,7 @@ fn handleReconfigResponse(self: *Association, resp: *const message.ReConfigRespo
     }
 
     while (self.stream_reset.popMessage()) |user_msg| {
-        try self.message_queue.pushUserMessage(self.allocator, user_msg);
+        try self.message_queue.pushUserMessage(self.allocator, &user_msg);
     }
 
     // events
@@ -797,7 +806,6 @@ fn handleReconfigResponse(self: *Association, resp: *const message.ReConfigRespo
             self.events.pushBackAssumeCapacity(.{ .outgoing_stream_reset_failed = stream_id });
     }
 }
-
 
 fn isValidVerificationTag(self: *const Association, packet: *const message.Packet) bool {
     if (packet.chunks.len < 2) return packet.verification_tag == self.verification_tag;
