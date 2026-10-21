@@ -698,7 +698,7 @@ test "Data.write" {
     }
 }
 
-test "Data round trip through ChunkIterator" {
+test "Data: round trip through ChunkIterator" {
     const original = Data{
         .flags = .{ .start_fragment = true },
         .tsn = 0xfffffffe,
@@ -839,31 +839,6 @@ test "ChunkIterator: skips known unhandled chunks" {
     try std.testing.expect(chunk == .cookie_ack);
 }
 
-test "ParameterIterator: rejects lengths shorter than the header" {
-    for (0..4) |length| {
-        const data = [_]u8{ 0x00, 0x01, 0x00, @intCast(length), 0x00, 0x00, 0x00, 0x00 };
-        var it = ParameterIterator.init(&data);
-        try std.testing.expectError(error.InvalidParameter, it.next());
-    }
-}
-
-test "ParameterIterator: round-trip supported extensions parameter" {
-    const data = [_]u8{
-        0x80,                                  0x08,                             0x00,                               0x07,
-        @intFromEnum(ChunkType.heartbeat_ack), @intFromEnum(ChunkType.shutdown), @intFromEnum(ChunkType.cookie_ack), 0,
-    };
-
-    var it = ParameterIterator.init(data[0..]);
-    const param = (try it.next()).?;
-
-    try std.testing.expect(param == .supported_extensions);
-    try std.testing.expectEqualSlices(ChunkType, &.{ .heartbeat_ack, .shutdown, .cookie_ack }, param.supported_extensions);
-
-    var buffer: [16]u8 = undefined;
-    const n = try param.writeBuffer(&buffer);
-    try std.testing.expectEqualSlices(u8, &data, buffer[0..n]);
-}
-
 test "ReConfigResponse.parse" {
     {
         const data = [_]u8{ 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x01 };
@@ -892,6 +867,31 @@ test "ReConfigResponse.parse" {
         try std.testing.expectError(error.InvalidParameter, ReConfigResponse.parse(&data));
         try std.testing.expectError(error.InvalidParameter, ReConfigResponse.parse(data[0..8]));
     }
+}
+
+test "ParameterIterator: rejects lengths shorter than the header" {
+    for (0..4) |length| {
+        const data = [_]u8{ 0x00, 0x01, 0x00, @intCast(length), 0x00, 0x00, 0x00, 0x00 };
+        var it = ParameterIterator.init(&data);
+        try std.testing.expectError(error.InvalidParameter, it.next());
+    }
+}
+
+test "ParameterIterator: round-trip supported extensions parameter" {
+    const data = [_]u8{
+        0x80,                                  0x08,                             0x00,                               0x07,
+        @intFromEnum(ChunkType.heartbeat_ack), @intFromEnum(ChunkType.shutdown), @intFromEnum(ChunkType.cookie_ack), 0,
+    };
+
+    var it = ParameterIterator.init(data[0..]);
+    const param = (try it.next()).?;
+
+    try std.testing.expect(param == .supported_extensions);
+    try std.testing.expectEqualSlices(ChunkType, &.{ .heartbeat_ack, .shutdown, .cookie_ack }, param.supported_extensions);
+
+    var buffer: [16]u8 = undefined;
+    const n = try param.writeBuffer(&buffer);
+    try std.testing.expectEqualSlices(u8, &data, buffer[0..n]);
 }
 
 test "Parameter.writeBuffer" {
@@ -967,7 +967,7 @@ test "Parameter.writeBuffer" {
     }
 }
 
-test "Parameter.writeBuffer round trip through ParameterIterator" {
+test "Parameter.writeBuffer: round trip through ParameterIterator" {
     const params = [_]Parameter{
         .{ .heartbeat_info = "hb" },
         .{ .reconfig_response = .{

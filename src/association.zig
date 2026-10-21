@@ -18,6 +18,30 @@ const min_buffer_size = 128;
 
 pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 
+pub const Extensions = packed struct(u8) {
+    stream_reconfiguration: bool = false,
+    _pad: u7 = 0,
+
+    fn fromChunks(chunks: []const message.ChunkType) Extensions {
+        var extensions: Extensions = .{};
+        for (chunks) |c| switch (c) {
+            .reconfig => extensions.stream_reconfiguration = true,
+            else => {},
+        };
+        return extensions;
+    }
+
+    fn intersect(a: Extensions, b: Extensions) Extensions {
+        return @bitCast(@as(u8, @bitCast(a)) & @as(u8, @bitCast(b)));
+    }
+
+    // The parameter is at most 8 bytes and the smallest buffer we can write to is 128 bytes, so this should never fail.
+    fn write(extensions: Extensions, buffer: []u8) usize {
+        if (!extensions.stream_reconfiguration) return 0;
+        return message.Parameter.writeBuffer(.{ .supported_extensions = &.{.reconfig} }, buffer) catch unreachable;
+    }
+};
+
 pub const Config = struct {
     source_port: u16,
     dest_port: u16,
@@ -25,6 +49,7 @@ pub const Config = struct {
     outbound_streams: u16 = std.math.maxInt(u16),
     inbound_streams: u16 = std.math.maxInt(u16),
     receive_buffer_size: u32 = 1024 * 1024, // 1 MiB
+    supported_extensions: Extensions = .{},
 };
 
 pub const Event = union(enum) {
@@ -180,6 +205,9 @@ peer_verification_tag: u32,
 cookie: [32]u8,
 peer_cookie: []const u8,
 
+supported_extensions: Extensions,
+negotiated_extensions: Extensions,
+
 // Congestion control state
 cwnd: u32,
 ssthresh: u32,
@@ -222,6 +250,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .peer_verification_tag = 0,
         .cookie = config.random.array(u8, 32),
         .peer_cookie = &.{},
+        .supported_extensions = config.supported_extensions,
+        .negotiated_extensions = .{},
         .cwnd = @min(4 * message.PMDCS, @max(2 * message.PMDCS, 4404)),
         .ssthresh = std.math.maxInt(u32),
         .partial_bytes_acked = 0,
@@ -273,7 +303,10 @@ pub fn setBufferedAmountLowThreshold(self: *Association, stream: u16, threshold:
     return self.message_queue.setBufferedAmountLowThreshold(self.allocator, stream, threshold);
 }
 
-pub fn resetStreams(self: *Association, streams: []const u16, direction: StreamReset.Direction) !void {
+pub const StreamResetError = error{UnsupportedExtension} || StreamReset.ResetError;
+
+pub fn resetStreams(self: *Association, streams: []const u16, direction: StreamReset.Direction) StreamResetError!void {
+    if (!self.negotiated_extensions.stream_reconfiguration) return error.UnsupportedExtension;
     try self.stream_reset.resetStreams(self.allocator, streams, direction);
     self.stream_reset.maybeStartTransmitting(&self.message_queue);
 }
@@ -338,7 +371,12 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
 
         switch (chunk) {
             // the tag is only checked against the first chunk of the packet
-            .init => |c| if (packet.verification_tag == 0) try self.handleInitChunk(c) else break,
+            .init => |c| if (packet.verification_tag == 0) {
+                self.handleInitChunk(c) catch |err| switch (err) {
+                    error.InvalidParameter => continue,
+                    else => |e| return e,
+                };
+            } else break,
             .init_ack => |c| switch (self.state) {
                 .cookie_wait => self.handleInitAckChunk(c) catch |err| switch (err) {
                     error.MissingCookie => continue,
@@ -389,6 +427,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 return null;
             },
             .reconfig => |params| {
+                if (!self.negotiated_extensions.stream_reconfiguration) continue; // send error chunk
                 var it = params;
                 while (it.next() catch break) |param| switch (param) {
                     .reconfig_response => |*resp| try self.handleReconfigResponse(resp),
@@ -657,6 +696,7 @@ fn updateT3Timer(self: *Association, cumulative_tsn_advanced: bool, now: i64) vo
 }
 
 fn handleInitChunk(self: *Association, chunk: message.Init) !void {
+    const supported_extensions = try getPeerSupportedExtensions(chunk);
     try self.transmits.pushBack(self.allocator, .{ .init_ack = chunk.initiate_tag });
 
     if (self.state == .closed or self.state == .cookie_wait) {
@@ -666,19 +706,22 @@ fn handleInitChunk(self: *Association, chunk: message.Init) !void {
         self.stream_reset.setPeerInitTsn(chunk.initial_tsn);
         self.peer_verification_tag = chunk.initiate_tag;
         self.message_queue.rwnd = chunk.a_rwnd;
+        self.negotiated_extensions = supported_extensions.intersect(self.supported_extensions);
     }
 }
 
 fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     try self.transmits.ensureUnusedCapacity(self.allocator, 1);
 
-    const cookie = blk: {
-        var it = chunk.iterateParameters();
-        while (try it.next()) |param| switch (param) {
-            .state_cookie => |cookie_param| break :blk cookie_param,
-            else => {},
-        } else return error.MissingCookie;
+    var supported_extensions: Extensions = .{};
+    var cookie_param: ?[]const u8 = null;
+    var it = chunk.iterateParameters();
+    while (try it.next()) |param| switch (param) {
+        .state_cookie => |value| cookie_param = value,
+        .supported_extensions => |chunks| supported_extensions = .fromChunks(chunks),
+        else => {},
     };
+    const cookie = cookie_param orelse return error.MissingCookie;
 
     if (self.peer_cookie.len != 0) {
         self.allocator.free(self.peer_cookie);
@@ -695,6 +738,18 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     self.state = .cookie_echoed;
     self.resetInitTimer();
     self.transmits.pushBackAssumeCapacity(.{ .cookie_echo = self.peer_cookie });
+    self.negotiated_extensions = supported_extensions.intersect(self.supported_extensions);
+}
+
+fn getPeerSupportedExtensions(chunk: message.Init) !Extensions {
+    var supported_extensions: Extensions = .{};
+    var it = chunk.iterateParameters();
+    while (try it.next()) |param| switch (param) {
+        .supported_extensions => |chunks| supported_extensions = .fromChunks(chunks),
+        else => {},
+    };
+
+    return supported_extensions;
 }
 
 fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
@@ -859,14 +914,15 @@ fn setInitTimer(self: *Association, now: i64) void {
 fn writeInit(self: *Association, buffer: []u8) usize {
     buffer[0] = @intFromEnum(message.ChunkType.init);
     buffer[1] = 0; // flags
-    std.mem.writeInt(u16, buffer[2..4], 20, .big);
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
     std.mem.writeInt(u32, buffer[8..12], self.message_assembler.capacity, .big);
     std.mem.writeInt(u16, buffer[12..14], self.outbound_streams, .big);
     std.mem.writeInt(u16, buffer[14..16], self.inbound_streams, .big);
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
 
-    return 20;
+    const written = 20 + self.supported_extensions.write(buffer[20..]);
+    std.mem.writeInt(u16, buffer[2..4], @intCast(written), .big);
+    return written;
 }
 
 fn writeInitAck(self: *Association, buffer: []u8) usize {
@@ -880,10 +936,13 @@ fn writeInitAck(self: *Association, buffer: []u8) usize {
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
 
     // Cookie is 32 bytes and the smallest buffer we can write to is 128 bytes, so this should never fail.
-    const written = message.Parameter.writeBuffer(
+    var written = message.Parameter.writeBuffer(
         .{ .state_cookie = &self.cookie },
         buffer[20..],
     ) catch unreachable;
+
+    written += self.negotiated_extensions.write(buffer[20 + written ..]);
+
     std.mem.writeInt(u16, buffer[2..4], @intCast(20 + written), .big);
     return 20 + written;
 }
@@ -1058,6 +1117,51 @@ fn testSackPacket(buffer: []u8, assoc: *const Association, cumulative_tsn: u32, 
     const packet = buffer[0 .. message.packet_header_size + len];
     Helper.checkSum(packet);
     return packet;
+}
+
+fn testOutgoingResetPacket(assoc: *const Association, buffer: []u8, req_seq_num: u32, last_assigned_tsn: u32, streams: []const u16) []const u8 {
+    assoc.writeCommonHeader(buffer);
+    const chunk = buffer[message.packet_header_size..];
+    const param_length: u16 = @intCast(16 + 2 * streams.len);
+    chunk[0] = @intFromEnum(message.ChunkType.reconfig);
+    chunk[1] = 0;
+    std.mem.writeInt(u16, chunk[2..4], 4 + param_length, .big);
+    std.mem.writeInt(u16, chunk[4..6], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
+    std.mem.writeInt(u16, chunk[6..8], param_length, .big);
+    std.mem.writeInt(u32, chunk[8..12], req_seq_num, .big);
+    std.mem.writeInt(u32, chunk[12..16], 0, .big);
+    std.mem.writeInt(u32, chunk[16..20], last_assigned_tsn, .big);
+    for (streams, 0..) |stream, index| std.mem.writeInt(u16, chunk[20 + 2 * index ..][0..2], stream, .big);
+
+    const size = message.packet_header_size + std.mem.alignForward(usize, 4 + param_length, 4);
+    @memset(buffer[message.packet_header_size + 4 + param_length .. size], 0);
+    Helper.checkSum(buffer[0..size]);
+    return buffer[0..size];
+}
+
+fn testStreamData(tsn: u32, stream_id: u16, stream_seq: u16) message.Data {
+    return .{
+        .flags = .complete,
+        .tsn = tsn,
+        .stream_id = stream_id,
+        .stream_seq = stream_seq,
+        .ppid = 0,
+        .user_data = "ping",
+    };
+}
+
+fn testReconfigPacket(assoc: *const Association, buffer: []u8, params: []const u8) []const u8 {
+    assoc.writeCommonHeader(buffer);
+    const chunk = buffer[message.packet_header_size..];
+    chunk[0] = @intFromEnum(message.ChunkType.reconfig);
+    chunk[1] = 0;
+    std.mem.writeInt(u16, chunk[2..4], @intCast(4 + params.len), .big);
+    @memcpy(chunk[4..][0..params.len], params);
+
+    const size = message.packet_header_size + std.mem.alignForward(usize, 4 + params.len, 4);
+    @memset(buffer[message.packet_header_size + 4 + params.len .. size], 0);
+    Helper.checkSum(buffer[0..size]);
+    return buffer[0..size];
 }
 
 test "Association.pollTransmits: a timed out message that was gap acked is not retransmitted" {
@@ -1842,37 +1946,6 @@ test "Association: connect two peers" {
     try testing.expectEqual(null, peer2.pollTimeout());
 }
 
-fn testOutgoingResetPacket(assoc: *const Association, buffer: []u8, req_seq_num: u32, last_assigned_tsn: u32, streams: []const u16) []const u8 {
-    assoc.writeCommonHeader(buffer);
-    const chunk = buffer[message.packet_header_size..];
-    const param_length: u16 = @intCast(16 + 2 * streams.len);
-    chunk[0] = @intFromEnum(message.ChunkType.reconfig);
-    chunk[1] = 0;
-    std.mem.writeInt(u16, chunk[2..4], 4 + param_length, .big);
-    std.mem.writeInt(u16, chunk[4..6], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
-    std.mem.writeInt(u16, chunk[6..8], param_length, .big);
-    std.mem.writeInt(u32, chunk[8..12], req_seq_num, .big);
-    std.mem.writeInt(u32, chunk[12..16], 0, .big);
-    std.mem.writeInt(u32, chunk[16..20], last_assigned_tsn, .big);
-    for (streams, 0..) |stream, index| std.mem.writeInt(u16, chunk[20 + 2 * index ..][0..2], stream, .big);
-
-    const size = message.packet_header_size + std.mem.alignForward(usize, 4 + param_length, 4);
-    @memset(buffer[message.packet_header_size + 4 + param_length .. size], 0);
-    Helper.checkSum(buffer[0..size]);
-    return buffer[0..size];
-}
-
-fn testStreamData(tsn: u32, stream_id: u16, stream_seq: u16) message.Data {
-    return .{
-        .flags = .complete,
-        .tsn = tsn,
-        .stream_id = stream_id,
-        .stream_seq = stream_seq,
-        .ppid = 0,
-        .user_data = "ping",
-    };
-}
-
 test "Association.handleRead: the peer's outgoing stream reset restarts the incoming ssn" {
     var buffer: [64]u8 = undefined;
     var lens: [4]usize = undefined;
@@ -1880,6 +1953,7 @@ test "Association.handleRead: the peer's outgoing stream reset restarts the inco
     {
         var assoc = try testEstablishedAssoc();
         defer assoc.deinit();
+        assoc.negotiated_extensions.stream_reconfiguration = true;
         assoc.stream_reset.setPeerInitTsn(assoc.initial_tsn);
         const tsn = assoc.initial_tsn;
 
@@ -1896,6 +1970,7 @@ test "Association.handleRead: the peer's outgoing stream reset restarts the inco
     {
         var assoc = try testEstablishedAssoc();
         defer assoc.deinit();
+        assoc.negotiated_extensions.stream_reconfiguration = true;
         assoc.stream_reset.setPeerInitTsn(assoc.initial_tsn);
         const tsn = assoc.initial_tsn;
 
@@ -1910,23 +1985,10 @@ test "Association.handleRead: the peer's outgoing stream reset restarts the inco
     }
 }
 
-fn testReconfigPacket(assoc: *const Association, buffer: []u8, params: []const u8) []const u8 {
-    assoc.writeCommonHeader(buffer);
-    const chunk = buffer[message.packet_header_size..];
-    chunk[0] = @intFromEnum(message.ChunkType.reconfig);
-    chunk[1] = 0;
-    std.mem.writeInt(u16, chunk[2..4], @intCast(4 + params.len), .big);
-    @memcpy(chunk[4..][0..params.len], params);
-
-    const size = message.packet_header_size + std.mem.alignForward(usize, 4 + params.len, 4);
-    @memset(buffer[message.packet_header_size + 4 + params.len .. size], 0);
-    Helper.checkSum(buffer[0..size]);
-    return buffer[0..size];
-}
-
 test "Association.handleRead: a data channel close resets the stream in both directions" {
     var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
+    assoc.negotiated_extensions.stream_reconfiguration = true;
     assoc.stream_reset.setPeerInitTsn(assoc.initial_tsn);
     const tsn = assoc.initial_tsn;
 
@@ -1978,4 +2040,21 @@ test "Association.handleRead: a data channel close resets the stream in both dir
 
     _ = try testRead(&assoc, testReconfigPacket(&assoc, &buffer, &response_param), 0, &lens);
     try testing.expectEqual(Event{ .outgoing_stream_reset = 1 }, assoc.pollEvent().?);
+}
+
+test "Association.resetStreams: rejected requests are not queued" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+
+    // Stream reconfiguration not negotiated
+    try testing.expectError(error.UnsupportedExtension, assoc.resetStreams(&.{1}, .{ .outgoing = true, .incoming = true }));
+
+    // Too many streams
+    {
+        assoc.negotiated_extensions.stream_reconfiguration = true;
+        const streams: [StreamReset.max_streams + 1]u16 = @splat(1);
+        try testing.expectError(error.TooManyStreams, assoc.resetStreams(&streams, .{ .outgoing = true, .incoming = false }));
+    }
+
+    try testing.expectEqual(0, assoc.stream_reset.requests.len);
 }
