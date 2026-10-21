@@ -80,22 +80,32 @@ pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32
 }
 
 pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const u8, config: message.UserMessageConfig) !void {
-    try self.messages.ensureUnusedCapacity(allocator, 1);
-    try self.streams.ensureUnusedCapacity(allocator, 1);
     const data_copy = try allocator.dupe(u8, data);
+    errdefer allocator.free(data_copy);
 
-    const result = self.streams.getOrPutAssumeCapacity(config.stream_id);
-    if (!result.found_existing) result.value_ptr.* = .init;
-
-    self.messages.pushBackAssumeCapacity(.{
+    const msg = message.UserMessage{
         .data = data_copy,
         .ppid = config.ppid,
         .stream_id = config.stream_id,
-        .stream_seq = if (config.unordered) 0 else result.value_ptr.stream_seq,
+        .stream_seq = 0,
         .unordered = config.unordered,
-    });
-    if (!config.unordered) result.value_ptr.incSeq();
-    result.value_ptr.buffered +|= @intCast(data.len);
+    };
+
+    return try self.pushUserMessage(allocator, &msg);
+}
+
+pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *const message.UserMessage) !void {
+    try self.messages.ensureUnusedCapacity(allocator, 1);
+    try self.streams.ensureUnusedCapacity(allocator, 1);
+
+    var new_msg = msg.*;
+    const result = self.streams.getOrPutAssumeCapacity(msg.stream_id);
+    if (!result.found_existing) result.value_ptr.* = .init;
+    new_msg.stream_seq = result.value_ptr.stream_seq;
+
+    self.messages.pushBackAssumeCapacity(new_msg);
+    if (!msg.unordered) result.value_ptr.incSeq();
+    result.value_ptr.buffered +|= @intCast(new_msg.data.len);
 }
 
 pub const SackResult = struct {
@@ -135,6 +145,18 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
         .duplicate_data = duplicate_data,
         .has_fast_retransmit = has_fast_retransmit,
         .cumulative_ack_advanced = prev_cumulative_tsn != self.sack_handler.acked.cumulative_tsn,
+    };
+}
+
+pub fn resetStreams(self: *MessageQueue, streams: []const u16) void {
+    if (streams.len == 0) {
+        var it = self.streams.valueIterator();
+        while (it.next()) |state| state.stream_seq = 0;
+        return;
+    }
+
+    for (streams) |stream| if (self.streams.getPtr(stream)) |state| {
+        state.stream_seq = 0;
     };
 }
 
@@ -411,8 +433,8 @@ fn testAckUpTo(msg_queue: *MessageQueue, allocator: std.mem.Allocator, cumulativ
     _ = try msg_queue.handleSack(allocator, message.Sack{
         .cumulative_tsn = cumulative_tsn,
         .a_rwnd = 1000,
-        .gap_ack_blocks = &.{},
-        .duplicate_tsns = &.{},
+        .blocks = &.{},
+        .num_gap_ack_blocks = 0,
     }, false);
 }
 
@@ -462,8 +484,8 @@ test "MessageQueue.nextRetransmit: gap acked chunks are skipped" {
     _ = try msg_queue.handleSack(testing.allocator, message.Sack{
         .cumulative_tsn = 1,
         .a_rwnd = 1000,
-        .gap_ack_blocks = &.{ 0, 2, 0, 3, 0, 5, 0, 5 },
-        .duplicate_tsns = &.{},
+        .blocks = &.{ 0, 2, 0, 3, 0, 5, 0, 5 },
+        .num_gap_ack_blocks = 2,
     }, false);
     msg_queue.handleTimeout();
 
@@ -531,8 +553,8 @@ test "MessageQueue.handleSack: acknowledging every chunk during a retransmission
     _ = try msg_queue.handleSack(testing.allocator, message.Sack{
         .cumulative_tsn = 3,
         .a_rwnd = 0,
-        .gap_ack_blocks = &.{},
-        .duplicate_tsns = &.{},
+        .blocks = &.{},
+        .num_gap_ack_blocks = 0,
     }, false);
 
     try testing.expectEqual(null, msg_queue.retransmit_index);
@@ -600,8 +622,8 @@ test "MessageQueue.handleSack: running out of memory for events keeps the queue 
     const sack = message.Sack{
         .cumulative_tsn = 2,
         .a_rwnd = 1000,
-        .gap_ack_blocks = &.{ 0, 2, 0, 2 },
-        .duplicate_tsns = &.{},
+        .blocks = &.{ 0, 2, 0, 2 },
+        .num_gap_ack_blocks = 1,
     };
     try testing.expectError(error.OutOfMemory, msg_queue.handleSack(allocator, sack, false));
     try testing.expectEqual(3, msg_queue.chunks.len);

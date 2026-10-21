@@ -4,6 +4,7 @@ const Helper = @import("helper.zig");
 
 pub const packet_header_size = 12;
 pub const data_chunk_header_size = 16;
+pub const reconfig_response_size = 12;
 pub const MTU = 1200;
 pub const PMDCS = MTU - packet_header_size;
 
@@ -101,6 +102,7 @@ pub const ChunkIterator = struct {
                 if (length != 4) return error.InvalidChunk;
                 chunk = .shutdown_ack;
             },
+            .reconfig => chunk = .{ .reconfig = ParameterIterator.init(self.slice[4..length]) },
             .heartbeat_ack, .@"error", .ecne, .cwr => {},
             _ => if (self.slice[0] & 0x80 == 0) return error.UnrecognizedChunkType,
         }
@@ -126,6 +128,7 @@ pub const ChunkType = enum(u8) {
     ecne,
     cwr,
     shutdown_complete,
+    reconfig = 0x82,
     _,
 };
 
@@ -141,6 +144,7 @@ pub const Chunk = union(enum) {
     shutdown: u32,
     shutdown_complete: bool, // T bit
     shutdown_ack,
+    reconfig: ParameterIterator,
 };
 
 pub const Init = struct {
@@ -252,8 +256,9 @@ pub const Data = struct {
 pub const Sack = struct {
     cumulative_tsn: u32,
     a_rwnd: u32,
-    gap_ack_blocks: []const u8,
-    duplicate_tsns: []const u8,
+    /// Gap ack blocks followed by the duplicate TSNs.
+    blocks: []const u8,
+    num_gap_ack_blocks: u16,
 
     pub fn parse(data: []const u8) error{InvalidChunk}!Sack {
         if (data.len < 12) {
@@ -264,7 +269,7 @@ pub const Sack = struct {
         const num_gap_ack_blocks = std.mem.readInt(u16, data[8..10], .big);
         const num_duplicate_tsns = std.mem.readInt(u16, data[10..12], .big);
 
-        const expected_length = @as(u32, num_gap_ack_blocks + num_duplicate_tsns) * 4 + 12;
+        const expected_length = (@as(u32, num_gap_ack_blocks) + num_duplicate_tsns) * 4 + 12;
         if (data.len != expected_length) {
             @branchHint(.unlikely);
             return error.InvalidChunk;
@@ -273,17 +278,17 @@ pub const Sack = struct {
         return Sack{
             .cumulative_tsn = std.mem.readInt(u32, data[0..4], .big),
             .a_rwnd = std.mem.readInt(u32, data[4..8], .big),
-            .gap_ack_blocks = data[12..(12 + num_gap_ack_blocks * 4)],
-            .duplicate_tsns = data[(12 + num_gap_ack_blocks * 4)..expected_length],
+            .blocks = data[12..expected_length],
+            .num_gap_ack_blocks = num_gap_ack_blocks,
         };
     }
 
     pub fn iterateGapAckBlocks(sack: *const Sack) GapAckBlockIterator {
-        return GapAckBlockIterator.init(sack.gap_ack_blocks, sack.cumulative_tsn);
+        return GapAckBlockIterator.init(sack.blocks[0 .. @as(u32, sack.num_gap_ack_blocks) * 4], sack.cumulative_tsn);
     }
 
     pub fn iterateDuplicateTsns(sack: *const Sack) DuplicateTsnIterator {
-        return DuplicateTsnIterator{ .bytes = sack.duplicate_tsns };
+        return DuplicateTsnIterator{ .bytes = sack.blocks[@as(u32, sack.num_gap_ack_blocks) * 4 ..] };
     }
 
     pub const GapAckBlockIterator = struct {
@@ -400,13 +405,100 @@ pub const Error = union(ErrorCode) {
 pub const ParameterType = enum(u16) {
     heartbeat_info = 0x0001,
     state_cookie = 0x0007,
+    outgoing_ssn_reset_req = 0x000D,
+    incoming_ssn_reset_req = 0x000E,
+    reconfig_response = 0x0010,
     supported_extensions = 0x8008,
     _,
+};
+
+pub const OutgoingSsnResetRequest = struct {
+    req_seq_num: u32,
+    resp_seq_num: u32,
+    last_assigned_tsn: u32,
+    streams: []const u8,
+
+    pub fn parse(data: []const u8) error{InvalidParameter}!OutgoingSsnResetRequest {
+        if (data.len < 12 or data.len % 2 != 0) return error.InvalidParameter;
+
+        return OutgoingSsnResetRequest{
+            .req_seq_num = std.mem.readInt(u32, data[0..4], .big),
+            .resp_seq_num = std.mem.readInt(u32, data[4..8], .big),
+            .last_assigned_tsn = std.mem.readInt(u32, data[8..12], .big),
+            .streams = data[12..],
+        };
+    }
+
+    pub fn countStreams(self: *const OutgoingSsnResetRequest) u16 {
+        return @intCast(self.streams.len / 2);
+    }
+
+    pub fn getStreamAt(self: *const OutgoingSsnResetRequest, index: u16) u16 {
+        std.debug.assert(index < self.countStreams());
+        return std.mem.readInt(u16, self.streams[index * 2 ..][0..2], .big);
+    }
+};
+
+pub const IncomingSsnResetRequest = struct {
+    req_seq_num: u32,
+    streams: []const u8,
+
+    pub fn parse(data: []const u8) error{InvalidParameter}!IncomingSsnResetRequest {
+        if (data.len < 4 or data.len % 2 != 0) return error.InvalidParameter;
+
+        return IncomingSsnResetRequest{
+            .req_seq_num = std.mem.readInt(u32, data[0..4], .big),
+            .streams = data[4..],
+        };
+    }
+
+    pub fn countStreams(self: *const IncomingSsnResetRequest) u16 {
+        return @intCast(self.streams.len / 2);
+    }
+
+    pub fn getStreamAt(self: *const IncomingSsnResetRequest, index: u16) u16 {
+        std.debug.assert(index < self.countStreams());
+        return std.mem.readInt(u16, self.streams[index * 2 ..][0..2], .big);
+    }
+};
+
+pub const ReConfigResponse = struct {
+    resp_seq_num: u32,
+    result: Result,
+    sender_next_tsn: ?u32,
+    receiver_next_tsn: ?u32,
+
+    pub const Result = enum(u32) {
+        success_nothing_to_do = 0,
+        success_performed,
+        denied,
+        wrong_tsn,
+        request_in_progress,
+        bad_sequence_number,
+        in_progress,
+    };
+
+    pub fn parse(data: []const u8) error{InvalidParameter}!ReConfigResponse {
+        if (data.len != 8 and data.len != 16) return error.InvalidParameter;
+
+        const result = std.mem.readInt(u32, data[4..8], .big);
+        if (result > @intFromEnum(Result.in_progress)) return error.InvalidParameter;
+
+        return ReConfigResponse{
+            .resp_seq_num = std.mem.readInt(u32, data[0..4], .big),
+            .result = @enumFromInt(result),
+            .sender_next_tsn = if (data.len == 16) std.mem.readInt(u32, data[8..12], .big) else null,
+            .receiver_next_tsn = if (data.len == 16) std.mem.readInt(u32, data[12..16], .big) else null,
+        };
+    }
 };
 
 pub const Parameter = union(enum) {
     heartbeat_info: []const u8,
     state_cookie: []const u8,
+    outgoing_ssn_reset_req: OutgoingSsnResetRequest,
+    incoming_ssn_reset_req: IncomingSsnResetRequest,
+    reconfig_response: ReConfigResponse,
     supported_extensions: []const ChunkType,
     unknown: struct { param_type: u16, value: []const u8 },
 
@@ -416,6 +508,23 @@ pub const Parameter = union(enum) {
             .state_cookie => |value| writeTLV(ParameterType.state_cookie, value, buffer),
             .supported_extensions => |value| writeTLV(ParameterType.supported_extensions, std.mem.sliceAsBytes(value), buffer),
             .unknown => |param| writeTLV(@enumFromInt(param.param_type), param.value, buffer),
+            .reconfig_response => |resp| blk: {
+                std.debug.assert((resp.sender_next_tsn == null) == (resp.receiver_next_tsn == null));
+                const size: usize = if (resp.sender_next_tsn != null) 16 else 8;
+                if (size + 4 > buffer.len) return error.WriteFailed;
+
+                std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ParameterType.reconfig_response), .big);
+                std.mem.writeInt(u16, buffer[2..4], @intCast(size + 4), .big);
+                std.mem.writeInt(u32, buffer[4..8], resp.resp_seq_num, .big);
+                std.mem.writeInt(u32, buffer[8..12], @intFromEnum(resp.result), .big);
+                if (resp.sender_next_tsn) |_| {
+                    std.mem.writeInt(u32, buffer[12..16], resp.sender_next_tsn.?, .big);
+                    std.mem.writeInt(u32, buffer[16..20], resp.receiver_next_tsn.?, .big);
+                }
+
+                break :blk size + 4;
+            },
+            else => unreachable,
         };
     }
 
@@ -438,7 +547,7 @@ pub const ParameterIterator = struct {
         return ParameterIterator{ .slice = slice };
     }
 
-    pub fn next(self: *ParameterIterator) !?Parameter {
+    pub fn next(self: *ParameterIterator) error{InvalidParameter}!?Parameter {
         if (self.slice.len == 0) return null;
         if (self.slice.len < 4) return error.InvalidParameter;
 
@@ -454,6 +563,9 @@ pub const ParameterIterator = struct {
         return switch (param_type) {
             .heartbeat_info => .{ .heartbeat_info = value },
             .state_cookie => .{ .state_cookie = value },
+            .outgoing_ssn_reset_req => .{ .outgoing_ssn_reset_req = try OutgoingSsnResetRequest.parse(value) },
+            .incoming_ssn_reset_req => .{ .incoming_ssn_reset_req = try IncomingSsnResetRequest.parse(value) },
+            .reconfig_response => .{ .reconfig_response = try ReConfigResponse.parse(value) },
             .supported_extensions => .{ .supported_extensions = std.mem.bytesAsSlice(ChunkType, value) },
             else => .{ .unknown = .{ .param_type = @intFromEnum(param_type), .value = value } },
         };
@@ -486,7 +598,7 @@ fn parseHeartbeat(data: []const u8) error{InvalidChunk}![]const u8 {
 }
 
 fn collectGapAcks(blocks: []const u8, out: []u32) ![]u32 {
-    const sack = Sack{ .cumulative_tsn = 10, .a_rwnd = 0, .gap_ack_blocks = blocks, .duplicate_tsns = &.{} };
+    const sack = Sack{ .cumulative_tsn = 10, .a_rwnd = 0, .blocks = blocks, .num_gap_ack_blocks = @intCast(blocks.len / 4) };
     var it = sack.iterateGapAckBlocks();
     var n: usize = 0;
     while (try it.next()) |tsn| : (n += 1) out[n] = tsn;
@@ -586,7 +698,7 @@ test "Data.write" {
     }
 }
 
-test "Data round trip through ChunkIterator" {
+test "Data: round trip through ChunkIterator" {
     const original = Data{
         .flags = .{ .start_fragment = true },
         .tsn = 0xfffffffe,
@@ -625,22 +737,22 @@ test "Sack.parse" {
         const s = try Sack.parse(&payload);
         try std.testing.expectEqual(100, s.cumulative_tsn);
         try std.testing.expectEqual(0x10000, s.a_rwnd);
-        try std.testing.expectEqualSlices(u8, payload[12..20], s.gap_ack_blocks);
-        try std.testing.expectEqualSlices(u8, payload[20..24], s.duplicate_tsns);
+        try std.testing.expectEqualSlices(u8, payload[12..24], s.blocks);
+        try std.testing.expectEqual(2, s.num_gap_ack_blocks);
     }
 
     {
         const s = try Sack.parse(&.{ 0, 0, 0, 1, 0, 0, 0x10, 0, 0, 0, 0, 0 });
         try std.testing.expectEqual(1, s.cumulative_tsn);
         try std.testing.expectEqual(0x1000, s.a_rwnd);
-        try std.testing.expectEqual(0, s.gap_ack_blocks.len);
-        try std.testing.expectEqual(0, s.duplicate_tsns.len);
+        try std.testing.expectEqual(0, s.blocks.len);
+        try std.testing.expectEqual(0, s.num_gap_ack_blocks);
     }
 
     {
         const s = try Sack.parse(&.{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1 });
-        try std.testing.expectEqual(0, s.gap_ack_blocks.len);
-        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1 }, s.duplicate_tsns);
+        try std.testing.expectEqual(0, s.num_gap_ack_blocks);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1 }, s.blocks);
     }
 
     try std.testing.expectError(error.InvalidChunk, Sack.parse(payload[0..11]));
@@ -650,6 +762,9 @@ test "Sack.parse" {
         const extended = payload ++ [_]u8{ 0, 0, 0, 0 };
         try std.testing.expectError(error.InvalidChunk, Sack.parse(&extended));
     }
+
+    // The block counts sum beyond u16
+    try std.testing.expectError(error.InvalidChunk, Sack.parse(&.{ 0, 0, 0, 1, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x01 }));
 }
 
 test "Sack.iterateGapAckBlocks" {
@@ -724,6 +839,36 @@ test "ChunkIterator: skips known unhandled chunks" {
     try std.testing.expect(chunk == .cookie_ack);
 }
 
+test "ReConfigResponse.parse" {
+    {
+        const data = [_]u8{ 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x01 };
+        const response = try ReConfigResponse.parse(&data);
+        try std.testing.expectEqual(42, response.resp_seq_num);
+        try std.testing.expectEqual(.success_performed, response.result);
+        try std.testing.expectEqual(null, response.sender_next_tsn);
+        try std.testing.expectEqual(null, response.receiver_next_tsn);
+    }
+
+    // With the optional sender and receiver next tsn
+    {
+        const data = [_]u8{
+            0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x14,
+        };
+        const response = try ReConfigResponse.parse(&data);
+        try std.testing.expectEqual(.denied, response.result);
+        try std.testing.expectEqual(10, response.sender_next_tsn);
+        try std.testing.expectEqual(20, response.receiver_next_tsn);
+    }
+
+    // Invalid length and unknown result
+    {
+        const data = [_]u8{ 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00 };
+        try std.testing.expectError(error.InvalidParameter, ReConfigResponse.parse(&data));
+        try std.testing.expectError(error.InvalidParameter, ReConfigResponse.parse(data[0..8]));
+    }
+}
+
 test "ParameterIterator: rejects lengths shorter than the header" {
     for (0..4) |length| {
         const data = [_]u8{ 0x00, 0x01, 0x00, @intCast(length), 0x00, 0x00, 0x00, 0x00 };
@@ -747,4 +892,104 @@ test "ParameterIterator: round-trip supported extensions parameter" {
     var buffer: [16]u8 = undefined;
     const n = try param.writeBuffer(&buffer);
     try std.testing.expectEqualSlices(u8, &data, buffer[0..n]);
+}
+
+test "Parameter.writeBuffer" {
+    // Length excludes the padding
+    {
+        const param = Parameter{ .heartbeat_info = "hello" };
+        var buffer: [16]u8 = @splat(0xff);
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(12, n);
+        try std.testing.expectEqualSlices(u8, &.{
+            0x00, 0x01, 0x00, 0x09, 'h', 'e', 'l', 'l',
+            'o',  0x00, 0x00, 0x00,
+        }, buffer[0..n]);
+        try std.testing.expectEqual(0xff, buffer[n]);
+    }
+
+    {
+        const param = Parameter{ .state_cookie = "abcd" };
+        var buffer: [8]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(8, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x07, 0x00, 0x08, 'a', 'b', 'c', 'd' }, &buffer);
+    }
+
+    {
+        const param = Parameter{ .unknown = .{ .param_type = 0x8001, .value = "" } };
+        var buffer: [4]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(4, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0x80, 0x01, 0x00, 0x04 }, &buffer);
+    }
+
+    {
+        const param = Parameter{ .reconfig_response = .{
+            .resp_seq_num = 42,
+            .result = .success_performed,
+            .sender_next_tsn = null,
+            .receiver_next_tsn = null,
+        } };
+        var buffer: [12]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(12, n);
+        try std.testing.expectEqualSlices(u8, &.{
+            0x00, 0x10, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x2A,
+            0x00, 0x00, 0x00, 0x01,
+        }, &buffer);
+    }
+
+    // With the optional sender and receiver next tsn
+    {
+        const param = Parameter{ .reconfig_response = .{
+            .resp_seq_num = 42,
+            .result = .denied,
+            .sender_next_tsn = 10,
+            .receiver_next_tsn = 20,
+        } };
+        var buffer: [20]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(20, n);
+        try std.testing.expectEqualSlices(u8, &.{
+            0x00, 0x10, 0x00, 0x14, 0x00, 0x00, 0x00, 0x2A,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0A,
+            0x00, 0x00, 0x00, 0x14,
+        }, &buffer);
+    }
+
+    // Buffer too small, including when only the padding doesn't fit
+    {
+        const param = Parameter{ .heartbeat_info = "hello" };
+        var buffer: [11]u8 = undefined;
+        try std.testing.expectError(error.WriteFailed, param.writeBuffer(&buffer));
+        try std.testing.expectError(error.WriteFailed, param.writeBuffer(buffer[0..3]));
+    }
+}
+
+test "Parameter.writeBuffer: round trip through ParameterIterator" {
+    const params = [_]Parameter{
+        .{ .heartbeat_info = "hb" },
+        .{ .reconfig_response = .{
+            .resp_seq_num = 7,
+            .result = .in_progress,
+            .sender_next_tsn = 0xfffffffe,
+            .receiver_next_tsn = 1,
+        } },
+        .{ .unknown = .{ .param_type = 0x4002, .value = "xyz" } },
+    };
+
+    var buffer: [64]u8 = undefined;
+    var n: usize = 0;
+    for (params) |param| n += try param.writeBuffer(buffer[n..]);
+
+    var it = ParameterIterator.init(buffer[0..n]);
+    try std.testing.expectEqualSlices(u8, "hb", (try it.next()).?.heartbeat_info);
+    try std.testing.expectEqualDeep(params[1].reconfig_response, (try it.next()).?.reconfig_response);
+
+    const unknown = (try it.next()).?.unknown;
+    try std.testing.expectEqual(0x4002, unknown.param_type);
+    try std.testing.expectEqualSlices(u8, "xyz", unknown.value);
+
+    try std.testing.expectEqual(null, try it.next());
 }

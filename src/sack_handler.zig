@@ -149,8 +149,8 @@ fn testSack(cumulative_tsn: u32, blocks: []const u8) message.Sack {
     return .{
         .cumulative_tsn = cumulative_tsn,
         .a_rwnd = 0,
-        .gap_ack_blocks = blocks,
-        .duplicate_tsns = &.{},
+        .blocks = blocks,
+        .num_gap_ack_blocks = @intCast(blocks.len / 4),
     };
 }
 
