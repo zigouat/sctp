@@ -400,18 +400,21 @@ pub const Error = union(ErrorCode) {
 pub const ParameterType = enum(u16) {
     heartbeat_info = 0x0001,
     state_cookie = 0x0007,
+    supported_extensions = 0x8008,
     _,
 };
 
 pub const Parameter = union(enum) {
     heartbeat_info: []const u8,
     state_cookie: []const u8,
+    supported_extensions: []const ChunkType,
     unknown: struct { param_type: u16, value: []const u8 },
 
     pub fn writeBuffer(self: Parameter, buffer: []u8) error{WriteFailed}!usize {
         return try switch (self) {
             .heartbeat_info => |value| writeTLV(ParameterType.heartbeat_info, value, buffer),
             .state_cookie => |value| writeTLV(ParameterType.state_cookie, value, buffer),
+            .supported_extensions => |value| writeTLV(ParameterType.supported_extensions, std.mem.sliceAsBytes(value), buffer),
             .unknown => |param| writeTLV(@enumFromInt(param.param_type), param.value, buffer),
         };
     }
@@ -451,6 +454,7 @@ pub const ParameterIterator = struct {
         return switch (param_type) {
             .heartbeat_info => .{ .heartbeat_info = value },
             .state_cookie => .{ .state_cookie = value },
+            .supported_extensions => .{ .supported_extensions = std.mem.bytesAsSlice(ChunkType, value) },
             else => .{ .unknown = .{ .param_type = @intFromEnum(param_type), .value = value } },
         };
     }
@@ -720,10 +724,27 @@ test "ChunkIterator: skips known unhandled chunks" {
     try std.testing.expect(chunk == .cookie_ack);
 }
 
-test "ParameterIterator rejects lengths shorter than the header" {
+test "ParameterIterator: rejects lengths shorter than the header" {
     for (0..4) |length| {
         const data = [_]u8{ 0x00, 0x01, 0x00, @intCast(length), 0x00, 0x00, 0x00, 0x00 };
         var it = ParameterIterator.init(&data);
         try std.testing.expectError(error.InvalidParameter, it.next());
     }
+}
+
+test "ParameterIterator: round-trip supported extensions parameter" {
+    const data = [_]u8{
+        0x80,                                  0x08,                             0x00,                               0x07,
+        @intFromEnum(ChunkType.heartbeat_ack), @intFromEnum(ChunkType.shutdown), @intFromEnum(ChunkType.cookie_ack), 0,
+    };
+
+    var it = ParameterIterator.init(data[0..]);
+    const param = (try it.next()).?;
+
+    try std.testing.expect(param == .supported_extensions);
+    try std.testing.expectEqualSlices(ChunkType, &.{ .heartbeat_ack, .shutdown, .cookie_ack }, param.supported_extensions);
+
+    var buffer: [16]u8 = undefined;
+    const n = try param.writeBuffer(&buffer);
+    try std.testing.expectEqualSlices(u8, &data, buffer[0..n]);
 }
