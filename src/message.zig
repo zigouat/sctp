@@ -508,7 +508,23 @@ pub const Parameter = union(enum) {
             .state_cookie => |value| writeTLV(ParameterType.state_cookie, value, buffer),
             .supported_extensions => |value| writeTLV(ParameterType.supported_extensions, std.mem.sliceAsBytes(value), buffer),
             .unknown => |param| writeTLV(@enumFromInt(param.param_type), param.value, buffer),
-            else => @panic("Must not be called"),
+            .reconfig_response => |resp| blk: {
+                std.debug.assert((resp.sender_next_tsn == null) == (resp.receiver_next_tsn == null));
+                const size: usize = if (resp.sender_next_tsn != null) 16 else 8;
+                if (size > buffer.len) return error.WriteFailed;
+
+                std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ParameterType.reconfig_response), .big);
+                std.mem.writeInt(u16, buffer[2..4], @intCast(size + 4), .big);
+                std.mem.writeInt(u32, buffer[4..8], resp.resp_seq_num, .big);
+                std.mem.writeInt(u32, buffer[8..12], @intFromEnum(resp.result), .big);
+                if (resp.sender_next_tsn) |_| {
+                    std.mem.writeInt(u32, buffer[12..16], resp.sender_next_tsn.?, .big);
+                    std.mem.writeInt(u32, buffer[16..20], resp.receiver_next_tsn.?, .big);
+                }
+
+                break :blk size + 8;
+            },
+            else => unreachable,
         };
     }
 
@@ -876,4 +892,104 @@ test "ReConfigResponse.parse" {
         try std.testing.expectError(error.InvalidParameter, ReConfigResponse.parse(&data));
         try std.testing.expectError(error.InvalidParameter, ReConfigResponse.parse(data[0..8]));
     }
+}
+
+test "Parameter.writeBuffer" {
+    // Length excludes the padding
+    {
+        const param = Parameter{ .heartbeat_info = "hello" };
+        var buffer: [16]u8 = @splat(0xff);
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(12, n);
+        try std.testing.expectEqualSlices(u8, &.{
+            0x00, 0x01, 0x00, 0x09, 'h', 'e', 'l', 'l',
+            'o',  0x00, 0x00, 0x00,
+        }, buffer[0..n]);
+        try std.testing.expectEqual(0xff, buffer[n]);
+    }
+
+    {
+        const param = Parameter{ .state_cookie = "abcd" };
+        var buffer: [8]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(8, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x07, 0x00, 0x08, 'a', 'b', 'c', 'd' }, &buffer);
+    }
+
+    {
+        const param = Parameter{ .unknown = .{ .param_type = 0x8001, .value = "" } };
+        var buffer: [4]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(4, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0x80, 0x01, 0x00, 0x04 }, &buffer);
+    }
+
+    {
+        const param = Parameter{ .reconfig_response = .{
+            .resp_seq_num = 42,
+            .result = .success_performed,
+            .sender_next_tsn = null,
+            .receiver_next_tsn = null,
+        } };
+        var buffer: [12]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(12, n);
+        try std.testing.expectEqualSlices(u8, &.{
+            0x00, 0x10, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x2A,
+            0x00, 0x00, 0x00, 0x01,
+        }, &buffer);
+    }
+
+    // With the optional sender and receiver next tsn
+    {
+        const param = Parameter{ .reconfig_response = .{
+            .resp_seq_num = 42,
+            .result = .denied,
+            .sender_next_tsn = 10,
+            .receiver_next_tsn = 20,
+        } };
+        var buffer: [20]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(20, n);
+        try std.testing.expectEqualSlices(u8, &.{
+            0x00, 0x10, 0x00, 0x14, 0x00, 0x00, 0x00, 0x2A,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0A,
+            0x00, 0x00, 0x00, 0x14,
+        }, &buffer);
+    }
+
+    // Buffer too small, including when only the padding doesn't fit
+    {
+        const param = Parameter{ .heartbeat_info = "hello" };
+        var buffer: [11]u8 = undefined;
+        try std.testing.expectError(error.WriteFailed, param.writeBuffer(&buffer));
+        try std.testing.expectError(error.WriteFailed, param.writeBuffer(buffer[0..3]));
+    }
+}
+
+test "Parameter.writeBuffer round trip through ParameterIterator" {
+    const params = [_]Parameter{
+        .{ .heartbeat_info = "hb" },
+        .{ .reconfig_response = .{
+            .resp_seq_num = 7,
+            .result = .in_progress,
+            .sender_next_tsn = 0xfffffffe,
+            .receiver_next_tsn = 1,
+        } },
+        .{ .unknown = .{ .param_type = 0x4002, .value = "xyz" } },
+    };
+
+    var buffer: [64]u8 = undefined;
+    var n: usize = 0;
+    for (params) |param| n += try param.writeBuffer(buffer[n..]);
+
+    var it = ParameterIterator.init(buffer[0..n]);
+    try std.testing.expectEqualSlices(u8, "hb", (try it.next()).?.heartbeat_info);
+    try std.testing.expectEqualDeep(params[1].reconfig_response, (try it.next()).?.reconfig_response);
+
+    const unknown = (try it.next()).?.unknown;
+    try std.testing.expectEqual(0x4002, unknown.param_type);
+    try std.testing.expectEqualSlices(u8, "xyz", unknown.value);
+
+    try std.testing.expectEqual(null, try it.next());
 }

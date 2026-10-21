@@ -78,10 +78,16 @@ const Response = struct {
     result: message.ReConfigResponse.Result,
 
     fn write(response: *const Response, buffer: []u8) void {
-        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.reconfig_response), .big);
-        std.mem.writeInt(u16, buffer[2..4], message.reconfig_response_size, .big);
-        std.mem.writeInt(u32, buffer[4..8], response.seq_num, .big);
-        std.mem.writeInt(u32, buffer[8..12], @intFromEnum(response.result), .big);
+        const reconfig_response = message.Parameter{
+            .reconfig_response = .{
+                .result = response.result,
+                .resp_seq_num = response.seq_num,
+                .receiver_next_tsn = null,
+                .sender_next_tsn = null,
+            },
+        };
+
+        _ = message.Parameter.writeBuffer(reconfig_response, buffer) catch unreachable;
     }
 };
 
