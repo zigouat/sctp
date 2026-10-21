@@ -31,9 +31,12 @@ pub const Event = union(enum) {
     comm_up: void,
     comm_down: void,
     buffered_amount_low_threshold: u16,
-    outgoing_stream_reset: u16,
-    outgoing_stream_reset_failed: u16,
-    incoming_stream_reset: u16,
+    /// The reset stream, `null` means all the streams.
+    outgoing_stream_reset: ?u16,
+    /// The stream whose reset failed, `null` means all the streams.
+    outgoing_stream_reset_failed: ?u16,
+    /// The reset stream, `null` means all the streams.
+    incoming_stream_reset: ?u16,
 };
 
 pub const MessageIterator = struct {
@@ -397,7 +400,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                         if (streams) |s| try self.resetIncomingStreams(s);
                     },
                     .incoming_ssn_reset_req => |*req| {
-                        try self.stream_reset.handleIncomingResetRequest(self.allocator, req, &self.message_queue);
+                        try self.stream_reset.handleIncomingResetRequest(self.allocator, req);
                         self.stream_reset.maybeStartTransmitting(&self.message_queue);
                     },
                     else => {},
@@ -786,6 +789,7 @@ fn maybeSendShutdown(self: *Association) !void {
 fn resetIncomingStreams(self: *Association, streams: []u16) !void {
     defer self.allocator.free(streams);
     self.message_assembler.resetStreams(streams);
+    if (streams.len == 0) return try self.events.pushBack(self.allocator, .{ .incoming_stream_reset = null });
 
     try self.events.ensureUnusedCapacity(self.allocator, streams.len);
     for (streams) |stream_id| self.events.pushBackAssumeCapacity(.{ .incoming_stream_reset = stream_id });
@@ -796,15 +800,19 @@ fn handleReconfigResponse(self: *Association, resp: *const message.ReConfigRespo
     const result = self.stream_reset.handleResponse(resp, &streams) orelse return;
     self.stream_reset.maybeStartTransmitting(&self.message_queue);
     if (result.part == .incoming) return;
-    if (result.succeeded) {
-        // reset streams of message queue
-    }
+    if (result.succeeded) self.message_queue.resetStreams(result.streams);
 
     while (self.stream_reset.popMessage()) |user_msg| {
         try self.message_queue.pushUserMessage(self.allocator, &user_msg);
     }
 
-    // events
+    if (result.streams.len == 0) {
+        return self.events.pushBack(
+            self.allocator,
+            if (result.succeeded) .{ .outgoing_stream_reset = null } else .{ .outgoing_stream_reset_failed = null },
+        );
+    }
+
     try self.events.ensureUnusedCapacity(self.allocator, result.streams.len);
     for (result.streams) |stream_id| {
         if (result.succeeded)

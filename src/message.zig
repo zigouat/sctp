@@ -511,7 +511,7 @@ pub const Parameter = union(enum) {
             .reconfig_response => |resp| blk: {
                 std.debug.assert((resp.sender_next_tsn == null) == (resp.receiver_next_tsn == null));
                 const size: usize = if (resp.sender_next_tsn != null) 16 else 8;
-                if (size > buffer.len) return error.WriteFailed;
+                if (size + 4 > buffer.len) return error.WriteFailed;
 
                 std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ParameterType.reconfig_response), .big);
                 std.mem.writeInt(u16, buffer[2..4], @intCast(size + 4), .big);
@@ -522,7 +522,7 @@ pub const Parameter = union(enum) {
                     std.mem.writeInt(u32, buffer[16..20], resp.receiver_next_tsn.?, .big);
                 }
 
-                break :blk size + 8;
+                break :blk size + 4;
             },
             else => unreachable,
         };

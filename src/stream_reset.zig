@@ -104,6 +104,8 @@ const SeqNumCheck = enum { new, retransmission, bad };
 streams: std.AutoHashMapUnmanaged(u16, void),
 /// Streams of the queued requests in order.
 request_streams: std.Deque(u16),
+/// Set when a request is queued to reset all the streams.
+reset_all_streams: bool,
 /// Only the front request is in flight (RFC6525 - 5.1.1).
 requests: std.Deque(Request),
 /// Messages written to resetting streams, held until the reset completes.
@@ -123,6 +125,7 @@ pub fn init(initial_tsn: u32) StreamReset {
     return .{
         .streams = .empty,
         .request_streams = .empty,
+        .reset_all_streams = false,
         .requests = .empty,
         .pending_messages = .empty,
         .req_seq_num = initial_tsn,
@@ -150,11 +153,9 @@ pub fn setPeerInitTsn(self: *StreamReset, init_tsn: u32) void {
 
 pub const ResetError = Allocator.Error || error{TooManyStreams};
 
-/// Queue a reset of `streams` in our outgoing direction, the peer's outgoing direction, or both. A request holds
-/// `max_streams` streams at most.
 pub fn resetStreams(self: *StreamReset, allocator: Allocator, streams: []const u16, direction: Direction) ResetError!void {
     if (streams.len > max_streams) return error.TooManyStreams;
-    if (streams.len == 0 or direction == Direction.unset) return;
+    if (direction == Direction.unset) return;
     try self.queueRequest(allocator, streams, direction, self.resp_seq_num, false);
 }
 
@@ -162,7 +163,7 @@ pub fn resetStreams(self: *StreamReset, allocator: Allocator, streams: []const u
 ///
 /// Returns `false` if the stream is not resetting, the message is not buffered and can be sent right away.
 pub fn bufferMessage(self: *StreamReset, allocator: Allocator, data: []const u8, config: message.UserMessageConfig) Allocator.Error!bool {
-    if (self.streams.size == 0 or !self.streams.contains(config.stream_id)) {
+    if (!self.reset_all_streams and (self.streams.size == 0 or !self.streams.contains(config.stream_id))) {
         @branchHint(.likely);
         return false;
     }
@@ -180,6 +181,7 @@ pub fn bufferMessage(self: *StreamReset, allocator: Allocator, data: []const u8,
 
 /// Pop the oldest buffered message whose stream finished resetting, the caller owns the message.
 pub fn popMessage(self: *StreamReset) ?message.UserMessage {
+    if (self.reset_all_streams) return null;
     for (self.pending_messages.items, 0..) |msg, index| {
         if (!self.streams.contains(msg.stream_id)) return self.pending_messages.orderedRemove(index);
     }
@@ -193,7 +195,7 @@ pub fn maybeStartTransmitting(self: *StreamReset, msg_queue: *const MessageQueue
     if (request.flags.direction.outgoing) {
         // Messages before `curr_msg` are fully assigned TSNs, the one at `curr_msg` may be partially sent.
         for (msg_queue.curr_msg..msg_queue.messages.len) |index| {
-            if (self.streams.contains(msg_queue.messages.atPtr(index).stream_id)) return;
+            if (request.stream_count == 0 or self.streams.contains(msg_queue.messages.atPtr(index).stream_id)) return;
         }
         request.last_assigned_tsn = msg_queue.curr_tsn -% 1;
     }
@@ -297,7 +299,6 @@ pub fn handleIncomingResetRequest(
     self: *StreamReset,
     allocator: Allocator,
     request: *const message.IncomingSsnResetRequest,
-    msg_queue: *const MessageQueue,
 ) Allocator.Error!void {
     switch (self.checkSeqNum(request.req_seq_num)) {
         .new => {},
@@ -318,21 +319,15 @@ pub fn handleIncomingResetRequest(
         return;
     }
 
-    const count: u32 = if (request.countStreams() != 0) request.countStreams() else msg_queue.streams.count();
-    if (count == 0 or count > max_streams) {
+    const count: u32 = request.countStreams();
+    if (count > max_streams) {
         self.resp_seq_num = request.req_seq_num;
-        self.pushResponse(request.req_seq_num, if (count == 0) .success_nothing_to_do else .denied);
+        self.pushResponse(request.req_seq_num, .denied);
         return;
     }
 
     var streams: [max_streams]u16 = undefined;
-    if (request.countStreams() != 0) {
-        for (streams[0..count], 0..) |*stream, index| stream.* = request.getStreamAt(@intCast(index));
-    } else {
-        var it = msg_queue.streams.keyIterator();
-        var index: u32 = 0;
-        while (it.next()) |stream| : (index += 1) streams[index] = stream.*;
-    }
+    for (streams[0..count], 0..) |*stream, index| stream.* = request.getStreamAt(@intCast(index));
 
     try self.queueRequest(allocator, streams[0..count], .{ .outgoing = true, .incoming = false }, request.req_seq_num, true);
     self.resp_seq_num = request.req_seq_num;
@@ -413,13 +408,16 @@ fn queueRequest(
     resp_seq_num: u32,
     implicit_response: bool,
 ) Allocator.Error!void {
-    std.debug.assert(streams.len <= max_streams);
-    if (direction.outgoing) try self.streams.ensureUnusedCapacity(allocator, @intCast(streams.len));
+    if (direction.outgoing and streams.len != 0) try self.streams.ensureUnusedCapacity(allocator, @intCast(streams.len));
     try self.requests.ensureUnusedCapacity(allocator, 1);
     try self.request_streams.ensureUnusedCapacity(allocator, streams.len);
 
     if (direction.outgoing) for (streams) |stream| self.streams.putAssumeCapacity(stream, {});
-    self.request_streams.pushBackSliceAssumeCapacity(streams);
+    if (direction.outgoing and streams.len == 0)
+        self.reset_all_streams = true
+    else
+        self.request_streams.pushBackSliceAssumeCapacity(streams);
+
     self.requests.pushBackAssumeCapacity(.{
         .seq_num = self.req_seq_num,
         .resp_seq_num = resp_seq_num,
@@ -450,12 +448,20 @@ fn completePart(self: *StreamReset) void {
 
 fn rebuildStreams(self: *StreamReset) void {
     self.streams.clearRetainingCapacity();
+    self.reset_all_streams = false;
 
     var offset: u32 = 0;
     var it = self.requests.iterator();
     while (it.next()) |request| {
         if (request.isOutgoingPending()) {
-            for (offset..offset + request.stream_count) |index| self.streams.putAssumeCapacity(self.request_streams.at(index), {});
+            if (request.stream_count == 0) {
+                self.reset_all_streams = true;
+                return;
+            }
+
+            for (offset..offset + request.stream_count) |index| {
+                self.streams.putAssumeCapacity(self.request_streams.at(index), {});
+            }
         }
         offset += request.stream_count;
     }
@@ -488,4 +494,107 @@ fn pushResponse(self: *StreamReset, seq_num: u32, result: message.ReConfigRespon
     }
     self.responses[self.response_count] = .{ .seq_num = seq_num, .result = result };
     self.response_count += 1;
+}
+
+fn testIsBuffered(self: *StreamReset, stream_id: u16) !bool {
+    return self.bufferMessage(std.testing.allocator, "data", .{ .stream_id = stream_id, .ppid = 0 });
+}
+
+test "StreamReset.resetStreams: queues a request for the outgoing streams" {
+    var stream_reset: StreamReset = .init(10);
+    defer stream_reset.deinit(std.testing.allocator);
+    stream_reset.setPeerInitTsn(100);
+
+    try stream_reset.resetStreams(std.testing.allocator, &.{ 1, 3 }, .{ .outgoing = true, .incoming = false });
+
+    const request = stream_reset.requests.front().?;
+    try std.testing.expectEqual(10, request.seq_num);
+    try std.testing.expectEqual(99, request.resp_seq_num);
+    try std.testing.expectEqual(2, request.stream_count);
+    try std.testing.expectEqual(Direction{ .outgoing = true, .incoming = false }, request.flags.direction);
+    try std.testing.expect(!request.flags.started);
+    try std.testing.expect(!request.flags.implicit_response);
+    try std.testing.expectEqual(11, stream_reset.req_seq_num);
+
+    try std.testing.expect(try testIsBuffered(&stream_reset, 1));
+    try std.testing.expect(try testIsBuffered(&stream_reset, 3));
+    try std.testing.expect(!try testIsBuffered(&stream_reset, 2));
+}
+
+test "StreamReset.resetStreams: both directions use two sequence numbers" {
+    var stream_reset: StreamReset = .init(10);
+    defer stream_reset.deinit(std.testing.allocator);
+
+    try stream_reset.resetStreams(std.testing.allocator, &.{1}, .{ .outgoing = true, .incoming = true });
+    try stream_reset.resetStreams(std.testing.allocator, &.{2}, .{ .outgoing = true, .incoming = false });
+
+    try std.testing.expectEqual(2, stream_reset.requests.len);
+    try std.testing.expectEqual(11, stream_reset.requests.front().?.incomingSeqNum());
+    try std.testing.expectEqual(12, stream_reset.requests.at(1).seq_num);
+    try std.testing.expectEqual(13, stream_reset.req_seq_num);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 2 }, &.{ stream_reset.request_streams.at(0), stream_reset.request_streams.at(1) });
+}
+
+test "StreamReset.resetStreams: incoming streams do not hold back outgoing messages" {
+    var stream_reset: StreamReset = .init(10);
+    defer stream_reset.deinit(std.testing.allocator);
+
+    // Specific streams
+    try stream_reset.resetStreams(std.testing.allocator, &.{1}, .{ .outgoing = false, .incoming = true });
+    try std.testing.expect(!try testIsBuffered(&stream_reset, 1));
+
+    // All the streams
+    try stream_reset.resetStreams(std.testing.allocator, &.{}, .{ .outgoing = false, .incoming = true });
+    try std.testing.expect(!stream_reset.reset_all_streams);
+    try std.testing.expect(!try testIsBuffered(&stream_reset, 1));
+
+    try std.testing.expectEqual(2, stream_reset.requests.len);
+    try std.testing.expectEqual(12, stream_reset.req_seq_num);
+}
+
+test "StreamReset.resetStreams: an empty stream list resets all the outgoing streams" {
+    var stream_reset: StreamReset = .init(10);
+    defer stream_reset.deinit(std.testing.allocator);
+
+    try stream_reset.resetStreams(std.testing.allocator, &.{}, .{ .outgoing = true, .incoming = false });
+
+    try std.testing.expect(stream_reset.reset_all_streams);
+    try std.testing.expectEqual(0, stream_reset.requests.front().?.stream_count);
+    try std.testing.expectEqual(0, stream_reset.request_streams.len);
+    try std.testing.expect(try testIsBuffered(&stream_reset, 1));
+    try std.testing.expect(try testIsBuffered(&stream_reset, 0xFFFF));
+    try std.testing.expectEqual(null, stream_reset.popMessage());
+}
+
+test "StreamReset.resetStreams: rejected requests are not queued" {
+    var stream_reset: StreamReset = .init(10);
+    defer stream_reset.deinit(std.testing.allocator);
+
+    // Too many streams
+    {
+        const streams: [max_streams + 1]u16 = @splat(1);
+        try std.testing.expectError(
+            error.TooManyStreams,
+            stream_reset.resetStreams(std.testing.allocator, &streams, .{ .outgoing = true, .incoming = false }),
+        );
+    }
+
+    // No direction
+    try stream_reset.resetStreams(std.testing.allocator, &.{1}, .unset);
+
+    try std.testing.expectEqual(0, stream_reset.requests.len);
+    try std.testing.expectEqual(10, stream_reset.req_seq_num);
+    try std.testing.expect(!try testIsBuffered(&stream_reset, 1));
+}
+
+test "StreamReset.resetStreams: accepts the maximum number of streams" {
+    var stream_reset: StreamReset = .init(10);
+    defer stream_reset.deinit(std.testing.allocator);
+
+    var streams: [max_streams]u16 = undefined;
+    for (&streams, 0..) |*stream, index| stream.* = @intCast(index);
+    try stream_reset.resetStreams(std.testing.allocator, &streams, .{ .outgoing = true, .incoming = false });
+
+    try std.testing.expectEqual(max_streams, stream_reset.requests.front().?.stream_count);
+    try std.testing.expectEqual(max_streams, stream_reset.streams.count());
 }

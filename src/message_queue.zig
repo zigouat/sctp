@@ -148,6 +148,18 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     };
 }
 
+pub fn resetStreams(self: *MessageQueue, streams: []const u16) void {
+    if (streams.len == 0) {
+        var it = self.streams.valueIterator();
+        while (it.next()) |state| state.stream_seq = 0;
+        return;
+    }
+
+    for (streams) |stream| if (self.streams.getPtr(stream)) |state| {
+        state.stream_seq = 0;
+    };
+}
+
 pub fn bufferedAmount(self: *const MessageQueue, stream_id: u16) ?u32 {
     return if (self.streams.getPtr(stream_id)) |stream| stream.buffered else null;
 }
