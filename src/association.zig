@@ -270,8 +270,8 @@ pub fn setBufferedAmountLowThreshold(self: *Association, stream: u16, threshold:
     return self.message_queue.setBufferedAmountLowThreshold(self.allocator, stream, threshold);
 }
 
-pub fn resetStreams(self: *Association, streams: []const u16) !void {
-    try self.stream_reset.resetStreams(self.allocator, streams);
+pub fn resetStreams(self: *Association, streams: []const u16, direction: StreamReset.Direction) !void {
+    try self.stream_reset.resetStreams(self.allocator, streams, direction);
     self.stream_reset.maybeStartTransmitting(&self.message_queue);
 }
 
@@ -392,7 +392,13 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                     .outgoing_ssn_reset_req => |*req| {
                         const cumulative_tsn = self.message_assembler.getCumulativeTsn();
                         const streams = try self.stream_reset.handleOutgoingResetRequest(self.allocator, req, cumulative_tsn);
+                        // The request may answer our Incoming SSN Reset Request and complete the front request
+                        self.stream_reset.maybeStartTransmitting(&self.message_queue);
                         if (streams) |s| try self.resetIncomingStreams(s);
+                    },
+                    .incoming_ssn_reset_req => |*req| {
+                        try self.stream_reset.handleIncomingResetRequest(self.allocator, req, &self.message_queue);
+                        self.stream_reset.maybeStartTransmitting(&self.message_queue);
                     },
                     else => {},
                 };
@@ -786,9 +792,10 @@ fn resetIncomingStreams(self: *Association, streams: []u16) !void {
 }
 
 fn handleReconfigResponse(self: *Association, resp: *const message.ReConfigResponse) !void {
-    const result = self.stream_reset.handleResponse(resp) orelse return;
-    defer self.allocator.free(result.streams);
+    var streams: [StreamReset.max_streams]u16 = undefined;
+    const result = self.stream_reset.handleResponse(resp, &streams) orelse return;
     self.stream_reset.maybeStartTransmitting(&self.message_queue);
+    if (result.part == .incoming) return;
     if (result.succeeded) {
         // reset streams of message queue
     }
@@ -1893,4 +1900,74 @@ test "Association.handleRead: the peer's outgoing stream reset restarts the inco
         const read = try testRead(&assoc, testDataPacket2(&assoc, testStreamData(tsn +% 1, 1, 0), &buffer), 0, &lens);
         try testing.expectEqualSlices(usize, &.{4}, read);
     }
+}
+
+fn testReconfigPacket(assoc: *const Association, buffer: []u8, params: []const u8) []const u8 {
+    assoc.writeCommonHeader(buffer);
+    const chunk = buffer[message.packet_header_size..];
+    chunk[0] = @intFromEnum(message.ChunkType.reconfig);
+    chunk[1] = 0;
+    std.mem.writeInt(u16, chunk[2..4], @intCast(4 + params.len), .big);
+    @memcpy(chunk[4..][0..params.len], params);
+
+    const size = message.packet_header_size + std.mem.alignForward(usize, 4 + params.len, 4);
+    @memset(buffer[message.packet_header_size + 4 + params.len .. size], 0);
+    Helper.checkSum(buffer[0..size]);
+    return buffer[0..size];
+}
+
+test "Association.handleRead: a data channel close resets the stream in both directions" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    assoc.stream_reset.setPeerInitTsn(assoc.initial_tsn);
+    const tsn = assoc.initial_tsn;
+
+    var buffer: [64]u8 = undefined;
+    var out: [message.MTU]u8 = undefined;
+    var lens: [4]usize = undefined;
+
+    // Outgoing SSN Reset Request (seq N) and Incoming SSN Reset Request (seq N + 1) for stream 1
+    var params: [32]u8 = undefined;
+    std.mem.writeInt(u16, params[0..2], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
+    std.mem.writeInt(u16, params[2..4], 18, .big);
+    std.mem.writeInt(u32, params[4..8], tsn, .big);
+    std.mem.writeInt(u32, params[8..12], 0, .big);
+    std.mem.writeInt(u32, params[12..16], tsn -% 1, .big);
+    std.mem.writeInt(u16, params[16..18], 1, .big);
+    @memset(params[18..20], 0);
+    std.mem.writeInt(u16, params[20..22], @intFromEnum(message.ParameterType.incoming_ssn_reset_req), .big);
+    std.mem.writeInt(u16, params[22..24], 10, .big);
+    std.mem.writeInt(u32, params[24..28], tsn +% 1, .big);
+    std.mem.writeInt(u16, params[28..30], 1, .big);
+    @memset(params[30..32], 0);
+
+    _ = try testRead(&assoc, testReconfigPacket(&assoc, &buffer, params[0..30]), 0, &lens);
+    try testing.expectEqual(Event{ .incoming_stream_reset = 1 }, assoc.pollEvent().?);
+    try testing.expectEqual(null, assoc.pollEvent());
+
+    // The response to seq N bundled with our request, which answers seq N + 1
+    const packet = try message.Packet.parse((try assoc.pollTransmit(&out, 0)).?);
+    var chunk_it = packet.iterateChunks();
+    var reconfig = (try chunk_it.next()).?.reconfig;
+    try testing.expectEqual(null, try chunk_it.next());
+
+    const response = (try reconfig.next()).?.reconfig_response;
+    try testing.expectEqual(tsn, response.resp_seq_num);
+    try testing.expectEqual(.success_performed, response.result);
+
+    const request = (try reconfig.next()).?.outgoing_ssn_reset_req;
+    try testing.expectEqual(tsn +% 1, request.resp_seq_num);
+    try testing.expectEqual(1, request.countStreams());
+    try testing.expectEqual(1, request.getStreamAt(0));
+    try testing.expectEqual(null, try reconfig.next());
+
+    // The peer accepts our request
+    var response_param: [12]u8 = undefined;
+    std.mem.writeInt(u16, response_param[0..2], @intFromEnum(message.ParameterType.reconfig_response), .big);
+    std.mem.writeInt(u16, response_param[2..4], 12, .big);
+    std.mem.writeInt(u32, response_param[4..8], request.req_seq_num, .big);
+    std.mem.writeInt(u32, response_param[8..12], @intFromEnum(message.ReConfigResponse.Result.success_performed), .big);
+
+    _ = try testRead(&assoc, testReconfigPacket(&assoc, &buffer, &response_param), 0, &lens);
+    try testing.expectEqual(Event{ .outgoing_stream_reset = 1 }, assoc.pollEvent().?);
 }

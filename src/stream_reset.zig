@@ -6,37 +6,108 @@ const MessageQueue = @import("message_queue.zig");
 const StreamReset = @This();
 const Allocator = std.mem.Allocator;
 
-/// A RE-CONFIG chunk bundling a Re-configuration Response and an Outgoing SSN Reset Request must fit in a packet.
-const max_streams_per_request = (message.PMDCS - 4 - 12 - 16) / 2;
+pub const max_streams = 128;
 
+pub const Direction = packed struct(u2) {
+    outgoing: bool,
+    incoming: bool,
+
+    pub const unset = Direction{ .outgoing = false, .incoming = false };
+};
+
+/// Resetting both directions sends an Outgoing and an Incoming SSN Reset Request for the same streams together
+/// (RFC6525 - 3.1), the outgoing part uses `seq_num` and the incoming part the next one.
 const Request = struct {
-    streams: []u16,
     seq_num: u32,
-    /// Set on the first send, a retransmission must carry the same value.
-    last_assigned_tsn: ?u32,
+    resp_seq_num: u32,
+    last_assigned_tsn: u32,
+    stream_count: u8,
+    flags: packed struct(u8) {
+        direction: Direction,
+        done: Direction = .unset,
+        /// The last assigned TSN is set, or the request has no outgoing part.
+        started: bool = false,
+        /// Answers the peer's Incoming SSN Reset Request (RFC6525 - 5.2.3).
+        implicit_response: bool,
+        _: u2 = 0,
+    },
+
+    fn incomingSeqNum(request: *const Request) u32 {
+        return request.seq_num +% @intFromBool(request.flags.direction.outgoing);
+    }
+
+    fn isOutgoingPending(request: *const Request) bool {
+        return request.flags.direction.outgoing and !request.flags.done.outgoing;
+    }
+
+    fn isIncomingPending(request: *const Request) bool {
+        return request.flags.direction.incoming and !request.flags.done.incoming;
+    }
+
+    /// `streams_it` starts at the request's streams, `buffer` holds the parameter and its padding.
+    fn writeOutgoingRequest(request: *const Request, streams_it: std.Deque(u16).Iterator, buffer: []u8) void {
+        const param_length: u32 = 16 + 2 * @as(u32, request.stream_count);
+
+        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
+        std.mem.writeInt(u16, buffer[2..4], @intCast(param_length), .big);
+        std.mem.writeInt(u32, buffer[4..8], request.seq_num, .big);
+        std.mem.writeInt(u32, buffer[8..12], request.resp_seq_num, .big);
+        std.mem.writeInt(u32, buffer[12..16], request.last_assigned_tsn, .big);
+
+        var it = streams_it;
+        for (0..request.stream_count) |index| std.mem.writeInt(u16, buffer[16 + 2 * index ..][0..2], it.next().?, .big);
+        @memset(buffer[param_length..], 0);
+    }
+
+    /// `streams_it` starts at the request's streams, `buffer` holds the parameter and its padding.
+    fn writeIncomingRequest(request: *const Request, streams_it: std.Deque(u16).Iterator, buffer: []u8) void {
+        const param_length: u32 = 8 + 2 * @as(u32, request.stream_count);
+
+        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.incoming_ssn_reset_req), .big);
+        std.mem.writeInt(u16, buffer[2..4], @intCast(param_length), .big);
+        std.mem.writeInt(u32, buffer[4..8], request.incomingSeqNum(), .big);
+
+        var it = streams_it;
+        for (0..request.stream_count) |index| std.mem.writeInt(u16, buffer[8 + 2 * index ..][0..2], it.next().?, .big);
+        @memset(buffer[param_length..], 0);
+    }
 };
 
 const Response = struct {
     seq_num: u32,
     result: message.ReConfigResponse.Result,
+
+    fn write(response: *const Response, buffer: []u8) void {
+        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.reconfig_response), .big);
+        std.mem.writeInt(u16, buffer[2..4], message.reconfig_response_size, .big);
+        std.mem.writeInt(u32, buffer[4..8], response.seq_num, .big);
+        std.mem.writeInt(u32, buffer[8..12], @intFromEnum(response.result), .big);
+    }
 };
 
 const Deferred = struct {
     streams: []u16,
     last_assigned_tsn: u32,
+    seq_num: u32,
 };
 
-/// Streams with a queued or in-flight outgoing reset.
+const SeqNumCheck = enum { new, retransmission, bad };
+
+/// Streams with a pending outgoing reset, rebuilt from `requests` when an outgoing part completes since a stream may
+/// be in several requests.
 streams: std.AutoHashMapUnmanaged(u16, void),
-/// Messages written to resetting streams, held until the reset completes.
-pending_messages: std.ArrayList(message.UserMessage),
+/// Streams of the queued requests in order.
+request_streams: std.Deque(u16),
 /// Only the front request is in flight (RFC6525 - 5.1.1).
 requests: std.Deque(Request),
+/// Messages written to resetting streams, held until the reset completes.
+pending_messages: std.ArrayList(message.UserMessage),
 req_seq_num: u32,
 /// Sequence number of the last processed peer request, starts at the peer's initial TSN - 1 (RFC6525 - 4.1).
 resp_seq_num: u32,
-response: Response,
-send_response: bool,
+/// Responses to send, a RE-CONFIG chunk carries two of them at most (RFC6525 - 3.1).
+responses: [2]Response,
+response_count: u8,
 /// Peer reset performed once the cumulative TSN reaches the peer's last assigned TSN (RFC6525 - 5.2.2).
 deferred: ?Deferred,
 deadline: i64,
@@ -45,12 +116,13 @@ retransmit: bool,
 pub fn init(initial_tsn: u32) StreamReset {
     return .{
         .streams = .empty,
-        .pending_messages = .empty,
+        .request_streams = .empty,
         .requests = .empty,
+        .pending_messages = .empty,
         .req_seq_num = initial_tsn,
         .resp_seq_num = 0,
-        .response = .{ .seq_num = 0, .result = .success_nothing_to_do },
-        .send_response = false,
+        .responses = undefined,
+        .response_count = 0,
         .deferred = null,
         .deadline = std.math.maxInt(i64),
         .retransmit = false,
@@ -59,10 +131,10 @@ pub fn init(initial_tsn: u32) StreamReset {
 
 pub fn deinit(self: *StreamReset, allocator: Allocator) void {
     self.streams.deinit(allocator);
+    self.request_streams.deinit(allocator);
+    self.requests.deinit(allocator);
     for (self.pending_messages.items) |msg| msg.deinit(allocator);
     self.pending_messages.deinit(allocator);
-    while (self.requests.popFront()) |request| allocator.free(request.streams);
-    self.requests.deinit(allocator);
     if (self.deferred) |deferred| allocator.free(deferred.streams);
 }
 
@@ -70,41 +142,14 @@ pub fn setPeerInitTsn(self: *StreamReset, init_tsn: u32) void {
     self.resp_seq_num = init_tsn -% 1;
 }
 
-/// Queue an outgoing reset of `streams`, streams that are already resetting are skipped.
-pub fn resetStreams(self: *StreamReset, allocator: Allocator, streams: []const u16) Allocator.Error!void {
-    try self.streams.ensureUnusedCapacity(allocator, @intCast(streams.len));
-    const new_streams = try allocator.alloc(u16, streams.len);
-    defer allocator.free(new_streams);
+pub const ResetError = Allocator.Error || error{TooManyStreams};
 
-    var count: u32 = 0;
-    for (streams) |stream| {
-        if (self.streams.contains(stream)) continue;
-        self.streams.putAssumeCapacity(stream, {});
-        new_streams[count] = stream;
-        count += 1;
-    }
-    errdefer for (new_streams[0..count]) |stream| {
-        _ = self.streams.remove(stream);
-    };
-    if (count == 0) return;
-
-    const request_count = std.math.divCeil(u32, count, max_streams_per_request) catch unreachable;
-    try self.requests.ensureUnusedCapacity(allocator, request_count);
-
-    var pushed: u32 = 0;
-    errdefer for (0..pushed) |_| allocator.free(self.requests.popBack().?.streams);
-
-    var start: u32 = 0;
-    while (start < count) : (start += max_streams_per_request) {
-        const end = @min(start + max_streams_per_request, count);
-        self.requests.pushBackAssumeCapacity(.{
-            .streams = try allocator.dupe(u16, new_streams[start..end]),
-            .seq_num = self.req_seq_num +% pushed,
-            .last_assigned_tsn = null,
-        });
-        pushed += 1;
-    }
-    self.req_seq_num +%= pushed;
+/// Queue a reset of `streams` in our outgoing direction, the peer's outgoing direction, or both. A request holds
+/// `max_streams` streams at most.
+pub fn resetStreams(self: *StreamReset, allocator: Allocator, streams: []const u16, direction: Direction) ResetError!void {
+    if (streams.len > max_streams) return error.TooManyStreams;
+    if (streams.len == 0 or direction == Direction.unset) return;
+    try self.queueRequest(allocator, streams, direction, self.resp_seq_num, false);
 }
 
 /// Buffer a message written to a resetting stream, the `data` is copied internally.
@@ -137,39 +182,56 @@ pub fn popMessage(self: *StreamReset) ?message.UserMessage {
 
 pub fn maybeStartTransmitting(self: *StreamReset, msg_queue: *const MessageQueue) void {
     const request = self.requests.frontPtr() orelse return;
-    if (request.last_assigned_tsn != null) return;
+    if (request.flags.started) return;
 
-    // Messages before `curr_msg` are fully assigned TSNs, the one at `curr_msg` may be partially sent.
-    for (msg_queue.curr_msg..msg_queue.messages.len) |index| {
-        if (self.streams.contains(msg_queue.messages.atPtr(index).stream_id)) return;
+    if (request.flags.direction.outgoing) {
+        // Messages before `curr_msg` are fully assigned TSNs, the one at `curr_msg` may be partially sent.
+        for (msg_queue.curr_msg..msg_queue.messages.len) |index| {
+            if (self.streams.contains(msg_queue.messages.atPtr(index).stream_id)) return;
+        }
+        request.last_assigned_tsn = msg_queue.curr_tsn -% 1;
     }
-    request.last_assigned_tsn = msg_queue.curr_tsn -% 1;
+    request.flags.started = true;
     self.retransmit = true;
 }
 
 pub const ResponseResult = struct {
     streams: []u16,
+    part: Part,
     succeeded: bool,
+
+    pub const Part = enum { outgoing, incoming };
 };
 
-pub fn handleResponse(self: *StreamReset, response: *const message.ReConfigResponse) ?ResponseResult {
+/// Handle the peer's response to a part of our in flight request, the request's streams are copied into `out`.
+pub fn handleResponse(self: *StreamReset, response: *const message.ReConfigResponse, out: *[max_streams]u16) ?ResponseResult {
     const request = self.requests.frontPtr() orelse return null;
-    if (request.last_assigned_tsn == null or response.resp_seq_num != request.seq_num) return null;
+    if (!request.flags.started) return null;
 
-    const success = switch (response.result) {
+    const part: ResponseResult.Part = if (request.isOutgoingPending() and response.resp_seq_num == request.seq_num)
+        .outgoing
+    else if (request.isIncomingPending() and response.resp_seq_num == request.incomingSeqNum())
+        .incoming
+    else
+        return null;
+
+    const succeeded = switch (response.result) {
         .success_nothing_to_do, .success_performed => true,
         .in_progress => return null,
         else => false,
     };
 
-    const streams = self.requests.popFront().?.streams;
-    for (streams) |stream| _ = self.streams.remove(stream);
-    self.deadline = std.math.maxInt(i64);
-    self.retransmit = false;
-    return .{
-        .streams = streams,
-        .succeeded = success,
-    };
+    const streams = out[0..request.stream_count];
+    for (streams, 0..) |*stream, index| stream.* = self.request_streams.at(index);
+
+    switch (part) {
+        .outgoing => request.flags.done.outgoing = true,
+        .incoming => request.flags.done.incoming = true,
+    }
+    self.completePart();
+    if (part == .outgoing) self.rebuildStreams();
+
+    return .{ .streams = streams, .part = part, .succeeded = succeeded };
 }
 
 /// Handle the peer's Outgoing SSN Reset Request.
@@ -182,19 +244,30 @@ pub fn handleOutgoingResetRequest(
     request: *const message.OutgoingSsnResetRequest,
     cumulative_tsn: u32,
 ) Allocator.Error!?[]u16 {
-    // RFC6525 - 5.2.1. a retransmitted request gets the same answer, processed requests are either performed or deferred
-    if (request.req_seq_num == self.resp_seq_num) {
-        self.setResponse(self.resp_seq_num, if (self.deferred != null) .in_progress else .success_performed);
-        return null;
+    // The peer's request answers our Incoming SSN Reset Request (RFC6525 - 5.2.3)
+    if (self.requests.frontPtr()) |front| {
+        if (front.flags.started and front.isIncomingPending() and request.resp_seq_num == front.incomingSeqNum()) {
+            front.flags.done.incoming = true;
+            self.completePart();
+        }
     }
 
-    if (request.req_seq_num != self.resp_seq_num +% 1) {
-        self.setResponse(request.req_seq_num, .bad_sequence_number);
-        return null;
+    switch (self.checkSeqNum(request.req_seq_num)) {
+        .new => {},
+        // Processed requests are either performed or deferred
+        .retransmission => {
+            const deferred = if (self.deferred) |deferred| deferred.seq_num == request.req_seq_num else false;
+            self.pushResponse(request.req_seq_num, if (deferred) .in_progress else .success_performed);
+            return null;
+        },
+        .bad => {
+            self.pushResponse(request.req_seq_num, .bad_sequence_number);
+            return null;
+        },
     }
 
     if (self.deferred != null) {
-        self.setResponse(request.req_seq_num, .request_in_progress);
+        self.pushResponse(request.req_seq_num, .request_in_progress);
         return null;
     }
 
@@ -203,13 +276,60 @@ pub fn handleOutgoingResetRequest(
     self.resp_seq_num = request.req_seq_num;
 
     if (Helper.tsnLte(request.last_assigned_tsn, cumulative_tsn)) {
-        self.setResponse(self.resp_seq_num, .success_performed);
+        self.pushResponse(request.req_seq_num, .success_performed);
         return streams;
     }
 
-    self.deferred = .{ .streams = streams, .last_assigned_tsn = request.last_assigned_tsn };
-    self.setResponse(self.resp_seq_num, .in_progress);
+    self.deferred = .{ .streams = streams, .last_assigned_tsn = request.last_assigned_tsn, .seq_num = request.req_seq_num };
+    self.pushResponse(request.req_seq_num, .in_progress);
     return null;
+}
+
+/// Handle the peer's Incoming SSN Reset Request by resetting our outgoing streams, the Outgoing SSN Reset Request we send
+/// for them is the response (RFC6525 - 5.2.3). An empty stream list resets the streams used in `msg_queue`.
+pub fn handleIncomingResetRequest(
+    self: *StreamReset,
+    allocator: Allocator,
+    request: *const message.IncomingSsnResetRequest,
+    msg_queue: *const MessageQueue,
+) Allocator.Error!void {
+    switch (self.checkSeqNum(request.req_seq_num)) {
+        .new => {},
+        .retransmission => {
+            const queued = self.implicitResponseSeqNum() == request.req_seq_num;
+            self.pushResponse(request.req_seq_num, if (queued) .in_progress else .success_performed);
+            return;
+        },
+        .bad => {
+            self.pushResponse(request.req_seq_num, .bad_sequence_number);
+            return;
+        },
+    }
+
+    // The peer must wait for our implicit response before sending a new request (RFC6525 - 5.1.1)
+    if (self.implicitResponseSeqNum() != null) {
+        self.pushResponse(request.req_seq_num, .request_in_progress);
+        return;
+    }
+
+    const count: u32 = if (request.countStreams() != 0) request.countStreams() else msg_queue.streams.count();
+    if (count == 0 or count > max_streams) {
+        self.resp_seq_num = request.req_seq_num;
+        self.pushResponse(request.req_seq_num, if (count == 0) .success_nothing_to_do else .denied);
+        return;
+    }
+
+    var streams: [max_streams]u16 = undefined;
+    if (request.countStreams() != 0) {
+        for (streams[0..count], 0..) |*stream, index| stream.* = request.getStreamAt(@intCast(index));
+    } else {
+        var it = msg_queue.streams.keyIterator();
+        var index: u32 = 0;
+        while (it.next()) |stream| : (index += 1) streams[index] = stream.*;
+    }
+
+    try self.queueRequest(allocator, streams[0..count], .{ .outgoing = true, .incoming = false }, request.req_seq_num, true);
+    self.resp_seq_num = request.req_seq_num;
 }
 
 /// Complete the deferred peer reset once all the data sent before the request is received. The caller owns the returned
@@ -222,7 +342,7 @@ pub fn handleCumulativeTsn(self: *StreamReset, cumulative_tsn: u32) ?[]u16 {
     if (!Helper.tsnLte(deferred.last_assigned_tsn, cumulative_tsn)) return null;
 
     self.deferred = null;
-    self.setResponse(self.resp_seq_num, .success_performed);
+    self.pushResponse(deferred.seq_num, .success_performed);
     return deferred.streams;
 }
 
@@ -236,511 +356,130 @@ pub fn pollTimeout(self: *const StreamReset) i64 {
     return self.deadline;
 }
 
-/// Write a RE-CONFIG chunk bundling the pending response and our outgoing request (RFC6525 - 3.1).
+/// Write a RE-CONFIG chunk with the pending responses and the pending parts of our in flight request (RFC6525 - 3.1).
 pub fn pollTransmit(self: *StreamReset, buffer: []u8, now: i64, rto: u32) error{WriteFailed}!?u32 {
-    const request = self.requestToSend();
-    if (request == null and !self.send_response) return null;
+    const request = self.nextRequest();
+    if (request == null and self.response_count == 0) return null;
 
-    const response_length: u32 = if (self.send_response) 12 else 0;
-    const request_length: u32 = if (request) |req| 16 + 2 * @as(u32, @intCast(req.streams.len)) else 0;
-    const length = 4 + response_length + request_length;
-    const size = std.mem.alignForward(u32, length, 4);
+    const send_outgoing, const send_incoming, const streams_size = if (request) |req|
+        .{ req.isOutgoingPending(), req.isIncomingPending(), 2 * @as(u32, req.stream_count) }
+    else
+        .{ false, false, 0 };
+
+    // Parameter sizes including their padding
+    const responses_size: u32 = message.reconfig_response_size * @as(u32, self.response_count);
+    const outgoing_size: u32 = if (send_outgoing) std.mem.alignForward(u32, 16 + streams_size, 4) else 0;
+    const incoming_size: u32 = if (send_incoming) std.mem.alignForward(u32, 8 + streams_size, 4) else 0;
+    const size = 4 + responses_size + outgoing_size + incoming_size;
     if (buffer.len < size) return error.WriteFailed;
+
+    // The chunk length excludes the padding of the last parameter (RFC9260 - 3.2), only an odd stream count adds one
+    const padding = streams_size % 4;
 
     buffer[0] = @intFromEnum(message.ChunkType.reconfig);
     buffer[1] = 0; // flags
-    std.mem.writeInt(u16, buffer[2..4], @intCast(length), .big);
+    std.mem.writeInt(u16, buffer[2..4], @intCast(size - padding), .big);
 
-    if (self.send_response) {
-        writeResponse(self.response, buffer[4..]);
-        self.send_response = false;
+    var offset: u32 = 4;
+    for (self.responses[0..self.response_count]) |*response| {
+        response.write(buffer[offset..][0..message.reconfig_response_size]);
+        offset += message.reconfig_response_size;
     }
+    self.response_count = 0;
 
-    if (request) |req| {
-        writeOutgoingRequest(req, self.resp_seq_num, buffer[4 + response_length .. size]);
-        self.deadline = now + rto;
-        self.retransmit = false;
+    const req = request orelse return size;
+    if (send_outgoing) {
+        req.writeOutgoingRequest(self.request_streams.iterator(), buffer[offset..][0..outgoing_size]);
+        offset += outgoing_size;
     }
+    if (send_incoming) req.writeIncomingRequest(self.request_streams.iterator(), buffer[offset..][0..incoming_size]);
+    self.deadline = now + rto;
+    self.retransmit = false;
 
     return size;
 }
 
-fn requestToSend(self: *const StreamReset) ?*const Request {
+fn queueRequest(
+    self: *StreamReset,
+    allocator: Allocator,
+    streams: []const u16,
+    direction: Direction,
+    resp_seq_num: u32,
+    implicit_response: bool,
+) Allocator.Error!void {
+    std.debug.assert(streams.len <= max_streams);
+    if (direction.outgoing) try self.streams.ensureUnusedCapacity(allocator, @intCast(streams.len));
+    try self.requests.ensureUnusedCapacity(allocator, 1);
+    try self.request_streams.ensureUnusedCapacity(allocator, streams.len);
+
+    if (direction.outgoing) for (streams) |stream| self.streams.putAssumeCapacity(stream, {});
+    self.request_streams.pushBackSliceAssumeCapacity(streams);
+    self.requests.pushBackAssumeCapacity(.{
+        .seq_num = self.req_seq_num,
+        .resp_seq_num = resp_seq_num,
+        .last_assigned_tsn = undefined,
+        .stream_count = @intCast(streams.len),
+        .flags = .{ .direction = direction, .implicit_response = implicit_response },
+    });
+    self.req_seq_num +%= @as(u32, @intFromBool(direction.outgoing)) + @intFromBool(direction.incoming);
+}
+
+fn nextRequest(self: *const StreamReset) ?*const Request {
     const request = self.requests.frontPtr() orelse return null;
-    return if (request.last_assigned_tsn != null and self.retransmit) request else null;
+    if (!request.flags.started or !self.retransmit) return null;
+    if (self.response_count == 0) return request;
+    // A response is only bundled with an Outgoing SSN Reset Request, and two of them fill the chunk
+    return if (self.response_count < self.responses.len and !request.isIncomingPending()) request else null;
 }
 
-/// `buffer` holds exactly the parameter and its padding.
-fn writeOutgoingRequest(req: *const Request, resp_seq_num: u32, buffer: []u8) void {
-    const param_length: u32 = 16 + 2 * @as(u32, @intCast(req.streams.len));
+fn completePart(self: *StreamReset) void {
+    const request = self.requests.front().?;
+    if (request.isOutgoingPending() or request.isIncomingPending()) return;
 
-    std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
-    std.mem.writeInt(u16, buffer[2..4], @intCast(param_length), .big);
-    std.mem.writeInt(u32, buffer[4..8], req.seq_num, .big);
-    std.mem.writeInt(u32, buffer[8..12], resp_seq_num, .big);
-    std.mem.writeInt(u32, buffer[12..16], req.last_assigned_tsn.?, .big);
-    for (req.streams, 0..) |stream, index| std.mem.writeInt(u16, buffer[16 + 2 * index ..][0..2], stream, .big);
-    @memset(buffer[param_length..], 0);
+    _ = self.requests.popFront();
+    for (0..request.stream_count) |_| _ = self.request_streams.popFront();
+    self.deadline = std.math.maxInt(i64);
+    self.retransmit = false;
 }
 
-fn setResponse(self: *StreamReset, seq_num: u32, result: message.ReConfigResponse.Result) void {
-    self.response = .{ .seq_num = seq_num, .result = result };
-    self.send_response = true;
-}
+fn rebuildStreams(self: *StreamReset) void {
+    self.streams.clearRetainingCapacity();
 
-fn writeResponse(response: Response, buffer: []u8) void {
-    std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.reconfig_response), .big);
-    std.mem.writeInt(u16, buffer[2..4], 12, .big);
-    std.mem.writeInt(u32, buffer[4..8], response.seq_num, .big);
-    std.mem.writeInt(u32, buffer[8..12], @intFromEnum(response.result), .big);
-}
-
-const testing = std.testing;
-
-fn testParseRequest(chunk: []const u8) !message.OutgoingSsnResetRequest {
-    var it = message.ChunkIterator.init(chunk);
-    var params = (try it.next()).?.reconfig;
-    try testing.expectEqual(null, try it.next());
-
-    const request = (try params.next()).?.outgoing_ssn_reset_req;
-    try testing.expectEqual(null, try params.next());
-    return request;
-}
-
-fn testExpectStreams(request: message.OutgoingSsnResetRequest, streams: []const u16) !void {
-    try testing.expectEqual(streams.len, request.countStreams());
-    for (streams, 0..) |stream, index| try testing.expectEqual(stream, request.getStreamAt(@intCast(index)));
-}
-
-fn testResponse(seq_num: u32, result: message.ReConfigResponse.Result) message.ReConfigResponse {
-    return .{ .resp_seq_num = seq_num, .result = result, .sender_next_tsn = null, .receiver_next_tsn = null };
-}
-
-fn testPushMessage(r: *StreamReset, stream_id: u16, data: []const u8) !bool {
-    return r.bufferMessage(testing.allocator, data, .{ .stream_id = stream_id, .ppid = 51 });
-}
-
-/// Start transmitting with an empty message queue whose last assigned tsn is `last_assigned_tsn`.
-fn testStart(r: *StreamReset, last_assigned_tsn: u32) void {
-    const msg_queue = MessageQueue.init(last_assigned_tsn +% 1);
-    r.maybeStartTransmitting(&msg_queue);
-}
-
-fn testQueue(last_assigned_tsn: u32, streams: []const u16) !MessageQueue {
-    var msg_queue = MessageQueue.init(last_assigned_tsn +% 1);
-    errdefer msg_queue.deinit(testing.allocator);
-    for (streams) |stream| try msg_queue.pushData(testing.allocator, "data", .{ .stream_id = stream, .ppid = 51 });
-    return msg_queue;
-}
-
-test "StreamReset.pollTransmit: writes an outgoing ssn reset request" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    r.setPeerInitTsn(500);
-
-    var buffer: [64]u8 = undefined;
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-
-    // Not started yet
-    try r.resetStreams(testing.allocator, &.{ 1, 2, 3 });
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-
-    testStart(&r, 10);
-    const written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-    // 4 bytes chunk header + 16 bytes parameter header + 3 streams, padded
-    try testing.expectEqual(28, written);
-    try testing.expectEqual(26, std.mem.readInt(u16, buffer[2..4], .big));
-
-    const request = try testParseRequest(buffer[0..written]);
-    try testing.expectEqual(100, request.req_seq_num);
-    try testing.expectEqual(499, request.resp_seq_num);
-    try testing.expectEqual(10, request.last_assigned_tsn);
-    try testExpectStreams(request, &.{ 1, 2, 3 });
-
-    // Already sent, nothing to do until a response or a timeout
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-}
-
-test "StreamReset.maybeStartTransmitting: waits for the queued messages of the resetting streams" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    var buffer: [64]u8 = undefined;
-
-    try r.resetStreams(testing.allocator, &.{ 1, 2 });
-
-    {
-        var msg_queue = try testQueue(10, &.{ 3, 2 });
-        defer msg_queue.deinit(testing.allocator);
-        r.maybeStartTransmitting(&msg_queue);
-        try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-    }
-
-    // Messages of other streams don't block the request
-    {
-        var msg_queue = try testQueue(20, &.{3});
-        defer msg_queue.deinit(testing.allocator);
-        r.maybeStartTransmitting(&msg_queue);
-    }
-    var written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-    try testing.expectEqual(20, (try testParseRequest(buffer[0..written])).last_assigned_tsn);
-
-    // Once started, the last assigned tsn doesn't change
-    testStart(&r, 30);
-    r.handleTimeout(1000);
-    written = (try r.pollTransmit(&buffer, 1000, 1000)).?;
-    try testing.expectEqual(20, (try testParseRequest(buffer[0..written])).last_assigned_tsn);
-}
-
-test "StreamReset.maybeStartTransmitting: only messages without tsn block the request" {
-    var buffer: [message.PMDCS]u8 = undefined;
-
-    // Messages fully assigned tsns don't block the request
-    {
-        var r = StreamReset.init(100);
-        defer r.deinit(testing.allocator);
-        try r.resetStreams(testing.allocator, &.{2});
-
-        var msg_queue = try testQueue(10, &.{2});
-        defer msg_queue.deinit(testing.allocator);
-        r.maybeStartTransmitting(&msg_queue);
-        try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-
-        _ = (try msg_queue.nextChunk(testing.allocator, &buffer)).?;
-        r.maybeStartTransmitting(&msg_queue);
-        const written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-        try testing.expectEqual(11, (try testParseRequest(buffer[0..written])).last_assigned_tsn);
-    }
-
-    // A partially sent message still blocks the request
-    {
-        var r = StreamReset.init(100);
-        defer r.deinit(testing.allocator);
-        try r.resetStreams(testing.allocator, &.{2});
-
-        var msg_queue = MessageQueue.init(11);
-        defer msg_queue.deinit(testing.allocator);
-        const data: [2 * message.PMDCS]u8 = @splat(0);
-        try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 2, .ppid = 51 });
-
-        _ = (try msg_queue.nextChunk(testing.allocator, &buffer)).?;
-        r.maybeStartTransmitting(&msg_queue);
-        try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
+    var offset: u32 = 0;
+    var it = self.requests.iterator();
+    while (it.next()) |request| {
+        if (request.isOutgoingPending()) {
+            for (offset..offset + request.stream_count) |index| self.streams.putAssumeCapacity(self.request_streams.at(index), {});
+        }
+        offset += request.stream_count;
     }
 }
 
-test "StreamReset.resetStreams: only the front request is in flight" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    var buffer: [64]u8 = undefined;
+fn implicitResponseSeqNum(self: *const StreamReset) ?u32 {
+    var it = self.requests.iterator();
+    while (it.next()) |request| if (request.flags.implicit_response) return request.resp_seq_num;
+    return null;
+}
 
-    // Already resetting and duplicated streams are skipped
-    try r.resetStreams(testing.allocator, &.{ 1, 2 });
-    try r.resetStreams(testing.allocator, &.{ 2, 3, 3 });
-    try r.resetStreams(testing.allocator, &.{ 1, 2, 3 });
-    try testing.expectEqual(2, r.requests.len);
+/// RFC6525 - 5.2.1. a chunk carries up to two requests, a retransmission may repeat both.
+fn checkSeqNum(self: *const StreamReset, seq_num: u32) SeqNumCheck {
+    if (seq_num == self.resp_seq_num +% 1) return .new;
+    if (seq_num == self.resp_seq_num or seq_num == self.resp_seq_num -% 1) return .retransmission;
+    return .bad;
+}
 
-    testStart(&r, 10);
-    var written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-    try testExpectStreams(try testParseRequest(buffer[0..written]), &.{ 1, 2 });
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-
-    {
-        const result = r.handleResponse(&testResponse(100, .success_performed)).?;
-        defer testing.allocator.free(result.streams);
+fn pushResponse(self: *StreamReset, seq_num: u32, result: message.ReConfigResponse.Result) void {
+    for (self.responses[0..self.response_count]) |*response| {
+        if (response.seq_num != seq_num) continue;
+        response.result = result;
+        return;
     }
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
 
-    testStart(&r, 20);
-    written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-    const request = try testParseRequest(buffer[0..written]);
-    try testing.expectEqual(101, request.req_seq_num);
-    try testing.expectEqual(20, request.last_assigned_tsn);
-    try testExpectStreams(request, &.{3});
-}
-
-test "StreamReset.resetStreams: large stream lists are split into multiple requests" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-
-    var streams: [max_streams_per_request + 1]u16 = undefined;
-    for (&streams, 0..) |*stream, index| stream.* = @intCast(index);
-    try r.resetStreams(testing.allocator, &streams);
-
-    try testing.expectEqual(2, r.requests.len);
-    try testing.expectEqual(max_streams_per_request, r.requests.at(0).streams.len);
-    try testing.expectEqual(1, r.requests.at(1).streams.len);
-    try testing.expectEqual(102, r.req_seq_num);
-
-    // The largest request bundled with a response fills the packet
-    var buffer: [message.PMDCS]u8 = undefined;
-    r.setPeerInitTsn(500);
-    testStart(&r, 10);
-    testing.allocator.free((try testPeerRequest(&r, 500, 10, &.{1}, 10)).?);
-    try testing.expectEqual(message.PMDCS, (try r.pollTransmit(&buffer, 0, 1000)).?);
-}
-
-test "StreamReset.resetStreams: an allocation failure leaves no partial request" {
-    var streams: [max_streams_per_request + 1]u16 = undefined;
-    for (&streams, 0..) |*stream, index| stream.* = @intCast(index);
-
-    var fail_index: usize = 0;
-    while (true) : (fail_index += 1) {
-        var r = StreamReset.init(100);
-        defer r.deinit(testing.allocator);
-        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
-
-        r.resetStreams(failing.allocator(), &streams) catch {
-            try testing.expectEqual(0, r.requests.len);
-            try testing.expectEqual(0, r.streams.count());
-            try testing.expectEqual(100, r.req_seq_num);
-            continue;
-        };
-        break;
+    // The peer retransmits the request whose response is dropped
+    if (self.response_count == self.responses.len) {
+        self.responses[0] = self.responses[1];
+        self.response_count -= 1;
     }
-}
-
-test "StreamReset.bufferMessage: messages are held until the reset succeeds" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    var buffer: [64]u8 = undefined;
-
-    try r.resetStreams(testing.allocator, &.{ 1, 2 });
-    try testing.expect(!try testPushMessage(&r, 3, "other"));
-    try testing.expect(try testPushMessage(&r, 1, "first"));
-    try testing.expect(try testPushMessage(&r, 2, "second"));
-    try testing.expect(try testPushMessage(&r, 1, "third"));
-    try testing.expectEqual(null, r.popMessage());
-
-    testStart(&r, 10);
-    _ = try r.pollTransmit(&buffer, 0, 1000);
-    const result = r.handleResponse(&testResponse(100, .success_performed)).?;
-    defer testing.allocator.free(result.streams);
-    try testing.expect(result.succeeded);
-    try testing.expectEqualSlices(u16, &.{ 1, 2 }, result.streams);
-
-    for ([_][]const u8{ "first", "second", "third" }) |expected| {
-        const msg = r.popMessage().?;
-        defer msg.deinit(testing.allocator);
-        try testing.expectEqualStrings(expected, msg.data);
-    }
-    try testing.expectEqual(null, r.popMessage());
-    try testing.expect(!try testPushMessage(&r, 1, "after"));
-}
-
-test "StreamReset.handleResponse: a refused reset releases the buffered messages" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    var buffer: [64]u8 = undefined;
-
-    try r.resetStreams(testing.allocator, &.{1});
-    try testing.expect(try testPushMessage(&r, 1, "data"));
-    testStart(&r, 10);
-    _ = try r.pollTransmit(&buffer, 0, 1000);
-    const result = r.handleResponse(&testResponse(100, .denied)).?;
-    defer testing.allocator.free(result.streams);
-    try testing.expect(!result.succeeded);
-    try testing.expectEqualSlices(u16, &.{1}, result.streams);
-
-    try testing.expectEqual(std.math.maxInt(i64), r.pollTimeout());
-    const msg = r.popMessage().?;
-    defer msg.deinit(testing.allocator);
-    try testing.expectEqualStrings("data", msg.data);
-}
-
-test "StreamReset.handleResponse: in progress and unrelated responses keep the request" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    var buffer: [64]u8 = undefined;
-
-    try r.resetStreams(testing.allocator, &.{1});
-
-    // Not started yet
-    try testing.expectEqual(null, r.handleResponse(&testResponse(100, .success_performed)));
-    try testing.expectEqual(1, r.requests.len);
-
-    testStart(&r, 10);
-    _ = try r.pollTransmit(&buffer, 0, 1000);
-    try testing.expectEqual(null, r.handleResponse(&testResponse(99, .success_performed)));
-    try testing.expectEqual(null, r.handleResponse(&testResponse(100, .in_progress)));
-    try testing.expectEqual(1, r.requests.len);
-    try testing.expectEqual(1000, r.pollTimeout());
-}
-
-test "StreamReset.handleTimeout: retransmits the same request" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    var buffer: [64]u8 = undefined;
-
-    try testing.expectEqual(std.math.maxInt(i64), r.pollTimeout());
-    try r.resetStreams(testing.allocator, &.{ 1, 2 });
-    testStart(&r, 10);
-    const written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-    const first = buffer;
-    try testing.expectEqual(1000, r.pollTimeout());
-
-    r.handleTimeout(999);
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 999, 1000));
-
-    r.handleTimeout(1000);
-    try testing.expectEqual(std.math.maxInt(i64), r.pollTimeout());
-    try testing.expectEqual(written, (try r.pollTransmit(&buffer, 1000, 2000)).?);
-    try testing.expectEqualSlices(u8, first[0..written], buffer[0..written]);
-    try testing.expectEqual(3000, r.pollTimeout());
-}
-
-test "StreamReset.pollTransmit: fails when the buffer is too small" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-
-    try r.resetStreams(testing.allocator, &.{ 1, 2, 3 });
-    testStart(&r, 10);
-    var buffer: [24]u8 = undefined;
-    try testing.expectError(error.WriteFailed, r.pollTransmit(&buffer, 0, 1000));
-    try testing.expectEqual(std.math.maxInt(i64), r.pollTimeout());
-
-    var big_buffer: [28]u8 = undefined;
-    try testing.expectEqual(28, (try r.pollTransmit(&big_buffer, 0, 1000)).?);
-}
-
-fn testPeerRequest(r: *StreamReset, req_seq_num: u32, last_assigned_tsn: u32, streams: []const u16, cumulative_tsn: u32) !?[]u16 {
-    var bytes: [16]u8 = undefined;
-    for (streams, 0..) |stream, index| std.mem.writeInt(u16, bytes[2 * index ..][0..2], stream, .big);
-    const request = message.OutgoingSsnResetRequest{
-        .req_seq_num = req_seq_num,
-        .resp_seq_num = 0,
-        .last_assigned_tsn = last_assigned_tsn,
-        .streams = bytes[0 .. 2 * streams.len],
-    };
-    return r.handleOutgoingResetRequest(testing.allocator, &request, cumulative_tsn);
-}
-
-fn testExpectResponse(r: *StreamReset, seq_num: u32, result: message.ReConfigResponse.Result) !void {
-    var buffer: [64]u8 = undefined;
-    const written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-    try testing.expectEqual(16, written);
-
-    var it = message.ChunkIterator.init(buffer[0..written]);
-    var params = (try it.next()).?.reconfig;
-    const response = (try params.next()).?.reconfig_response;
-    try testing.expectEqual(seq_num, response.resp_seq_num);
-    try testing.expectEqual(result, response.result);
-}
-
-test "StreamReset.handleOutgoingResetRequest: resets the streams when the data before the request is received" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    r.setPeerInitTsn(500);
-    var buffer: [64]u8 = undefined;
-
-    const streams = (try testPeerRequest(&r, 500, 10, &.{ 1, 2 }, 10)).?;
-    defer testing.allocator.free(streams);
-    try testing.expectEqualSlices(u16, &.{ 1, 2 }, streams);
-    try testExpectResponse(&r, 500, .success_performed);
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-
-    // Our requests carry the last processed peer request
-    try r.resetStreams(testing.allocator, &.{3});
-    testStart(&r, 20);
-    const written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-    try testing.expectEqual(500, (try testParseRequest(buffer[0..written])).resp_seq_num);
-}
-
-test "StreamReset.pollTransmit: bundles the response with our request" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    r.setPeerInitTsn(500);
-    var buffer: [64]u8 = undefined;
-
-    try r.resetStreams(testing.allocator, &.{3});
-    testStart(&r, 20);
-    testing.allocator.free((try testPeerRequest(&r, 500, 10, &.{1}, 10)).?);
-
-    // 4 bytes chunk header + 12 bytes response + 16 bytes request header + 1 stream, padded
-    const written = (try r.pollTransmit(&buffer, 0, 1000)).?;
-    try testing.expectEqual(36, written);
-    try testing.expectEqual(34, std.mem.readInt(u16, buffer[2..4], .big));
-    try testing.expectEqual(@intFromEnum(message.ParameterType.reconfig_response), std.mem.readInt(u16, buffer[4..6], .big));
-
-    var it = message.ChunkIterator.init(buffer[0..written]);
-    var params = (try it.next()).?.reconfig;
-    try testing.expectEqual(null, try it.next());
-
-    const response = (try params.next()).?.reconfig_response;
-    try testing.expectEqual(500, response.resp_seq_num);
-    try testing.expectEqual(.success_performed, response.result);
-
-    const request = (try params.next()).?.outgoing_ssn_reset_req;
-    try testing.expectEqual(100, request.req_seq_num);
-    try testing.expectEqual(500, request.resp_seq_num);
-    try testing.expectEqual(20, request.last_assigned_tsn);
-    try testExpectStreams(request, &.{3});
-    try testing.expectEqual(null, try params.next());
-
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-    try testing.expectEqual(1000, r.pollTimeout());
-}
-
-test "StreamReset.handleOutgoingResetRequest: an empty stream list resets all the streams" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    r.setPeerInitTsn(500);
-
-    const streams = (try testPeerRequest(&r, 500, 10, &.{}, 10)).?;
-    defer testing.allocator.free(streams);
-    try testing.expectEqual(0, streams.len);
-    try testExpectResponse(&r, 500, .success_performed);
-}
-
-test "StreamReset.handleCumulativeTsn: completes a deferred reset" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    r.setPeerInitTsn(500);
-    var buffer: [64]u8 = undefined;
-
-    try testing.expectEqual(null, try testPeerRequest(&r, 500, 10, &.{1}, 9));
-    try testExpectResponse(&r, 500, .in_progress);
-
-    try testing.expectEqual(null, r.handleCumulativeTsn(9));
-    try testing.expectEqual(null, try r.pollTransmit(&buffer, 0, 1000));
-
-    const streams = r.handleCumulativeTsn(10).?;
-    defer testing.allocator.free(streams);
-    try testing.expectEqualSlices(u16, &.{1}, streams);
-    try testExpectResponse(&r, 500, .success_performed);
-    try testing.expectEqual(null, r.handleCumulativeTsn(11));
-}
-
-test "StreamReset.handleOutgoingResetRequest: retransmitted and unexpected requests" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    r.setPeerInitTsn(500);
-
-    try testing.expectEqual(null, try testPeerRequest(&r, 500, 10, &.{1}, 5));
-    try testExpectResponse(&r, 500, .in_progress);
-
-    // Retransmission while deferred
-    try testing.expectEqual(null, try testPeerRequest(&r, 500, 10, &.{1}, 5));
-    try testExpectResponse(&r, 500, .in_progress);
-
-    // A new request while one is deferred
-    try testing.expectEqual(null, try testPeerRequest(&r, 501, 10, &.{2}, 5));
-    try testExpectResponse(&r, 501, .request_in_progress);
-
-    try testing.expectEqual(null, try testPeerRequest(&r, 600, 10, &.{2}, 5));
-    try testExpectResponse(&r, 600, .bad_sequence_number);
-
-    testing.allocator.free(r.handleCumulativeTsn(10).?);
-    try testExpectResponse(&r, 500, .success_performed);
-
-    // Retransmission once performed, the streams are not reset again
-    try testing.expectEqual(null, try testPeerRequest(&r, 500, 10, &.{1}, 10));
-    try testExpectResponse(&r, 500, .success_performed);
-}
-
-test "StreamReset.deinit: frees a deferred reset" {
-    var r = StreamReset.init(100);
-    defer r.deinit(testing.allocator);
-    r.setPeerInitTsn(500);
-
-    try testing.expectEqual(null, try testPeerRequest(&r, 500, 10, &.{ 1, 2 }, 5));
+    self.responses[self.response_count] = .{ .seq_num = seq_num, .result = result };
+    self.response_count += 1;
 }

@@ -4,6 +4,7 @@ const Helper = @import("helper.zig");
 
 pub const packet_header_size = 12;
 pub const data_chunk_header_size = 16;
+pub const reconfig_response_size = 12;
 pub const MTU = 1200;
 pub const PMDCS = MTU - packet_header_size;
 
