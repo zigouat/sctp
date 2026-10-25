@@ -96,6 +96,15 @@ pub fn receiveData(self: *MessageAssembler, allocator: std.mem.Allocator, d: mes
     return window_full or d.flags.immediate;
 }
 
+/// Acknowledges the chunk's tsn but drops its data.
+///
+/// Returns `true` if a sack should be sent immediately.
+pub fn acknowledge(self: *MessageAssembler, d: message.Data) bool {
+    self.sack_generator.checkTsn(d.tsn) catch |err| return err == error.Duplicate;
+    self.sack_generator.receiveTsn(d.tsn);
+    return d.flags.immediate;
+}
+
 pub fn scheduleSack(self: *MessageAssembler, immediate: bool, now: i64) bool {
     if (self.send_sack or immediate or self.hasGaps()) return true;
     self.send_sack = true;

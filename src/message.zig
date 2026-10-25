@@ -103,7 +103,8 @@ pub const ChunkIterator = struct {
                 chunk = .shutdown_ack;
             },
             .reconfig => chunk = .{ .reconfig = ParameterIterator.init(self.slice[4..length]) },
-            .heartbeat_ack, .@"error", .ecne, .cwr => {},
+            .@"error" => chunk = .{ .@"error" = ErrorIterator.init(self.slice[4..length]) },
+            .heartbeat_ack, .ecne, .cwr => {},
             _ => if (self.slice[0] & 0x80 == 0) return error.UnrecognizedChunkType,
         }
 
@@ -145,6 +146,7 @@ pub const Chunk = union(enum) {
     shutdown_complete: bool, // T bit
     shutdown_ack,
     reconfig: ParameterIterator,
+    @"error": ErrorIterator,
 };
 
 pub const Init = struct {
@@ -370,35 +372,100 @@ pub const ErrorCode = enum(u16) {
     restart_of_an_association,
     user_initiated_abort,
     protocol_violation,
-
-    pub fn fromInt(t: u16) !ErrorCode {
-        switch (t) {
-            1...13 => return @enumFromInt(t),
-            else => return error.InvalidErrorCode,
-        }
-    }
+    _,
 };
 
 pub const Error = union(ErrorCode) {
-    invalid_stream_id: void,
-    missing_mandatory_param: void,
-    stale_cookie: void,
+    invalid_stream_id: u16,
+    missing_mandatory_param: []const u8,
+    stale_cookie: u32,
     out_of_resource: void,
-    unresolvable_address: void,
-    unrecognized_chunk_type: void,
+    unresolvable_address: []const u8,
+    unrecognized_chunk_type: []const u8, // whole chunk
     invalid_mandatory_param: void,
-    unrecognized_parameters: void,
+    unrecognized_parameters: []const u8,
     no_user_data: u32,
     cookie_received_while_shutting_down: void,
-    restart_of_an_association: void,
-    user_initiated_abort: void,
-    protocol_violation: void,
+    restart_of_an_association: []const u8,
+    user_initiated_abort: []const u8,
+    protocol_violation: []const u8,
 
     pub fn writeNoUserDataErrorBuffer(buffer: []u8, tsn: u32) usize {
         std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ErrorCode.no_user_data), .big);
         std.mem.writeInt(u16, buffer[2..4], 8, .big);
         std.mem.writeInt(u32, buffer[4..8], tsn, .big);
         return 8;
+    }
+
+    pub fn writeInvalidStreamIdErrorBuffer(buffer: []u8, stream_id: u16) usize {
+        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ErrorCode.invalid_stream_id), .big);
+        std.mem.writeInt(u16, buffer[2..4], 8, .big);
+        std.mem.writeInt(u16, buffer[4..6], stream_id, .big);
+        std.mem.writeInt(u16, buffer[6..8], 0, .big);
+        return 8;
+    }
+
+    test "Error.writeNoUserDataErrorBuffer" {
+        var buffer: [8]u8 = undefined;
+        const n = Error.writeNoUserDataErrorBuffer(&buffer, 0x12345678);
+        try std.testing.expectEqual(8, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x09, 0x00, 0x08, 0x12, 0x34, 0x56, 0x78 }, buffer[0..n]);
+    }
+
+    test "Error.writeInvalidStreamIdErrorBuffer" {
+        var buffer: [8]u8 = undefined;
+        const n = Error.writeInvalidStreamIdErrorBuffer(&buffer, 0x1234);
+        try std.testing.expectEqual(8, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x00, 0x08, 0x12, 0x34, 0x00, 0x00 }, buffer[0..n]);
+    }
+};
+
+pub const ErrorIterator = struct {
+    slice: []const u8,
+
+    pub fn init(slice: []const u8) ErrorIterator {
+        return ErrorIterator{ .slice = slice };
+    }
+
+    pub fn next(self: *ErrorIterator) error{InvalidParameter}!?Error {
+        while (true) {
+            if (self.slice.len < 4) return null;
+
+            const error_code = std.mem.readInt(u16, self.slice[0..2], .big);
+            const length = std.mem.readInt(u16, self.slice[2..4], .big);
+            const padded_length = std.mem.alignForward(u32, length, 4);
+            if (length < 4 or length > self.slice.len) return error.InvalidParameter;
+            const err: ErrorCode = @enumFromInt(error_code);
+
+            defer self.slice = if (self.slice.len >= padded_length) self.slice[padded_length..] else self.slice[length..];
+            return switch (err) {
+                .invalid_stream_id => blk: {
+                    if (length != 8) return error.InvalidParameter;
+                    const stream_id = std.mem.readInt(u16, self.slice[4..6], .big);
+                    break :blk Error{ .invalid_stream_id = stream_id };
+                },
+                .missing_mandatory_param => .{ .missing_mandatory_param = self.slice[4..length] },
+                .stale_cookie => blk: {
+                    if (length != 8) return error.InvalidParameter;
+                    break :blk Error{ .stale_cookie = std.mem.readInt(u32, self.slice[4..8], .big) };
+                },
+                .out_of_resource => .{ .out_of_resource = {} },
+                .unresolvable_address => .{ .unresolvable_address = self.slice[4..length] },
+                .unrecognized_chunk_type => .{ .unrecognized_chunk_type = self.slice[4..length] },
+                .invalid_mandatory_param => .{ .invalid_mandatory_param = {} },
+                .unrecognized_parameters => .{ .unrecognized_parameters = self.slice[4..length] },
+                .no_user_data => blk: {
+                    if (length != 8) return error.InvalidParameter;
+                    const tsn = std.mem.readInt(u32, self.slice[4..8], .big);
+                    break :blk Error{ .no_user_data = tsn };
+                },
+                .cookie_received_while_shutting_down => .{ .cookie_received_while_shutting_down = {} },
+                .restart_of_an_association => .{ .restart_of_an_association = self.slice[4..length] },
+                .user_initiated_abort => .{ .user_initiated_abort = self.slice[4..length] },
+                .protocol_violation => .{ .protocol_violation = self.slice[4..length] },
+                else => continue, // Ignore unknown error codes
+            };
+        }
     }
 };
 
@@ -992,4 +1059,90 @@ test "Parameter.writeBuffer: round trip through ParameterIterator" {
     try std.testing.expectEqualSlices(u8, "xyz", unknown.value);
 
     try std.testing.expectEqual(null, try it.next());
+}
+
+test "ErrorIterator.next: parse errors" {
+    const data = [_]u8{
+        0x00, 0x01, 0x00, 0x08, 0x12, 0x34, 0x00, 0x00, // Error1: invalid stream id
+        0x00, 0x09, 0x00, 0x08, 0x56, 0x78, 0x00, 0x03, // Error2: No user data
+        0x00, 0x06, 0x00, 0x0C, 0xfe, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, // Error3: unrecognized chunk type
+    };
+
+    var it = ErrorIterator.init(data[0..]);
+    const err1 = (try it.next()).?;
+    try std.testing.expect(err1 == .invalid_stream_id);
+    try std.testing.expectEqual(0x1234, err1.invalid_stream_id);
+
+    const err2 = (try it.next()).?;
+    try std.testing.expect(err2 == .no_user_data);
+    try std.testing.expectEqual(0x56780003, err2.no_user_data);
+
+    const err3 = (try it.next()).?;
+    try std.testing.expect(err3 == .unrecognized_chunk_type);
+    try std.testing.expectEqual(0xFE, err3.unrecognized_chunk_type[0]);
+    try std.testing.expectEqual(0, err3.unrecognized_chunk_type[1]);
+    try std.testing.expectEqual(8, std.mem.readInt(u16, err3.unrecognized_chunk_type[2..4], .big));
+
+    try std.testing.expectEqual(null, try it.next());
+}
+
+test "ErrorIterator.next: ignore unknown errors" {
+    const data = [_]u8{
+        0x00, 0x01, 0x00, 0x08, 0x12, 0x34, 0x00, 0x00, // Error1: invalid stream id
+        0x01, 0xfe, 0x00, 0x04, // Error2: unknown error
+    };
+
+    var it = ErrorIterator.init(data[0..]);
+    const err1 = (try it.next()).?;
+    try std.testing.expect(err1 == .invalid_stream_id);
+    try std.testing.expectEqual(0x1234, err1.invalid_stream_id);
+    try std.testing.expectEqual(null, try it.next());
+}
+
+test "ErrorIterator.next: invalid data" {
+    // invalid stream id with wrong length
+    {
+        const data = [_]u8{ 0x00, 0x01, 0x00, 0x07, 0x12, 0x34, 0x00, 0x00 };
+        var it = ErrorIterator.init(data[0..]);
+        try std.testing.expectError(error.InvalidParameter, it.next());
+    }
+
+    // stale cookie with wrong length
+    {
+        const data = [_]u8{ 0x00, 0x03, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+        var it = ErrorIterator.init(data[0..]);
+        try std.testing.expectError(error.InvalidParameter, it.next());
+    }
+
+    // no user data with wrong length
+    {
+        const data = [_]u8{ 0x00, 0x09, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00 };
+        var it = ErrorIterator.init(data[0..]);
+        try std.testing.expectError(error.InvalidParameter, it.next());
+    }
+
+    // length shorter than the header, even for unknown error codes
+    {
+        const data = [_]u8{ 0x01, 0xfe, 0x00, 0x03 };
+        var it = ErrorIterator.init(data[0..]);
+        try std.testing.expectError(error.InvalidParameter, it.next());
+    }
+
+    // length exceeding the remaining data
+    {
+        const data = [_]u8{ 0x00, 0x0D, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00 };
+        var it = ErrorIterator.init(data[0..]);
+        try std.testing.expectError(error.InvalidParameter, it.next());
+    }
+
+    // invalid error after a valid one
+    {
+        const data = [_]u8{
+            0x00, 0x04, 0x00, 0x04, // out of resource
+            0x00, 0x01, 0x00, 0x04, // invalid stream id with missing stream id
+        };
+        var it = ErrorIterator.init(data[0..]);
+        try std.testing.expect((try it.next()).? == .out_of_resource);
+        try std.testing.expectError(error.InvalidParameter, it.next());
+    }
 }

@@ -62,6 +62,10 @@ pub const Event = union(enum) {
     outgoing_stream_reset_failed: ?u16,
     /// The reset stream, `null` means all the streams.
     incoming_stream_reset: ?u16,
+    /// Send failed for the stream.
+    ///
+    /// e.g. a message sent before the peer lowered the max inbound streams.
+    send_failed: u16,
 };
 
 pub const MessageIterator = struct {
@@ -95,6 +99,7 @@ const Transmit = union(enum) {
     shutdown: u32,
     shutdown_ack,
     shutdown_complete: ?u32,
+    invalid_stream_error: u16,
 };
 
 const RetransmissionTimer = struct {
@@ -314,12 +319,13 @@ pub fn resetStreams(self: *Association, streams: []const u16, direction: StreamR
 /// Write a message to the association.
 ///
 /// The `data` is copied internally.
-pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMessageConfig) Error!void {
+pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMessageConfig) (Error || error{InvalidStream})!void {
     std.debug.assert(data.len > 0);
     switch (self.state) {
         .established, .cookie_wait, .cookie_echoed => {},
         else => return error.InvalidState,
     }
+    if (options.stream_id >= self.outbound_streams) return error.InvalidStream;
     if (!try self.stream_reset.bufferMessage(self.allocator, data, options)) {
         try self.message_queue.pushData(self.allocator, data, options);
     }
@@ -399,6 +405,14 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                     else => break,
                 }
 
+                if (d.stream_id >= self.inbound_streams) {
+                    @branchHint(.cold);
+                    try self.transmits.pushBack(self.allocator, .{ .invalid_stream_error = d.stream_id });
+                    immediate_sack |= self.message_assembler.acknowledge(d);
+                    received_data = true;
+                    continue;
+                }
+
                 immediate_sack |= self.message_assembler.receiveData(self.allocator, d) catch |err| switch (err) {
                     error.NoUserData => {
                         try self.transmits.pushBack(self.allocator, .{ .abort = d.tsn });
@@ -445,6 +459,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                     else => {},
                 };
             },
+            .@"error" => {},
         }
     }
 
@@ -636,6 +651,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
         .shutdown => |tsn| writeShutdown(buffer, tsn),
         .shutdown_ack => writeShutdownAck(buffer),
         .shutdown_complete => |reflected_tag| writeShutdownComplete(buffer, reflected_tag != null),
+        .invalid_stream_error => |stream_id| message.Error.writeInvalidStreamIdErrorBuffer(buffer, stream_id),
     };
 
     switch (chunk_type) {
@@ -707,6 +723,7 @@ fn handleInitChunk(self: *Association, chunk: message.Init) !void {
         self.peer_verification_tag = chunk.initiate_tag;
         self.message_queue.rwnd = chunk.a_rwnd;
         self.negotiated_extensions = supported_extensions.intersect(self.supported_extensions);
+        try self.checkQueuedMessages();
     }
 }
 
@@ -739,6 +756,14 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     self.resetInitTimer();
     self.transmits.pushBackAssumeCapacity(.{ .cookie_echo = self.peer_cookie });
     self.negotiated_extensions = supported_extensions.intersect(self.supported_extensions);
+    try self.checkQueuedMessages();
+}
+
+fn checkQueuedMessages(self: *Association) !void {
+    const streams = try self.message_queue.dropMessages(self.allocator, self.outbound_streams);
+    defer self.allocator.free(streams);
+    try self.events.ensureUnusedCapacity(self.allocator, streams.len);
+    for (streams) |stream_id| self.events.pushBackAssumeCapacity(.{ .send_failed = stream_id });
 }
 
 fn getPeerSupportedExtensions(chunk: message.Init) !Extensions {
@@ -1712,6 +1737,26 @@ test "Association.handleRead: a duplicate followed by new data in the same packe
     try testing.expectEqual(1, (try testRead(&assoc, buffer[0..len], MessageAssembler.sack_delay, &lens)).len);
     try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
     try testing.expect(!assoc.message_assembler.send_sack);
+}
+
+test "Association.handleRead: data on an invalid stream is acknowledged and answered with an error" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    assoc.inbound_streams = 2;
+
+    var buffer: [64]u8 = undefined;
+    var lens: [1]usize = undefined;
+    const packet = testDataPacket2(&assoc, testStreamData(assoc.initial_tsn, 5, 0), &buffer);
+    try testing.expectEqual(0, (try testRead(&assoc, packet, 0, &lens)).len);
+    try testing.expectEqual(Transmit{ .invalid_stream_error = 5 }, assoc.transmits.popFront().?);
+    try testing.expectEqual(0, assoc.transmits.len);
+    try testing.expectEqual(assoc.initial_tsn, assoc.message_assembler.getCumulativeTsn());
+    try testing.expect(assoc.message_assembler.send_sack);
+
+    // a retransmission is sacked immediately
+    try testing.expectEqual(0, (try testRead(&assoc, packet, 0, &lens)).len);
+    try testing.expectEqual(Transmit{ .invalid_stream_error = 5 }, assoc.transmits.popFront().?);
+    try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
 }
 
 test "Association.handleRead: only one sack is queued until it is sent" {
