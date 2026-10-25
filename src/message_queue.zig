@@ -108,6 +108,41 @@ pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *
     result.value_ptr.buffered +|= @intCast(new_msg.data.len);
 }
 
+pub fn dropMessages(self: *MessageQueue, allocator: std.mem.Allocator, max_streams: u16) std.mem.Allocator.Error![]u16 {
+    if (self.isEmpty()) return &.{};
+
+    var dropped_streams: std.ArrayList(u16) = .empty;
+    errdefer dropped_streams.deinit(allocator);
+
+    var dropped_messages: u32 = 0;
+    var it = self.messages.iterator();
+    while (it.next()) |msg| if (msg.stream_id >= max_streams) {
+        dropped_messages += 1;
+        if (std.mem.findScalar(u16, dropped_streams.items, msg.stream_id) != null) continue;
+        try dropped_streams.append(allocator, msg.stream_id);
+    };
+
+    if (dropped_streams.items.len == 0) return &.{};
+
+    var messages_copy: std.Deque(message.UserMessage) = .empty;
+    errdefer messages_copy.deinit(allocator);
+    try messages_copy.ensureUnusedCapacity(allocator, self.messages.len - dropped_messages);
+    const streams = try dropped_streams.toOwnedSlice(allocator);
+
+    for (streams) |stream_id| _ = self.streams.remove(stream_id);
+    while (self.messages.popFront()) |msg| {
+        if (msg.stream_id >= max_streams) {
+            allocator.free(msg.data);
+            continue;
+        }
+        messages_copy.pushBackAssumeCapacity(msg);
+    }
+
+    self.messages.deinit(allocator);
+    self.messages = messages_copy;
+    return streams;
+}
+
 pub const SackResult = struct {
     acked_data: u32,
     duplicate_data: u32,
@@ -457,6 +492,28 @@ test "MessageQueue.pushData: increment sequence and buffered size" {
     });
     try testing.expectEqual(1, msg_queue.streams.get(100).?.stream_seq);
     try testing.expectEqual(10, msg_queue.streams.get(100).?.buffered);
+}
+
+test "MessageQueue.dropMessages: drops the messages of the streams above the limit" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+
+    for ([_]u16{ 0, 5, 1, 5, 7 }) |stream_id| {
+        try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = stream_id, .ppid = 0 });
+    }
+
+    const streams = try msg_queue.dropMessages(testing.allocator, 2);
+    defer testing.allocator.free(streams);
+    try testing.expectEqualSlices(u16, &.{ 5, 7 }, streams);
+    try testing.expectEqual(2, msg_queue.messages.len);
+    try testing.expectEqual(0, msg_queue.messages.at(0).stream_id);
+    try testing.expectEqual(1, msg_queue.messages.at(1).stream_id);
+    try testing.expect(msg_queue.streams.get(5) == null);
+    try testing.expect(msg_queue.streams.get(7) == null);
+    try testing.expectEqual(4, msg_queue.streams.get(1).?.buffered);
+
+    // nothing left to drop
+    try testing.expectEqual(0, (try msg_queue.dropMessages(testing.allocator, 2)).len);
 }
 
 test "MessageQueue.nextRetransmit: retransmitting the last chunk clears the retransmit index" {
