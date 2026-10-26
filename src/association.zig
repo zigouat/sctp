@@ -50,6 +50,9 @@ pub const Config = struct {
     inbound_streams: u16 = std.math.maxInt(u16),
     receive_buffer_size: u32 = 1024 * 1024, // 1 MiB
     supported_extensions: Extensions = .{},
+    /// RFC9260 - 6.1. (D) Max.Burst, the flight size may grow by at most `max_burst` packets during one
+    /// `pollTransmit` drain (successive calls until it returns `null`). `0` disables the limit.
+    max_burst: u8 = 32,
 };
 
 pub const Event = union(enum) {
@@ -222,6 +225,10 @@ fast_recovery: bool,
 fast_retransmit: bool,
 fast_recovery_exit_tsn: u32,
 
+max_burst: u8,
+/// Flight size up to which new data is sent during the current `pollTransmit` drain, `null` between drains.
+burst_window: ?u32,
+
 init_deadline: i64,
 init_rto: u8,
 init_attempts: u8,
@@ -263,6 +270,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .fast_recovery = false,
         .fast_retransmit = false,
         .fast_recovery_exit_tsn = 0,
+        .max_burst = config.max_burst,
+        .burst_window = null,
         .transmits = .empty,
         .events = .empty,
         .message_queue = .init(initial_tsn),
@@ -553,13 +562,20 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
     self.writeCommonHeader(buffer);
 
     const prve_curr_msg = self.message_queue.curr_msg;
+    if (self.burst_window == null and self.max_burst != 0) {
+        self.burst_window = self.message_queue.flight_size +| @as(u32, self.max_burst) * message.PMDCS;
+    }
 
     while (true) {
         const next = self.nextChunk(slice, now, written == message.packet_header_size) catch |err| {
             if (written == message.packet_header_size) return err;
             break;
         };
-        const maybe_control_chunk, const w = next orelse if (written == message.packet_header_size) return null else break;
+        const maybe_control_chunk, const w = next orelse if (written == message.packet_header_size) {
+            // The drain is over, the next call starts a new burst.
+            self.burst_window = null;
+            return null;
+        } else break;
         written += w;
         slice = slice[w..];
 
@@ -625,6 +641,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
         if (self.message_queue.flight_size >= self.cwnd) return null;
 
         if (self.fast_recovery) if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
+        if (self.burst_window) |window| if (self.message_queue.flight_size >= window) return null;
         const result = try self.message_queue.nextChunk(self.allocator, buffer) orelse return null;
         self.zero_wnd_probe |= result.zero_wnd_probe;
 
@@ -1261,6 +1278,41 @@ test "Association.pollTransmit: a retransmission that does not fit is sent in th
     const retransmit = (try assoc.pollTransmit(&out, 10_000)).?;
     try testing.expectEqual(message.MTU, retransmit.len);
     try testing.expectEqual(assoc.initial_tsn, std.mem.readInt(u32, retransmit[16..20], .big));
+}
+
+fn testCountPackets(assoc: *Association, now: i64) !usize {
+    var out: [message.MTU]u8 = undefined;
+    var count: usize = 0;
+    while (try assoc.pollTransmit(&out, now)) |_| count += 1;
+    return count;
+}
+
+test "Association.pollTransmit: max burst limits the data sent per drain" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    assoc.cwnd = 100 * message.PMDCS;
+    assoc.max_burst = 4;
+
+    const data: [message.PMDCS - message.data_chunk_header_size]u8 = @splat('a');
+    for (0..12) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+
+    // Data is sent while the flight size is below 4 * PMDCS, the flight size only counts the user data
+    // so a fifth packet fits.
+    try testing.expectEqual(5, try testCountPackets(&assoc, 0));
+    // Each drain starts a new burst, no SACK is needed.
+    try testing.expectEqual(5, try testCountPackets(&assoc, 0));
+    try testing.expectEqual(2, try testCountPackets(&assoc, 0));
+}
+
+test "Association.pollTransmit: max burst of 0 disables the limit" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    assoc.cwnd = 100 * message.PMDCS;
+    assoc.max_burst = 0;
+
+    const data: [message.PMDCS - message.data_chunk_header_size]u8 = @splat('a');
+    for (0..12) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    try testing.expectEqual(12, try testCountPackets(&assoc, 0));
 }
 
 test "Association.pollTransmit: cookie echo is padded when bundled" {
