@@ -19,6 +19,7 @@ const min_buffer_size = 128;
 pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 
 pub const Extensions = packed struct(u8) {
+    /// If `true`, the association will negotiate stream reset reconfiguration (RFC6525).
     stream_reconfiguration: bool = false,
     _pad: u7 = 0,
 
@@ -43,13 +44,28 @@ pub const Extensions = packed struct(u8) {
 };
 
 pub const Config = struct {
+    /// The source port of the association. The peer association will only accept packets from this port.
     source_port: u16,
+    /// The destination port of the peer. The association will only accept packets from this port.
     dest_port: u16,
     random: std.Random,
+    /// The maximum number of outbound streams that the association will use to send data to the peer.
     outbound_streams: u16 = std.math.maxInt(u16),
+    /// The maximum number of inbound streams that the association will accept from the peer.
     inbound_streams: u16 = std.math.maxInt(u16),
+    /// The size of the buffer used to hold received data until it is read by the application.
+    ///
+    /// Once the buffer is full, the association will stop accepting new data from the peer until the application reads some data.
     receive_buffer_size: u32 = 1024 * 1024, // 1 MiB
+    /// Enable/disable supported extensions. The peer may not support the same extensions,
+    /// so the negotiated extensions may be a subset of the supported extensions.
     supported_extensions: Extensions = .{},
+    /// RFC9260 - 6.1. (D) Max.Burst, the flight size may grow by at most `max_burst` packets during one
+    /// `pollTransmit` drain (successive calls until it returns `null`). `0` disables the limit.
+    max_burst: u8 = 4,
+    /// Lower bound of the retransmission timeout in milliseconds. RFC9260 recommends 1 second.
+    /// WebRTC stacks use a lower value.
+    min_rto: u16 = 400,
 };
 
 pub const Event = union(enum) {
@@ -128,7 +144,7 @@ const RetransmissionTimer = struct {
         .error_count = 0,
     };
 
-    fn calculateRto(timer: *RetransmissionTimer, now: i64) void {
+    fn calculateRto(timer: *RetransmissionTimer, now: i64, min_rto: u16) void {
         const rtt: u32 = @intCast(now - timer.rtt_start);
         if (timer.first_sample) {
             timer.first_sample = false;
@@ -142,7 +158,7 @@ const RetransmissionTimer = struct {
         }
 
         timer.rto = @min(max_rto * std.time.ms_per_s, timer.srtt +| 4 *| timer.rttvar);
-        timer.rto = @max(timer.rto, initial_rto);
+        timer.rto = @max(timer.rto, min_rto);
         timer.rtt_tsn = null;
         timer.rtt_start = 0;
     }
@@ -222,6 +238,11 @@ fast_recovery: bool,
 fast_retransmit: bool,
 fast_recovery_exit_tsn: u32,
 
+max_burst: u8,
+min_rto: u16,
+/// Flight size up to which new data is sent during the current `pollTransmit` drain, `null` between drains.
+burst_window: ?u32,
+
 init_deadline: i64,
 init_rto: u8,
 init_attempts: u8,
@@ -263,6 +284,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .fast_recovery = false,
         .fast_retransmit = false,
         .fast_recovery_exit_tsn = 0,
+        .max_burst = config.max_burst,
+        .min_rto = config.min_rto,
+        .burst_window = null,
         .transmits = .empty,
         .events = .empty,
         .message_queue = .init(initial_tsn),
@@ -553,13 +577,20 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
     self.writeCommonHeader(buffer);
 
     const prve_curr_msg = self.message_queue.curr_msg;
+    if (self.burst_window == null and self.max_burst != 0) {
+        self.burst_window = self.message_queue.flight_size +| @as(u32, self.max_burst) * message.PMDCS;
+    }
 
     while (true) {
         const next = self.nextChunk(slice, now, written == message.packet_header_size) catch |err| {
             if (written == message.packet_header_size) return err;
             break;
         };
-        const maybe_control_chunk, const w = next orelse if (written == message.packet_header_size) return null else break;
+        const maybe_control_chunk, const w = next orelse if (written == message.packet_header_size) {
+            // The drain is over, the next call starts a new burst.
+            self.burst_window = null;
+            return null;
+        } else break;
         written += w;
         slice = slice[w..];
 
@@ -625,6 +656,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
         if (self.message_queue.flight_size >= self.cwnd) return null;
 
         if (self.fast_recovery) if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
+        if (self.burst_window) |window| if (self.message_queue.flight_size >= window) return null;
         const result = try self.message_queue.nextChunk(self.allocator, buffer) orelse return null;
         self.zero_wnd_probe |= result.zero_wnd_probe;
 
@@ -812,7 +844,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
         self.partial_bytes_acked = 0;
     }
 
-    if (self.t3_timer.rtt_tsn) |tsn| if (self.message_queue.isAcked(tsn)) self.t3_timer.calculateRto(now);
+    if (self.t3_timer.rtt_tsn) |tsn| if (self.message_queue.isAcked(tsn)) self.t3_timer.calculateRto(now, self.min_rto);
     self.updateT3Timer(result.cumulative_ack_advanced, now);
     try self.maybeSendShutdown();
 }
@@ -1263,6 +1295,41 @@ test "Association.pollTransmit: a retransmission that does not fit is sent in th
     try testing.expectEqual(assoc.initial_tsn, std.mem.readInt(u32, retransmit[16..20], .big));
 }
 
+fn testCountPackets(assoc: *Association, now: i64) !usize {
+    var out: [message.MTU]u8 = undefined;
+    var count: usize = 0;
+    while (try assoc.pollTransmit(&out, now)) |_| count += 1;
+    return count;
+}
+
+test "Association.pollTransmit: max burst limits the data sent per drain" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    assoc.cwnd = 100 * message.PMDCS;
+    assoc.max_burst = 4;
+
+    const data: [message.PMDCS - message.data_chunk_header_size]u8 = @splat('a');
+    for (0..12) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+
+    // Data is sent while the flight size is below 4 * PMDCS, the flight size only counts the user data
+    // so a fifth packet fits.
+    try testing.expectEqual(5, try testCountPackets(&assoc, 0));
+    // Each drain starts a new burst, no SACK is needed.
+    try testing.expectEqual(5, try testCountPackets(&assoc, 0));
+    try testing.expectEqual(2, try testCountPackets(&assoc, 0));
+}
+
+test "Association.pollTransmit: max burst of 0 disables the limit" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    assoc.cwnd = 100 * message.PMDCS;
+    assoc.max_burst = 0;
+
+    const data: [message.PMDCS - message.data_chunk_header_size]u8 = @splat('a');
+    for (0..12) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    try testing.expectEqual(12, try testCountPackets(&assoc, 0));
+}
+
 test "Association.pollTransmit: cookie echo is padded when bundled" {
     var assoc = testAssoc();
     defer assoc.deinit();
@@ -1631,6 +1698,19 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
 
+test "RetransmissionTimer.calculateRto: the rto is bounded by min_rto" {
+    var timer: RetransmissionTimer = .init;
+    timer.setSample(1, 0);
+    timer.calculateRto(10, 200);
+    // srtt + 4 * rttvar = 10 + 4 * 5
+    try testing.expectEqual(200, timer.rto);
+
+    timer.setSample(2, 100);
+    timer.calculateRto(500, 200);
+    // srtt = (7 * 10 + 400) / 8 = 58, rttvar = (3 * 5 + 390) / 4 = 101
+    try testing.expectEqual(58 + 4 * 101, timer.rto);
+}
+
 test "Association.handleTimeout: cwnd decays per rto while idle" {
     var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
@@ -1705,6 +1785,27 @@ test "Association.pollTransmit: a fast retransmit restarts T3-rtx only for the l
     packet = (try assoc.pollTransmit(&out, 200)).?;
     try testing.expectEqual(assoc.initial_tsn +% 4, std.mem.readInt(u32, packet[16..20], .big));
     try testing.expectEqual(100 + initial_rto, assoc.t3_timer.deadline);
+}
+
+test "Association.pollTransmit: a lost fast retransmission is not fast retransmitted again" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+
+    for (0..8) |_| try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.MTU]u8 = undefined;
+    while (try assoc.pollTransmit(&out, 0)) |_| {}
+
+    var buffer: [64]u8 = undefined;
+    const cumulative_tsn = assoc.initial_tsn -% 1;
+    const wnd = assoc.message_assembler.advertised_wnd;
+
+    for ([_]u16{ 2, 3, 4 }) |end| _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, cumulative_tsn, &.{ 2, end }, wnd), 100);
+    const packet = (try assoc.pollTransmit(&out, 100)).?;
+    try testing.expectEqual(assoc.initial_tsn, std.mem.readInt(u32, packet[16..20], .big));
+    try testing.expectEqual(100 + initial_rto, assoc.pollTimeout().?);
+
+    for ([_]u16{ 5, 6, 7 }) |end| _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, cumulative_tsn, &.{ 2, end }, wnd), 900);
+    try testing.expectEqual(null, try assoc.pollTransmit(&out, 900));
 }
 
 test "Association.handleRead: a duplicate followed by new data in the same packet is sacked immediately" {
