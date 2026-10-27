@@ -19,6 +19,7 @@ const min_buffer_size = 128;
 pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 
 pub const Extensions = packed struct(u8) {
+    /// If `true`, the association will negotiate stream reset reconfiguration (RFC6525).
     stream_reconfiguration: bool = false,
     _pad: u7 = 0,
 
@@ -43,16 +44,28 @@ pub const Extensions = packed struct(u8) {
 };
 
 pub const Config = struct {
+    /// The source port of the association. The peer association will only accept packets from this port.
     source_port: u16,
+    /// The destination port of the peer. The association will only accept packets from this port.
     dest_port: u16,
     random: std.Random,
+    /// The maximum number of outbound streams that the association will use to send data to the peer.
     outbound_streams: u16 = std.math.maxInt(u16),
+    /// The maximum number of inbound streams that the association will accept from the peer.
     inbound_streams: u16 = std.math.maxInt(u16),
+    /// The size of the buffer used to hold received data until it is read by the application.
+    ///
+    /// Once the buffer is full, the association will stop accepting new data from the peer until the application reads some data.
     receive_buffer_size: u32 = 1024 * 1024, // 1 MiB
+    /// Enable/disable supported extensions. The peer may not support the same extensions,
+    /// so the negotiated extensions may be a subset of the supported extensions.
     supported_extensions: Extensions = .{},
     /// RFC9260 - 6.1. (D) Max.Burst, the flight size may grow by at most `max_burst` packets during one
     /// `pollTransmit` drain (successive calls until it returns `null`). `0` disables the limit.
-    max_burst: u8 = 32,
+    max_burst: u8 = 4,
+    /// Lower bound of the retransmission timeout in milliseconds. RFC9260 recommends 1 second.
+    /// WebRTC stacks use a lower value.
+    min_rto: u16 = 400,
 };
 
 pub const Event = union(enum) {
@@ -131,7 +144,7 @@ const RetransmissionTimer = struct {
         .error_count = 0,
     };
 
-    fn calculateRto(timer: *RetransmissionTimer, now: i64) void {
+    fn calculateRto(timer: *RetransmissionTimer, now: i64, rto_min: u16) void {
         const rtt: u32 = @intCast(now - timer.rtt_start);
         if (timer.first_sample) {
             timer.first_sample = false;
@@ -145,7 +158,7 @@ const RetransmissionTimer = struct {
         }
 
         timer.rto = @min(max_rto * std.time.ms_per_s, timer.srtt +| 4 *| timer.rttvar);
-        timer.rto = @max(timer.rto, initial_rto);
+        timer.rto = @max(timer.rto, rto_min);
         timer.rtt_tsn = null;
         timer.rtt_start = 0;
     }
@@ -226,6 +239,7 @@ fast_retransmit: bool,
 fast_recovery_exit_tsn: u32,
 
 max_burst: u8,
+rto_min: u16,
 /// Flight size up to which new data is sent during the current `pollTransmit` drain, `null` between drains.
 burst_window: ?u32,
 
@@ -271,6 +285,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .fast_retransmit = false,
         .fast_recovery_exit_tsn = 0,
         .max_burst = config.max_burst,
+        .rto_min = config.min_rto,
         .burst_window = null,
         .transmits = .empty,
         .events = .empty,
@@ -829,7 +844,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
         self.partial_bytes_acked = 0;
     }
 
-    if (self.t3_timer.rtt_tsn) |tsn| if (self.message_queue.isAcked(tsn)) self.t3_timer.calculateRto(now);
+    if (self.t3_timer.rtt_tsn) |tsn| if (self.message_queue.isAcked(tsn)) self.t3_timer.calculateRto(now, self.rto_min);
     self.updateT3Timer(result.cumulative_ack_advanced, now);
     try self.maybeSendShutdown();
 }
@@ -1389,6 +1404,8 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     var out: [message.MTU]u8 = undefined;
     _ = (try assoc.pollTransmit(&out, 0)).?;
+    // sending the message empties the buffered amount
+    try testing.expectEqual(Event{ .buffered_amount_low_threshold = 0 }, assoc.pollEvent().?);
 
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
 
@@ -1683,6 +1700,19 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
 
+test "RetransmissionTimer.calculateRto: the rto is bounded by rto_min" {
+    var timer: RetransmissionTimer = .init;
+    timer.setSample(1, 0);
+    timer.calculateRto(10, 200);
+    // srtt + 4 * rttvar = 10 + 4 * 5
+    try testing.expectEqual(200, timer.rto);
+
+    timer.setSample(2, 100);
+    timer.calculateRto(500, 200);
+    // srtt = (7 * 10 + 400) / 8 = 58, rttvar = (3 * 5 + 390) / 4 = 101
+    try testing.expectEqual(58 + 4 * 101, timer.rto);
+}
+
 test "Association.handleTimeout: cwnd decays per rto while idle" {
     var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
@@ -1757,6 +1787,27 @@ test "Association.pollTransmit: a fast retransmit restarts T3-rtx only for the l
     packet = (try assoc.pollTransmit(&out, 200)).?;
     try testing.expectEqual(assoc.initial_tsn +% 4, std.mem.readInt(u32, packet[16..20], .big));
     try testing.expectEqual(100 + initial_rto, assoc.t3_timer.deadline);
+}
+
+test "Association.pollTransmit: a lost fast retransmission is not fast retransmitted again" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+
+    for (0..8) |_| try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.MTU]u8 = undefined;
+    while (try assoc.pollTransmit(&out, 0)) |_| {}
+
+    var buffer: [64]u8 = undefined;
+    const cumulative_tsn = assoc.initial_tsn -% 1;
+    const wnd = assoc.message_assembler.advertised_wnd;
+
+    for ([_]u16{ 2, 3, 4 }) |end| _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, cumulative_tsn, &.{ 2, end }, wnd), 100);
+    const packet = (try assoc.pollTransmit(&out, 100)).?;
+    try testing.expectEqual(assoc.initial_tsn, std.mem.readInt(u32, packet[16..20], .big));
+    try testing.expectEqual(100 + initial_rto, assoc.pollTimeout().?);
+
+    for ([_]u16{ 5, 6, 7 }) |end| _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, cumulative_tsn, &.{ 2, end }, wnd), 900);
+    try testing.expectEqual(null, try assoc.pollTransmit(&out, 900));
 }
 
 test "Association.handleRead: a duplicate followed by new data in the same packet is sacked immediately" {
