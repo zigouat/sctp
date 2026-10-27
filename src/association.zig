@@ -144,7 +144,7 @@ const RetransmissionTimer = struct {
         .error_count = 0,
     };
 
-    fn calculateRto(timer: *RetransmissionTimer, now: i64, rto_min: u16) void {
+    fn calculateRto(timer: *RetransmissionTimer, now: i64, min_rto: u16) void {
         const rtt: u32 = @intCast(now - timer.rtt_start);
         if (timer.first_sample) {
             timer.first_sample = false;
@@ -158,7 +158,7 @@ const RetransmissionTimer = struct {
         }
 
         timer.rto = @min(max_rto * std.time.ms_per_s, timer.srtt +| 4 *| timer.rttvar);
-        timer.rto = @max(timer.rto, rto_min);
+        timer.rto = @max(timer.rto, min_rto);
         timer.rtt_tsn = null;
         timer.rtt_start = 0;
     }
@@ -239,7 +239,7 @@ fast_retransmit: bool,
 fast_recovery_exit_tsn: u32,
 
 max_burst: u8,
-rto_min: u16,
+min_rto: u16,
 /// Flight size up to which new data is sent during the current `pollTransmit` drain, `null` between drains.
 burst_window: ?u32,
 
@@ -285,7 +285,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Association {
         .fast_retransmit = false,
         .fast_recovery_exit_tsn = 0,
         .max_burst = config.max_burst,
-        .rto_min = config.min_rto,
+        .min_rto = config.min_rto,
         .burst_window = null,
         .transmits = .empty,
         .events = .empty,
@@ -844,7 +844,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
         self.partial_bytes_acked = 0;
     }
 
-    if (self.t3_timer.rtt_tsn) |tsn| if (self.message_queue.isAcked(tsn)) self.t3_timer.calculateRto(now, self.rto_min);
+    if (self.t3_timer.rtt_tsn) |tsn| if (self.message_queue.isAcked(tsn)) self.t3_timer.calculateRto(now, self.min_rto);
     self.updateT3Timer(result.cumulative_ack_advanced, now);
     try self.maybeSendShutdown();
 }
@@ -1700,7 +1700,7 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
 
-test "RetransmissionTimer.calculateRto: the rto is bounded by rto_min" {
+test "RetransmissionTimer.calculateRto: the rto is bounded by min_rto" {
     var timer: RetransmissionTimer = .init;
     timer.setSample(1, 0);
     timer.calculateRto(10, 200);
