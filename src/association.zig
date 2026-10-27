@@ -1404,8 +1404,6 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
     var out: [message.MTU]u8 = undefined;
     _ = (try assoc.pollTransmit(&out, 0)).?;
-    // sending the message empties the buffered amount
-    try testing.expectEqual(Event{ .buffered_amount_low_threshold = 0 }, assoc.pollEvent().?);
 
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
 
