@@ -1411,6 +1411,8 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}, assoc.message_assembler.advertised_wnd), 0);
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }, assoc.message_assembler.advertised_wnd), 0);
 
+    // sending the first message emptied the buffered amount, the ignored sacks produce nothing else
+    try testing.expectEqual(Event{ .buffered_amount_low_threshold = 0 }, assoc.pollEvent().?);
     try testing.expectEqual(null, assoc.pollEvent());
     try testing.expectEqual(2, assoc.message_queue.messages.len);
     try testing.expect(try assoc.pollTransmit(&out, 0) != null);
