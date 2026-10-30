@@ -568,21 +568,22 @@ pub const TransmitError = error{ WriteFailed, OutOfMemory };
 
 /// Poll the association for data to transmit.
 ///
-/// Chunks are bundled into packets of at most `message.MTU` bytes. `buffer` must be at least `message.MTU` bytes,
-/// otherwise `error.WriteFailed` is returned.
+/// Chunks are bundled into packets of at most `message.MTU` bytes.
+/// `error.WriteFailed` is returned if the buffer is too small to hold a packet.
 pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[]const u8 {
-    if (buffer.len < message.MTU) return error.WriteFailed;
+    if (buffer.len < message.packet_header_size) return error.WriteFailed;
     var written: usize = message.packet_header_size;
-    var slice = buffer[written..message.MTU];
+    var slice = buffer[written..@min(buffer.len, message.MTU)];
+    const can_fragment = buffer.len >= message.MTU;
     self.writeCommonHeader(buffer);
 
-    const prve_curr_msg = self.message_queue.curr_msg;
+    const prev_curr_msg = self.message_queue.curr_msg;
     if (self.burst_window == null and self.max_burst != 0) {
         self.burst_window = self.message_queue.flight_size +| @as(u32, self.max_burst) * message.PMDCS;
     }
 
     while (true) {
-        const next = self.nextChunk(slice, now, written == message.packet_header_size) catch |err| {
+        const next = self.nextChunk(slice, now, written == message.packet_header_size, can_fragment) catch |err| {
             if (written == message.packet_header_size) return err;
             break;
         };
@@ -603,17 +604,17 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
                 else => {},
             }
 
+            // Check for chunks' that must go alone in a packet.
             switch (chunk_type) {
                 .init, .init_ack, .shutdown_complete, .ootb_abort => break,
                 else => {},
             }
         }
-
-        if (slice.len < min_buffer_size) break;
     }
+
     Helper.checkSum(buffer[0..written]);
 
-    if (prve_curr_msg != self.message_queue.curr_msg) self.stream_reset.maybeStartTransmitting(&self.message_queue);
+    if (prev_curr_msg != self.message_queue.curr_msg) self.stream_reset.maybeStartTransmitting(&self.message_queue);
     return buffer[0..written];
 }
 
@@ -632,7 +633,13 @@ pub fn pollTimeout(self: *Association) ?i64 {
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
-fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) TransmitError!?struct { ?Transmit, usize } {
+fn nextChunk(
+    self: *Association,
+    buffer: []u8,
+    now: i64,
+    first_chunk: bool,
+    can_fragment: bool,
+) TransmitError!?struct { ?Transmit, usize } {
     if (self.fast_retransmit) {
         if (self.nextFastRetransmit(buffer, now) catch |err| {
             if (first_chunk) return err;
@@ -657,7 +664,7 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
 
         if (self.fast_recovery) if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
         if (self.burst_window) |window| if (self.message_queue.flight_size >= window) return null;
-        const result = try self.message_queue.nextChunk(self.allocator, buffer) orelse return null;
+        const result = try self.message_queue.nextChunk(self.allocator, buffer, can_fragment) orelse return null;
         self.zero_wnd_probe |= result.zero_wnd_probe;
 
         self.t3_timer.setDeadline(now);
@@ -670,6 +677,9 @@ fn nextChunk(self: *Association, buffer: []u8, now: i64, first_chunk: bool) Tran
         .init, .init_ack, .shutdown_complete, .ootb_abort => return null,
         else => {},
     };
+
+    // Check buffer size after we're sure we have a chunk to write.
+    if (buffer.len < min_buffer_size) return error.WriteFailed;
 
     const written = switch (chunk_type) {
         .init => self.writeInit(buffer),
