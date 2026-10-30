@@ -5,6 +5,9 @@ const Helper = @import("helper.zig");
 const MessageQueue = @This();
 const SackHandler = @import("sack_handler.zig");
 
+/// The smallest message payload takes 4 bytes, padding included.
+const min_fragment_payload = 4;
+
 pub const Event = union(enum) {
     buffered_amount_low_threshold: u16,
 };
@@ -235,10 +238,15 @@ pub const NextChunkResult = packed struct {
 
 pub const NextChunkError = error{WriteFailed} || std.mem.Allocator.Error;
 
-pub fn nextChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) NextChunkError!?NextChunkResult {
+pub fn nextChunk(
+    self: *MessageQueue,
+    allocator: std.mem.Allocator,
+    buffer: []u8,
+    can_fragment: bool,
+) NextChunkError!?NextChunkResult {
     const size = try self.nextRetransmit(buffer) orelse {
         var zero_wnd_probe = false;
-        const next_chunk_size = try self.nextChunkSize(buffer.len) orelse return null;
+        const next_chunk_size = try self.nextChunkSize(buffer.len, can_fragment) orelse return null;
         if (self.rwnd < next_chunk_size) {
             if (self.chunks.len != 0) return null;
             zero_wnd_probe = true;
@@ -356,19 +364,21 @@ fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
     return @intCast(chunk.write(buffer));
 }
 
-fn nextChunkSize(self: *MessageQueue, buffer_size: usize) error{WriteFailed}!?u32 {
-    if (self.curr_msg >= self.messages.len) return null;
-    if (self.chunks.len >= SackHandler.bitmap_bits - 1) return null;
+fn nextChunkSize(self: *MessageQueue, buffer_size: usize, can_fragment: bool) error{WriteFailed}!?u32 {
+    if (self.curr_msg >= self.messages.len or self.chunks.len >= SackHandler.bitmap_bits - 1) return null;
     const msg = self.messages.atPtr(self.curr_msg);
     const curr_payload = msg.data.len - self.message_offset;
-    const max_payload = std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4);
+    if (std.mem.alignForward(usize, message.data_chunk_header_size + curr_payload, 4) <= buffer_size) {
+        return @intCast(curr_payload);
+    }
 
-    // A message that fits in one packet is not fragmented when the buffer is too small, it's sent whole
-    // on a later call to nextChunk() with a big enough buffer.
-    if (self.message_offset == 0 and curr_payload > max_payload and
-        msg.data.len <= message.PMDCS - message.data_chunk_header_size) return error.WriteFailed;
+    // A message is never fragmented to fit a short buffer, and a message that fits in one packet is not fragmented
+    // at all, it's sent whole on a later call to nextChunk() with a big enough buffer.
+    if (!can_fragment or buffer_size < message.data_chunk_header_size + min_fragment_payload or
+        (self.message_offset == 0 and msg.data.len <= message.PMDCS - message.data_chunk_header_size))
+        return error.WriteFailed;
 
-    return @intCast(@min(curr_payload, max_payload));
+    return @intCast(std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4));
 }
 
 fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!usize {
@@ -554,8 +564,8 @@ test "MessageQueue.nextChunk: a message that fits in one packet is not fragmente
     try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [message.PMDCS]u8 = undefined;
-    try testing.expectError(error.WriteFailed, msg_queue.nextChunk(testing.allocator, buffer[0..200]));
-    const result = (try msg_queue.nextChunk(testing.allocator, &buffer)).?;
+    try testing.expectError(error.WriteFailed, msg_queue.nextChunk(testing.allocator, buffer[0..200], true));
+    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, true)).?;
     try testing.expectEqual(message.data_chunk_header_size + data.len, result.written);
 }
 
@@ -568,7 +578,7 @@ test "MessageQueue.nextChunk: data chunk padding fits in a buffer not aligned to
     try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [130]u8 = undefined;
-    const result = (try msg_queue.nextChunk(testing.allocator, &buffer)).?;
+    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, true)).?;
     try testing.expectEqual(0, result.written % 4);
     try testing.expect(result.written <= buffer.len);
 }
@@ -583,7 +593,7 @@ test "MessageQueue.nextChunk: outstanding tsns stay within the peer's tsn window
     }
 
     var buffer: [64]u8 = undefined;
-    while (try msg_queue.nextChunk(testing.allocator, &buffer)) |_| {}
+    while (try msg_queue.nextChunk(testing.allocator, &buffer, true)) |_| {}
     // the peer accepts tsns up to its cumulative tsn + bitmap_bits - 1
     try testing.expectEqual(SackHandler.bitmap_bits - 1, msg_queue.chunks.len);
 }
