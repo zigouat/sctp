@@ -109,6 +109,7 @@ const Transmit = union(enum) {
     sack,
     cookie_ack,
     abort: u32,
+    user_abort,
     ootb_abort: u32,
     cookie_echo: []const u8,
     heartbeat_ack: []const u8,
@@ -322,6 +323,15 @@ pub fn shutdown(self: *Association) Error!void {
     if (self.state != .established) return error.InvalidState;
     self.state = .shutdown_pending;
     try self.maybeSendShutdown();
+}
+
+/// Closes the association immediately, queued data is dropped and a single ABORT chunk is sent to the peer.
+pub fn abort(self: *Association) void {
+    if (self.state == .closed) return;
+    while (self.transmits.popFront()) |_| {}
+    self.pending_sack = false;
+    if (self.peer_verification_tag != 0) self.transmits.pushBack(self.allocator, .user_abort) catch {};
+    self.resetToClosed();
 }
 
 pub fn bufferedAmount(self: *const Association, stream: u16) ?u32 {
@@ -687,6 +697,7 @@ fn nextChunk(
         .cookie_echo => |cookie| try writeCookieEcho(cookie, buffer),
         .cookie_ack => self.writeCookieAck(buffer),
         .abort => |tsn| self.writeNoUserDataAbort(tsn, buffer),
+        .user_abort => writeAbort(buffer),
         .ootb_abort => writeReflectedAbort(buffer),
         .sack => self.message_assembler.writeSack(buffer),
         .heartbeat_ack => |data| try writeHeartbeatAck(data, buffer),
@@ -721,6 +732,10 @@ fn messageIterator(self: *Association) ?MessageIterator {
 
 fn setStateToClosed(self: *Association) !void {
     try self.events.pushBack(self.allocator, .comm_down);
+    self.resetToClosed();
+}
+
+fn resetToClosed(self: *Association) void {
     self.state = .closed;
     self.verification_tag = 0;
     self.resetInitTimer();
@@ -728,6 +743,10 @@ fn setStateToClosed(self: *Association) !void {
     self.message_assembler.reset(self.allocator);
     self.t3_timer = .init;
     self.zero_wnd_probe = false;
+    self.fast_retransmit = false;
+    self.fast_recovery = false;
+    self.stream_reset.deinit(self.allocator);
+    self.stream_reset = .init(self.initial_tsn);
 }
 
 fn setStateToEstablished(self: *Association) !void {
@@ -1063,6 +1082,13 @@ fn writeShutdown(buffer: []u8, tsn: u32) usize {
 
 fn writeShutdownAck(buffer: []u8) usize {
     buffer[0] = @intFromEnum(message.ChunkType.shutdown_ack);
+    buffer[1] = 0; // flags
+    std.mem.writeInt(u16, buffer[2..4], 4, .big);
+    return 4;
+}
+
+fn writeAbort(buffer: []u8) usize {
+    buffer[0] = @intFromEnum(message.ChunkType.abort);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
     return 4;
@@ -1466,6 +1492,42 @@ test "Association.handleRead: a shutdown acknowledging gap acked chunks does not
     try testing.expectEqual(100, assoc.message_queue.flight_size);
 }
 
+test "Association.abort: drops queued data and sends a single abort chunk" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+
+    const data: [100]u8 = @splat('a');
+    for (0..4) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+    var out: [message.MTU]u8 = undefined;
+    _ = try assoc.pollTransmit(&out, 0);
+    for (0..4) |_| try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
+
+    assoc.abort();
+    try testing.expectEqual(.closed, assoc.state);
+    try testing.expectEqual(null, assoc.pollEvent());
+
+    const packet = (try assoc.pollTransmit(&out, 0)).?;
+    try testing.expectEqual(message.packet_header_size + 4, packet.len);
+    try testing.expectEqual(assoc.peer_verification_tag, std.mem.readInt(u32, packet[4..8], .big));
+    try testing.expectEqual(@intFromEnum(message.ChunkType.abort), packet[12]);
+    try testing.expectEqual(0, packet[13]);
+
+    try testing.expectEqual(null, try assoc.pollTransmit(&out, 0));
+    try testing.expectEqual(null, assoc.pollTimeout());
+}
+
+test "Association.abort: nothing is sent before the peer tag is known" {
+    var assoc = testAssoc();
+    defer assoc.deinit();
+    try assoc.connect();
+
+    assoc.abort();
+    try testing.expectEqual(.closed, assoc.state);
+
+    var out: [message.MTU]u8 = undefined;
+    try testing.expectEqual(null, try assoc.pollTransmit(&out, 0));
+}
+
 test "Association.handleRead: Abort with the T bit and the peer tag closes the association" {
     var assoc = testAssoc();
     defer assoc.deinit();
@@ -1654,8 +1716,8 @@ test "Association.handleRead: a replayed cookie echo does not reopen a closed as
     defer assoc.deinit();
     const tag = assoc.verification_tag;
 
-    var abort: [16]u8 = undefined;
-    _ = try assoc.handleRead(testPacket(&abort, tag, .abort, 0), 0);
+    var abort_packet: [16]u8 = undefined;
+    _ = try assoc.handleRead(testPacket(&abort_packet, tag, .abort, 0), 0);
     try testing.expectEqual(.closed, assoc.state);
     _ = assoc.pollEvent();
 
