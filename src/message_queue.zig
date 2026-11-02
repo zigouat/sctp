@@ -5,6 +5,8 @@ const Helper = @import("helper.zig");
 const MessageQueue = @This();
 const SackHandler = @import("sack_handler.zig");
 
+const AllocError = std.mem.Allocator.Error;
+
 /// The smallest message payload takes 4 bytes, padding included.
 const min_fragment_payload = 4;
 
@@ -127,7 +129,7 @@ pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *
     result.value_ptr.buffered +|= @intCast(new_msg.data.len);
 }
 
-pub fn dropMessages(self: *MessageQueue, allocator: std.mem.Allocator, max_streams: u16) std.mem.Allocator.Error![]u16 {
+pub fn dropMessages(self: *MessageQueue, allocator: std.mem.Allocator, max_streams: u16) AllocError![]u16 {
     std.debug.assert(self.chunks.len == 0 and self.curr_msg == 0 and self.message_offset == 0);
     if (self.isEmpty()) return &.{};
 
@@ -170,17 +172,16 @@ pub const SackResult = struct {
     cumulative_ack_advanced: bool,
 };
 
-pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: message.Sack, fast_recovery: bool) std.mem.Allocator.Error!?SackResult {
-    const prev_flight_size = self.flight_size;
+pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: message.Sack, fast_recovery: bool) AllocError!?SackResult {
+    self.sack_handler.validateSack(&sack, self.highestTsnSent()) catch return null;
+
     const prev_cumulative_tsn = self.sack_handler.acked.cumulative_tsn;
     var acked_data: u32 = 0;
     var duplicate_data: u32 = 0;
 
+    const abandoned_size = self.abandonedUnackedSize(sack.cumulative_tsn);
     const old_gap_size = self.updateGapAckedFlightSize(true);
-    const has_fast_retransmit = self.sack_handler.handleSack(&sack, self.highestTsnSent(), fast_recovery) catch {
-        self.flight_size = prev_flight_size;
-        return null;
-    };
+    const has_fast_retransmit = self.sack_handler.handleSack(&sack, fast_recovery);
 
     var duplicate_it = sack.iterateDuplicateTsns();
     while (duplicate_it.next()) |tsn| {
@@ -192,6 +193,7 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     acked_data += self.dropAcknowledged(allocator);
     acked_data += self.updateGapAckedFlightSize(false);
     acked_data -|= old_gap_size;
+    acked_data -|= abandoned_size;
     self.rwnd = sack.a_rwnd -| self.flight_size;
 
     return .{
@@ -200,6 +202,13 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
         .has_fast_retransmit = has_fast_retransmit,
         .cumulative_ack_advanced = prev_cumulative_tsn != self.sack_handler.acked.cumulative_tsn,
     };
+}
+
+fn abandonedUnackedSize(self: *const MessageQueue, cumulative_tsn: u32) u32 {
+    var size: u32 = 0;
+    var it = self.sack_handler.iterateAbandonedUnacked(cumulative_tsn);
+    while (it.next()) |tsn| size +|= self.getChunkSizeAt(tsn);
+    return size;
 }
 
 pub fn resetStreams(self: *MessageQueue, streams: []const u16) void {
@@ -218,7 +227,7 @@ pub fn bufferedAmount(self: *const MessageQueue, stream_id: u16) ?u32 {
     return if (self.streams.getPtr(stream_id)) |stream| stream.buffered else null;
 }
 
-pub fn setBufferedAmountLowThreshold(self: *MessageQueue, allocator: std.mem.Allocator, stream_id: u16, threshold: u32) !void {
+pub fn setBufferedAmountLowThreshold(self: *MessageQueue, allocator: std.mem.Allocator, stream_id: u16, threshold: u32) AllocError!void {
     const entry = try self.streams.getOrPut(allocator, stream_id);
     if (!entry.found_existing) entry.value_ptr.* = .init;
     entry.value_ptr.buffered_low_thresh = threshold;
