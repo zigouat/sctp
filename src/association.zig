@@ -475,6 +475,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 try self.setStateToClosed();
                 return null;
             },
+            .forward_tsn => {},
             .reconfig => |params| {
                 if (!self.negotiated_extensions.stream_reconfiguration) continue; // send error chunk
                 var it = params;

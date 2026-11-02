@@ -71,7 +71,7 @@ pub const ChunkIterator = struct {
         const chunk_type: ChunkType = @enumFromInt(self.slice[0]);
         const flags = self.slice[1];
         const length = std.mem.readInt(u16, self.slice[2..4], .big);
-        const padded_length = (length + 3) & ~@as(u16, 3); // Align to 4 bytes
+        const padded_length = std.mem.alignForward(u32, length, 4);
 
         if (length < 4 or padded_length > self.slice.len) return error.InvalidChunk;
 
@@ -102,6 +102,7 @@ pub const ChunkIterator = struct {
                 if (length != 4) return error.InvalidChunk;
                 chunk = .shutdown_ack;
             },
+            .forward_tsn => chunk = .{ .forward_tsn = try ForwardTsn.parse(self.slice[4..length]) },
             .reconfig => chunk = .{ .reconfig = ParameterIterator.init(self.slice[4..length]) },
             .@"error" => chunk = .{ .@"error" = ErrorIterator.init(self.slice[4..length]) },
             .heartbeat_ack, .ecne, .cwr => {},
@@ -130,6 +131,7 @@ pub const ChunkType = enum(u8) {
     cwr,
     shutdown_complete,
     reconfig = 0x82,
+    forward_tsn = 0xC0,
     _,
 };
 
@@ -145,6 +147,7 @@ pub const Chunk = union(enum) {
     shutdown: u32,
     shutdown_complete: bool, // T bit
     shutdown_ack,
+    forward_tsn: ForwardTsn,
     reconfig: ParameterIterator,
     @"error": ErrorIterator,
 };
@@ -469,6 +472,40 @@ pub const ErrorIterator = struct {
     }
 };
 
+pub const ForwardTsn = struct {
+    new_cumulative_tsn: u32,
+    streams: []const u8,
+
+    pub const StreamIterator = struct {
+        slice: []const u8,
+
+        pub fn init(slice: []const u8) StreamIterator {
+            return StreamIterator{ .slice = slice };
+        }
+
+        pub fn next(self: *StreamIterator) ?struct { u16, u16 } {
+            if (self.slice.len < 4) return null;
+            const stream_id = std.mem.readInt(u16, self.slice[0..2], .big);
+            const stream_seq = std.mem.readInt(u16, self.slice[2..4], .big);
+            self.slice = self.slice[4..];
+            return .{ stream_id, stream_seq };
+        }
+    };
+
+    pub fn parse(data: []const u8) error{InvalidChunk}!ForwardTsn {
+        if (data.len < 4 or data.len % 4 != 0) return error.InvalidChunk;
+
+        return ForwardTsn{
+            .new_cumulative_tsn = std.mem.readInt(u32, data[0..4], .big),
+            .streams = data[4..],
+        };
+    }
+
+    pub fn iterateStreams(self: *const ForwardTsn) StreamIterator {
+        return StreamIterator.init(self.streams);
+    }
+};
+
 pub const ParameterType = enum(u16) {
     heartbeat_info = 0x0001,
     state_cookie = 0x0007,
@@ -476,6 +513,7 @@ pub const ParameterType = enum(u16) {
     incoming_ssn_reset_req = 0x000E,
     reconfig_response = 0x0010,
     supported_extensions = 0x8008,
+    forward_tsn_supported = 0xC000,
     _,
 };
 
@@ -566,6 +604,7 @@ pub const Parameter = union(enum) {
     outgoing_ssn_reset_req: OutgoingSsnResetRequest,
     incoming_ssn_reset_req: IncomingSsnResetRequest,
     reconfig_response: ReConfigResponse,
+    forward_tsn_supported: void,
     supported_extensions: []const ChunkType,
     unknown: struct { param_type: u16, value: []const u8 },
 
@@ -574,7 +613,6 @@ pub const Parameter = union(enum) {
             .heartbeat_info => |value| writeTLV(ParameterType.heartbeat_info, value, buffer),
             .state_cookie => |value| writeTLV(ParameterType.state_cookie, value, buffer),
             .supported_extensions => |value| writeTLV(ParameterType.supported_extensions, std.mem.sliceAsBytes(value), buffer),
-            .unknown => |param| writeTLV(@enumFromInt(param.param_type), param.value, buffer),
             .reconfig_response => |resp| blk: {
                 std.debug.assert((resp.sender_next_tsn == null) == (resp.receiver_next_tsn == null));
                 const size: usize = if (resp.sender_next_tsn != null) 16 else 8;
@@ -591,6 +629,8 @@ pub const Parameter = union(enum) {
 
                 break :blk size + 4;
             },
+            .forward_tsn_supported => writeTLV(ParameterType.forward_tsn_supported, &.{}, buffer),
+            .unknown => |param| writeTLV(@enumFromInt(param.param_type), param.value, buffer),
             else => unreachable,
         };
     }
@@ -633,6 +673,10 @@ pub const ParameterIterator = struct {
             .outgoing_ssn_reset_req => .{ .outgoing_ssn_reset_req = try OutgoingSsnResetRequest.parse(value) },
             .incoming_ssn_reset_req => .{ .incoming_ssn_reset_req = try IncomingSsnResetRequest.parse(value) },
             .reconfig_response => .{ .reconfig_response = try ReConfigResponse.parse(value) },
+            .forward_tsn_supported => blk: {
+                if (length != 4) return error.InvalidParameter;
+                break :blk .forward_tsn_supported;
+            },
             .supported_extensions => .{ .supported_extensions = std.mem.bytesAsSlice(ChunkType, value) },
             else => .{ .unknown = .{ .param_type = @intFromEnum(param_type), .value = value } },
         };
@@ -862,6 +906,29 @@ test "Sack.iterateGapAckBlocks" {
     }
 }
 
+test "ForwardTsn.parse" {
+    // without streams
+    {
+        const fwd = try ForwardTsn.parse(&.{ 0, 0, 0, 100 });
+        try std.testing.expectEqual(100, fwd.new_cumulative_tsn);
+        var it = fwd.iterateStreams();
+        try std.testing.expectEqual(null, it.next());
+    }
+
+    // with streams
+    {
+        const fwd = try ForwardTsn.parse(&.{ 0xFF, 0xFF, 0xFF, 0xFF, 0, 1, 0, 2, 0xAB, 0xCD, 0xFF, 0xFF });
+        try std.testing.expectEqual(0xFFFFFFFF, fwd.new_cumulative_tsn);
+        var it = fwd.iterateStreams();
+        try std.testing.expectEqual(.{ 1, 2 }, it.next().?);
+        try std.testing.expectEqual(.{ 0xABCD, 0xFFFF }, it.next().?);
+        try std.testing.expectEqual(null, it.next());
+    }
+
+    try std.testing.expectError(error.InvalidChunk, ForwardTsn.parse(&.{ 0, 0, 0 }));
+    try std.testing.expectError(error.InvalidChunk, ForwardTsn.parse(&.{ 0, 0, 0, 1, 0, 1 }));
+}
+
 test "ChunkIterator: parse hearbeat" {
     const data = [_]u8{
         0x04, 0x00, 0x00, 0x0F, 0x00,
@@ -1007,6 +1074,14 @@ test "Parameter.writeBuffer" {
         }, &buffer);
     }
 
+    {
+        const param = Parameter{ .forward_tsn_supported = {} };
+        var buffer: [4]u8 = undefined;
+        const n = try param.writeBuffer(&buffer);
+        try std.testing.expectEqual(4, n);
+        try std.testing.expectEqualSlices(u8, &.{ 0xC0, 0x00, 0x00, 0x04 }, &buffer);
+    }
+
     // With the optional sender and receiver next tsn
     {
         const param = Parameter{ .reconfig_response = .{
@@ -1043,6 +1118,7 @@ test "Parameter.writeBuffer: round trip through ParameterIterator" {
             .sender_next_tsn = 0xfffffffe,
             .receiver_next_tsn = 1,
         } },
+        .{ .forward_tsn_supported = {} },
         .{ .unknown = .{ .param_type = 0x4002, .value = "xyz" } },
     };
 
@@ -1053,6 +1129,9 @@ test "Parameter.writeBuffer: round trip through ParameterIterator" {
     var it = ParameterIterator.init(buffer[0..n]);
     try std.testing.expectEqualSlices(u8, "hb", (try it.next()).?.heartbeat_info);
     try std.testing.expectEqualDeep(params[1].reconfig_response, (try it.next()).?.reconfig_response);
+
+    const forward_tsn = (try it.next()).?;
+    try std.testing.expect(forward_tsn == .forward_tsn_supported);
 
     const unknown = (try it.next()).?.unknown;
     try std.testing.expectEqual(0x4002, unknown.param_type);
