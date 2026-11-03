@@ -34,16 +34,28 @@ const StreamState = struct {
     }
 };
 
+const MessageChunk = struct {
+    message_id: u32,
+    offset: u32,
+    length: u16,
+
+    fn getSize(self: *const MessageChunk) u32 {
+        return std.mem.alignForward(u32, message.data_chunk_header_size + self.length, 4);
+    }
+};
+
 sack_handler: SackHandler,
 streams: std.AutoHashMapUnmanaged(u16, StreamState),
 messages: std.Deque(message.UserMessage),
-chunks: std.Deque(message.Data),
+chunks: std.Deque(MessageChunk),
 events: std.Deque(Event),
+earliest_message_id: u32,
+curr_msg: u32,
+earliest_tsn: u32,
+message_offset: u32,
+curr_tsn: u32,
 flight_size: u32,
 rwnd: u32,
-curr_tsn: u32,
-curr_msg: u32,
-message_offset: u32,
 retransmit_index: ?u32,
 
 pub fn init(initial_tsn: u32) MessageQueue {
@@ -51,7 +63,9 @@ pub fn init(initial_tsn: u32) MessageQueue {
         .sack_handler = .init(initial_tsn),
         .streams = .empty,
         .messages = .empty,
+        .earliest_message_id = 0,
         .chunks = .empty,
+        .earliest_tsn = initial_tsn,
         .events = .empty,
         .curr_tsn = initial_tsn,
         .curr_msg = 0,
@@ -75,9 +89,11 @@ pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32
     while (self.chunks.popFront()) |_| {}
     while (self.messages.popFront()) |msg| allocator.free(msg.data);
     while (self.events.popFront()) |_| {}
-    self.curr_tsn = initial_tsn;
-    self.curr_msg = 0;
     self.message_offset = 0;
+    self.earliest_message_id = 0;
+    self.curr_msg = 0;
+    self.earliest_tsn = initial_tsn;
+    self.curr_tsn = initial_tsn;
     self.retransmit_index = null;
     self.sack_handler = .init(initial_tsn);
 }
@@ -306,20 +322,23 @@ fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator) u32 {
     var data_size: u32 = 0;
 
     const retransmit_index = self.retransmit_index orelse self.chunks.len;
-    const dropped = self.sack_handler.acked.cumulative_tsn -% self.chunks.frontPtr().?.tsn +% 1;
+    const dropped = self.sack_handler.acked.cumulative_tsn -% self.earliest_tsn +% 1;
+    var msg = self.messages.frontPtr().?;
     for (0..dropped) |index| {
         const chunk = self.chunks.popFront().?;
 
-        if (index < retransmit_index) self.flight_size -= @intCast(chunk.user_data.len);
+        if (index < retransmit_index) self.flight_size -= chunk.length;
         data_size +|= chunk.getSize();
 
-        if (chunk.flags.end_fragment) {
-            const msg = self.messages.popFront().?;
-            allocator.free(msg.data);
+        if (chunk.offset + chunk.length == msg.data.len) {
             self.curr_msg -= 1;
+            self.earliest_message_id +%= 1;
+            allocator.free(self.messages.popFront().?.data);
+            msg = self.messages.frontPtr() orelse break;
         }
     }
 
+    self.earliest_tsn +%= dropped;
     self.subRetransmitIndex(dropped);
     return data_size;
 }
@@ -331,14 +350,14 @@ fn subRetransmitIndex(self: *MessageQueue, count: u32) void {
 }
 
 fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void {
-    const index = tsn -% self.chunks.atPtr(0).tsn;
-    const chunk_size: u32 = @intCast(self.chunks.atPtr(index).user_data.len);
+    const index = tsn -% self.earliest_tsn;
+    const chunk_size: u32 = self.chunks.atPtr(index).length;
     if (inc) self.flight_size += chunk_size else self.flight_size -= chunk_size;
 }
 
 fn writeChunkAt(self: *const MessageQueue, tsn: u32, buffer: []u8) u32 {
-    const index = tsn -% self.chunks.atPtr(0).tsn;
-    return @intCast(self.chunks.at(index).write(buffer));
+    const index = tsn -% self.earliest_tsn;
+    return self.writeMessageChunk(index, self.chunks.at(index), buffer);
 }
 
 fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
@@ -355,13 +374,31 @@ fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
         return null;
     }
 
-    self.retransmit_index = tsn -% self.chunks.atPtr(0).tsn;
-    const chunk = self.chunks.atPtr(self.retransmit_index.?);
+    self.retransmit_index = tsn -% self.earliest_tsn;
+    const chunk = self.chunks.at(self.retransmit_index.?);
     if (chunk.getSize() > buffer.len) return error.WriteFailed;
-    self.flight_size += @intCast(chunk.user_data.len);
-    self.rwnd -|= @intCast(chunk.user_data.len);
+    self.flight_size += chunk.length;
+    self.rwnd -|= chunk.length;
+    const written = self.writeMessageChunk(self.retransmit_index.?, chunk, buffer);
     self.nextRetransmitIndex();
-    return @intCast(chunk.write(buffer));
+    return written;
+}
+
+fn writeMessageChunk(self: *const MessageQueue, chunk_index: u32, msg_chunk: MessageChunk, buffer: []u8) u32 {
+    const msg = self.messages.atPtr(msg_chunk.message_id -% self.earliest_message_id);
+    const data_chunk = message.Data{
+        .flags = .{
+            .start_fragment = msg_chunk.offset == 0,
+            .end_fragment = msg_chunk.offset +% msg_chunk.length == msg.data.len,
+            .unordered = msg.unordered,
+        },
+        .tsn = self.earliest_tsn +% chunk_index,
+        .ppid = msg.ppid,
+        .stream_id = msg.stream_id,
+        .stream_seq = msg.stream_seq,
+        .user_data = msg.data[msg_chunk.offset .. msg_chunk.offset + msg_chunk.length],
+    };
+    return @intCast(data_chunk.write(buffer));
 }
 
 fn nextChunkSize(self: *MessageQueue, buffer_size: usize, can_fragment: bool) error{WriteFailed}!?u32 {
@@ -402,7 +439,11 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
         .stream_seq = msg.stream_seq,
         .user_data = msg.data[self.message_offset .. self.message_offset + payload_size],
     };
-    self.chunks.pushBackAssumeCapacity(chunk);
+    self.chunks.pushBackAssumeCapacity(.{
+        .message_id = self.earliest_message_id +% self.curr_msg,
+        .offset = self.message_offset,
+        .length = @intCast(payload_size),
+    });
     self.curr_tsn +%= 1;
 
     if (chunk.flags.end_fragment) {
@@ -425,7 +466,7 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
 }
 
 fn getChunkSizeAt(self: *const MessageQueue, tsn: u32) u32 {
-    const index = tsn -% self.chunks.atPtr(0).tsn;
+    const index = tsn -% self.earliest_tsn;
     return self.chunks.atPtr(index).getSize();
 }
 
@@ -442,7 +483,7 @@ fn updateGapAckedFlightSize(self: *MessageQueue, comptime inc: bool) u32 {
 }
 
 fn getCurrentRetransmitTsn(self: *const MessageQueue) ?u32 {
-    if (self.retransmit_index) |index| return self.chunks.atPtr(index).tsn;
+    if (self.retransmit_index) |index| return self.earliest_tsn +% index;
     return null;
 }
 
