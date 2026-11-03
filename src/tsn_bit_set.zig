@@ -210,19 +210,29 @@ pub fn countAcked(self: *const TsnBitSet, start_tsn: u32, end_tsn: u32) u32 {
 
 /// The lowest set bit in an inclusive tsn range.
 pub fn firstAcked(self: *const TsnBitSet, start_tsn: u32, end_tsn: u32) ?u32 {
+    return firstSet(&self.acked_tsn, start_tsn, end_tsn);
+}
+
+/// The lowest unset bit in an inclusive tsn range.
+pub fn firstUnacked(self: *const TsnBitSet, start_tsn: u32, end_tsn: u32) ?u32 {
+    return firstUnset(&self.acked_tsn, start_tsn, end_tsn);
+}
+
+/// The lowest set bit in an inclusive tsn range of a bitset indexed by `bitIndex`.
+pub fn firstSet(bit_set: anytype, start_tsn: u32, end_tsn: u32) ?u32 {
     var it = WordIterator.init(start_tsn, end_tsn, false);
     while (it.next()) |word| {
-        const bits = self.acked_tsn.masks[word.index] & word.mask;
+        const bits = bit_set.masks[word.index] & word.mask;
         if (bits != 0) return word.firstTsn(bits);
     }
     return null;
 }
 
-/// The lowest unset bit in an inclusive tsn range.
-pub fn firstUnacked(self: *const TsnBitSet, start_tsn: u32, end_tsn: u32) ?u32 {
+/// The lowest unset bit in an inclusive tsn range of a bitset indexed by `bitIndex`.
+pub fn firstUnset(bit_set: anytype, start_tsn: u32, end_tsn: u32) ?u32 {
     var it = WordIterator.init(start_tsn, end_tsn, false);
     while (it.next()) |word| {
-        const bits = ~self.acked_tsn.masks[word.index] & word.mask;
+        const bits = ~bit_set.masks[word.index] & word.mask;
         if (bits != 0) return word.firstTsn(bits);
     }
     return null;
@@ -230,9 +240,14 @@ pub fn firstUnacked(self: *const TsnBitSet, start_tsn: u32, end_tsn: u32) ?u32 {
 
 /// The highest set bit in an inclusive tsn range.
 pub fn lastAcked(self: *const TsnBitSet, start_tsn: u32, end_tsn: u32) ?u32 {
+    return lastSet(&self.acked_tsn, start_tsn, end_tsn);
+}
+
+/// The highest set bit in an inclusive tsn range of a bitset indexed by `bitIndex`.
+pub fn lastSet(bit_set: anytype, start_tsn: u32, end_tsn: u32) ?u32 {
     var it = WordIterator.init(start_tsn, end_tsn, true);
     while (it.next()) |word| {
-        const bits = self.acked_tsn.masks[word.index] & word.mask;
+        const bits = bit_set.masks[word.index] & word.mask;
         if (bits != 0) return word.lastTsn(bits);
     }
     return null;
@@ -240,9 +255,14 @@ pub fn lastAcked(self: *const TsnBitSet, start_tsn: u32, end_tsn: u32) ?u32 {
 
 /// The highest unset bit in an inclusive tsn range.
 pub fn lastUnacked(self: *const TsnBitSet, start_tsn: u32, end_tsn: u32) ?u32 {
+    return lastUnset(&self.acked_tsn, start_tsn, end_tsn);
+}
+
+/// The highest unset bit in an inclusive tsn range of a bitset indexed by `bitIndex`.
+pub fn lastUnset(bit_set: anytype, start_tsn: u32, end_tsn: u32) ?u32 {
     var it = WordIterator.init(start_tsn, end_tsn, true);
     while (it.next()) |word| {
-        const bits = ~self.acked_tsn.masks[word.index] & word.mask;
+        const bits = ~bit_set.masks[word.index] & word.mask;
         if (bits != 0) return word.lastTsn(bits);
     }
     return null;

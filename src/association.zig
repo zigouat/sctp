@@ -87,8 +87,9 @@ pub const Event = union(enum) {
 pub const MessageIterator = struct {
     assoc: *Association,
 
+    /// The message's data is valid until the next call to `next` or `handleRead`.
     pub fn next(it: *MessageIterator) ?message.UserMessage {
-        return it.assoc.message_assembler.drainReady();
+        return it.assoc.message_assembler.drainReady(it.assoc.allocator);
     }
 };
 
@@ -929,7 +930,7 @@ fn maybeSendShutdown(self: *Association) !void {
 /// Takes ownership of `streams`.
 fn resetIncomingStreams(self: *Association, streams: []u16) !void {
     defer self.allocator.free(streams);
-    self.message_assembler.resetStreams(streams);
+    self.message_assembler.resetStreams(self.allocator, streams);
     if (streams.len == 0) return try self.events.pushBack(self.allocator, .{ .incoming_stream_reset = null });
 
     try self.events.ensureUnusedCapacity(self.allocator, streams.len);
@@ -1180,7 +1181,6 @@ fn testRead(assoc: *Association, packet: []const u8, now: i64, lens: []usize) ![
     var it = try assoc.handleRead(packet, now) orelse return lens[0..0];
     var n: usize = 0;
     while (it.next()) |msg| : (n += 1) {
-        defer msg.deinit(testing.allocator);
         lens[n] = msg.data.len;
     }
     return lens[0..n];

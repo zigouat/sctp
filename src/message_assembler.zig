@@ -5,20 +5,19 @@ const message = @import("message.zig");
 const MessageAssembler = @This();
 const UserMessage = message.UserMessage;
 const SackGenerator = @import("sack_generator.zig");
+const TsnBitSet = @import("tsn_bit_set.zig");
 const Helper = @import("helper.zig");
+const BitSet = std.bit_set.StaticBitSet(bitmap_bits);
+const bitmap_bits = SackGenerator.bitmap_bits;
 
 const StreamState = struct {
     next_ssn: u16,
-    seq_to_tsn: std.AutoArrayHashMapUnmanaged(u16, u32),
+    complete_messages: std.AutoArrayHashMapUnmanaged(u16, TsnRange),
 
-    const init = StreamState{ .next_ssn = 0, .seq_to_tsn = .empty };
-
-    fn recordTsn(self: *StreamState, allocator: std.mem.Allocator, stream_seq: u16, tsn: u32) !void {
-        if (!self.seq_to_tsn.contains(stream_seq)) try self.seq_to_tsn.put(allocator, stream_seq, tsn);
-    }
+    const init = StreamState{ .next_ssn = 0, .complete_messages = .empty };
 
     fn deinit(self: *StreamState, allocator: std.mem.Allocator) void {
-        self.seq_to_tsn.deinit(allocator);
+        self.complete_messages.deinit(allocator);
     }
 };
 
@@ -27,12 +26,29 @@ pub const ReceiveError = AllocError || error{NoUserData};
 
 pub const sack_delay = 200;
 
+const TsnRange = struct {
+    start: u32,
+    end: u32,
+};
+
+const Ready = union(enum) {
+    range: TsnRange,
+    message: UserMessage, // single chunk messages
+};
+
 sack_generator: SackGenerator,
+/// start and end fragments of the messages not yet complete, single chunk messages are not tracked.
+boundary: BitSet,
 send_sack: bool,
 sack_deadline: i64,
+/// chunks of the messages not yet drained.
 pending: std.AutoArrayHashMapUnmanaged(u32, message.Data),
 streams: std.AutoHashMapUnmanaged(u16, StreamState),
-ready: std.Deque(UserMessage),
+ready: std.Deque(Ready),
+/// fragmented messages are assembled here when drained, it's as large as the largest complete message received.
+assembly_buffer: []u8,
+/// the single chunk message returned by the last drain, freed by the next one.
+drained_chunk: []const u8,
 capacity: u32,
 buffered_data: u32,
 advertised_wnd: u32,
@@ -40,11 +56,14 @@ advertised_wnd: u32,
 pub fn init(capacity: u32) MessageAssembler {
     return .{
         .sack_generator = .init(0),
+        .boundary = .empty,
         .send_sack = false,
         .sack_deadline = std.math.maxInt(i64),
         .pending = .empty,
         .streams = .empty,
         .ready = .empty,
+        .assembly_buffer = &.{},
+        .drained_chunk = &.{},
         .capacity = capacity,
         .buffered_data = 0,
         .advertised_wnd = capacity,
@@ -59,8 +78,14 @@ pub fn deinit(self: *MessageAssembler, allocator: std.mem.Allocator) void {
     while (streams_it.next()) |state| state.deinit(allocator);
     self.streams.deinit(allocator);
 
-    while (self.ready.popFront()) |msg| msg.deinit(allocator);
+    while (self.ready.popFront()) |ready| switch (ready) {
+        .range => {},
+        .message => |msg| msg.deinit(allocator),
+    };
     self.ready.deinit(allocator);
+
+    allocator.free(self.assembly_buffer);
+    allocator.free(self.drained_chunk);
 }
 
 pub fn reset(self: *MessageAssembler, allocator: std.mem.Allocator) void {
@@ -74,11 +99,7 @@ pub fn setInitTsn(self: *MessageAssembler, init_tsn: u32) void {
 
 pub fn receiveData(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) ReceiveError!bool {
     if (d.user_data.len == 0) return error.NoUserData;
-
-    self.sack_generator.checkTsn(d.tsn) catch |err| switch (err) {
-        error.Duplicate => return true,
-        else => return false,
-    };
+    self.sack_generator.checkTsn(d.tsn) catch |err| return err == error.Duplicate;
 
     const window_full = self.advertised_wnd == 0;
     if (window_full) {
@@ -86,13 +107,13 @@ pub fn receiveData(self: *MessageAssembler, allocator: std.mem.Allocator, d: mes
         if (!self.dropChunkWithHighestTsn(allocator, d)) return true;
     }
 
-    self.sack_generator.receiveTsn(d.tsn);
+    const stream_state = if (d.flags.unordered) null else try self.getStreamState(allocator, d.stream_id);
+    try self.ready.ensureUnusedCapacity(allocator, if (stream_state) |state| state.complete_messages.count() + 1 else 1);
 
-    const may_complete = try self.storeChunk(allocator, d);
-    self.buffered_data += @intCast(d.user_data.len);
-    self.advertised_wnd -|= @intCast(d.user_data.len);
+    if (d.isComplete() and (stream_state == null or d.stream_seq == stream_state.?.next_ssn)) {
+        try self.deliverSingleChunk(allocator, stream_state, d);
+    } else try self.storeFragment(allocator, stream_state, d);
 
-    if (may_complete) try self.assembleReadyMessages(allocator, self.streams.getPtr(d.stream_id).?);
     return window_full or d.flags.immediate;
 }
 
@@ -123,14 +144,28 @@ pub fn writeSack(self: *MessageAssembler, buffer: []u8) u32 {
     return written;
 }
 
-pub fn drainReady(self: *MessageAssembler) ?UserMessage {
-    if (self.ready.popFront()) |msg| {
-        self.buffered_data -= @intCast(msg.data.len);
-        self.updateAdvertisedWindow();
-        return msg;
-    }
+pub fn drainReady(self: *MessageAssembler, allocator: std.mem.Allocator) ?UserMessage {
+    allocator.free(self.drained_chunk);
+    self.drained_chunk = &.{};
 
-    return null;
+    const msg = switch (self.ready.popFront() orelse return null) {
+        .message => |msg| blk: {
+            self.drained_chunk = msg.data;
+            break :blk msg;
+        },
+        .range => |range| blk: {
+            var msg = self.pending.get(range.start).?.toUserMessage();
+            if (range.start == range.end) {
+                _ = self.pending.swapRemove(range.start);
+                self.drained_chunk = msg.data;
+            } else msg.data = self.assembleMessage(allocator, range);
+            break :blk msg;
+        },
+    };
+
+    self.buffered_data -= @intCast(msg.data.len);
+    self.updateAdvertisedWindow();
+    return msg;
 }
 
 pub fn getCumulativeTsn(self: *const MessageAssembler) u32 {
@@ -142,15 +177,31 @@ pub fn hasGaps(self: *const MessageAssembler) bool {
 }
 
 /// Restart the incoming stream sequence number of `streams` at 0, an empty slice resets all the streams.
-pub fn resetStreams(self: *MessageAssembler, streams: []const u16) void {
+pub fn resetStreams(self: *MessageAssembler, allocator: std.mem.Allocator, streams: []const u16) void {
     if (streams.len == 0) {
         var it = self.streams.valueIterator();
-        while (it.next()) |state| state.next_ssn = 0;
+        while (it.next()) |state| self.resetStream(allocator, state);
         return;
     }
 
     for (streams) |stream| {
-        if (self.streams.getPtr(stream)) |state| state.next_ssn = 0;
+        if (self.streams.getPtr(stream)) |state| self.resetStream(allocator, state);
+    }
+}
+
+/// Restarts the stream's ssn at 0 and frees the completed messages still waiting for an earlier ssn.
+/// A well behaving peer has all its messages delivered before the reset, so there are none to free.
+fn resetStream(self: *MessageAssembler, allocator: std.mem.Allocator, state: *StreamState) void {
+    state.next_ssn = 0;
+    for (state.complete_messages.values()) |range| self.dropMessage(allocator, range);
+    state.complete_messages.clearRetainingCapacity();
+}
+
+fn dropMessage(self: *MessageAssembler, allocator: std.mem.Allocator, range: TsnRange) void {
+    var tsn = range.start;
+    while (true) : (tsn +%= 1) {
+        _ = self.dropChunk(allocator, tsn);
+        if (tsn == range.end) break;
     }
 }
 
@@ -158,12 +209,135 @@ fn dropChunkWithHighestTsn(self: *MessageAssembler, allocator: std.mem.Allocator
     if (!self.sack_generator.received.inGapRange(d.tsn)) return false;
     var high = self.sack_generator.received.highest_tsn_received;
     while (Helper.tsnGt(high, d.tsn)) : (high -%= 1) {
-        if (!self.dropChunk(allocator, high)) continue;
+        const chunk = self.pending.get(high) orelse continue;
+        // a ready message can't be withdrawn, the stream's next ssn already moved past it
+        if (self.isReady(high)) continue;
+        self.removeCompleted(chunk);
+        _ = self.dropChunk(allocator, high);
         self.sack_generator.reneg(high);
         return true;
     }
 
     return false;
+}
+
+fn isReady(self: *const MessageAssembler, tsn: u32) bool {
+    var it = self.ready.iterator();
+    while (it.next()) |ready| {
+        const range = switch (ready) {
+            // not in pending, never a candidate for reneg
+            .message => continue,
+            .range => |range| range,
+        };
+        if (Helper.tsnLte(range.start, tsn) and Helper.tsnLte(tsn, range.end)) return true;
+    }
+    return false;
+}
+
+fn deliverSingleChunk(self: *MessageAssembler, allocator: std.mem.Allocator, stream_state: ?*StreamState, d: message.Data) std.mem.Allocator.Error!void {
+    var msg = d.toUserMessage();
+    msg.data = try allocator.dupe(u8, d.user_data);
+    self.commitChunk(d);
+
+    if (stream_state) |state| {
+        self.deliverInOrder(state, .{ .message = msg });
+    } else self.ready.pushBackAssumeCapacity(.{ .message = msg });
+}
+
+fn deliverInOrder(self: *MessageAssembler, stream_state: *StreamState, ready: Ready) void {
+    self.ready.pushBackAssumeCapacity(ready);
+    stream_state.next_ssn +%= 1;
+
+    while (stream_state.complete_messages.fetchSwapRemove(stream_state.next_ssn)) |complete| {
+        self.ready.pushBackAssumeCapacity(.{ .range = complete.value });
+        stream_state.next_ssn +%= 1;
+    }
+}
+
+fn storeFragment(self: *MessageAssembler, allocator: std.mem.Allocator, stream_state: ?*StreamState, d: message.Data) AllocError!void {
+    if (stream_state) |state| try state.complete_messages.ensureUnusedCapacity(allocator, 1);
+
+    // nothing below fails once the buffer is large enough for the message and the chunk is stored
+    const tsns = self.completedMessage(d);
+    if (tsns) |range| if (range.start != range.end) try self.growAssemblyBuffer(allocator, self.messageSize(range, d));
+    try self.storeChunk(allocator, d);
+    self.commitChunk(d);
+
+    if (tsns) |range| {
+        self.completeMessage(allocator, stream_state, range, d.stream_seq);
+    } else if (d.flags.start_fragment or d.flags.end_fragment) self.boundary.set(TsnBitSet.bitIndex(d.tsn));
+}
+
+fn completeMessage(self: *MessageAssembler, allocator: std.mem.Allocator, stream_state: ?*StreamState, range: TsnRange, ssn: u16) void {
+    self.setBoundary(range, false);
+    const state = stream_state orelse return self.ready.pushBackAssumeCapacity(.{ .range = range });
+    if (ssn == state.next_ssn) return self.deliverInOrder(state, .{ .range = range });
+
+    // a misbehaving peer sent another message with the ssn of a waiting one, keep the first
+    const entry = state.complete_messages.getOrPutAssumeCapacity(ssn);
+    if (entry.found_existing) {
+        @branchHint(.cold);
+        self.dropMessage(allocator, range);
+    } else entry.value_ptr.* = range;
+}
+
+fn commitChunk(self: *MessageAssembler, d: message.Data) void {
+    self.buffered_data += @intCast(d.user_data.len);
+    self.advertised_wnd -|= @intCast(d.user_data.len);
+    self.sack_generator.receiveTsn(d.tsn);
+}
+
+/// Removes the completed message `chunk` belongs to, its boundaries are set again so it completes once the chunk is received again.
+fn removeCompleted(self: *MessageAssembler, chunk: message.Data) void {
+    if (chunk.flags.unordered) return;
+    const stream_state = self.streams.getPtr(chunk.stream_id) orelse return;
+    const entry = stream_state.complete_messages.fetchSwapRemove(chunk.stream_seq) orelse return;
+    self.setBoundary(entry.value, true);
+}
+
+fn setBoundary(self: *MessageAssembler, range: TsnRange, value: bool) void {
+    if (range.start == range.end) return;
+    self.boundary.setValue(TsnBitSet.bitIndex(range.start), value);
+    self.boundary.setValue(TsnBitSet.bitIndex(range.end), value);
+}
+
+/// The tsn range of the message `d` completes, null if some of its fragments are still missing.
+/// `d` is not received yet, its own flags stand for its boundary.
+fn completedMessage(self: *const MessageAssembler, d: message.Data) ?TsnRange {
+    const start_tsn = if (d.flags.start_fragment) d.tsn else self.findFragmentStartTsn(d.tsn) orelse return null;
+    const end_tsn = if (d.flags.end_fragment) d.tsn else self.findFragmentEndTsn(d.tsn) orelse return null;
+    return .{ .start = start_tsn, .end = end_tsn };
+}
+
+/// The nearest boundary before `tsn`, if no gap lies between them.
+fn findFragmentStartTsn(self: *const MessageAssembler, tsn: u32) ?u32 {
+    const received = &self.sack_generator.received;
+    var it = TsnBitSet.WordIterator.init(tsn -% bitmap_bits +% 1, tsn -% 1, true);
+    while (it.next()) |word| {
+        const boundaries = self.boundary.masks[word.index] & word.mask;
+        const gaps = ~received.acked_tsn.masks[word.index] & word.mask;
+        // bits up to the cumulative tsn are cleared but received, @clz(0) loses against any set bit
+        if (gaps != 0 and Helper.tsnGt(word.lastTsn(gaps), received.cumulative_tsn) and @clz(gaps) <= @clz(boundaries)) return null;
+        if (boundaries != 0) return word.lastTsn(boundaries);
+    }
+    return null;
+}
+
+/// The nearest boundary after `tsn`, if no gap lies between them.
+fn findFragmentEndTsn(self: *const MessageAssembler, tsn: u32) ?u32 {
+    // tsns up to the cumulative tsn are received and the one after it is not, so no gap check is needed below it
+    const received = &self.sack_generator.received;
+    const check_gaps = Helper.tsnGt(tsn, received.cumulative_tsn);
+    const end_tsn = if (check_gaps) received.highest_tsn_received else received.cumulative_tsn;
+
+    var it = TsnBitSet.WordIterator.init(tsn +% 1, end_tsn, false);
+    while (it.next()) |word| {
+        const boundaries = self.boundary.masks[word.index] & word.mask;
+        const gaps = if (check_gaps) ~received.acked_tsn.masks[word.index] & word.mask else 0;
+        if (gaps != 0 and @ctz(gaps) <= @ctz(boundaries)) return null;
+        if (boundaries != 0) return word.firstTsn(boundaries);
+    }
+    return null;
 }
 
 fn dropChunk(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32) bool {
@@ -177,51 +351,11 @@ fn dropChunk(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32) bo
     return false;
 }
 
-fn storeChunk(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) !bool {
-    try self.ready.ensureUnusedCapacity(allocator, 1);
+fn storeChunk(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) !void {
     try self.pending.ensureUnusedCapacity(allocator, 1);
-
     var copy = d;
     copy.user_data = try allocator.dupe(u8, d.user_data);
-    errdefer allocator.free(copy.user_data);
-
-    if (copy.flags.unordered) {
-        try self.handleUnorderedChunk(allocator, copy);
-        return false;
-    }
-
-    const stream_state = try self.getStreamState(allocator, d.stream_id);
-    const is_next = stream_state.next_ssn == d.stream_seq;
-    if (is_next and d.isComplete()) {
-        stream_state.next_ssn +%= 1;
-        self.ready.pushBackAssumeCapacity(copy.toUserMessage());
-        return true;
-    }
-
-    try stream_state.recordTsn(allocator, d.stream_seq, d.tsn);
     self.pending.putAssumeCapacity(d.tsn, copy);
-    return is_next;
-}
-
-fn handleUnorderedChunk(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) !void {
-    if (d.isComplete()) {
-        self.ready.pushBackAssumeCapacity(d.toUserMessage());
-        return;
-    }
-
-    self.pending.putAssumeCapacity(d.tsn, d);
-    errdefer _ = self.pending.swapRemove(d.tsn);
-    if (try self.tryReassemble(allocator, d.tsn)) |msg| self.ready.pushBackAssumeCapacity(msg);
-}
-
-fn assembleReadyMessages(self: *MessageAssembler, allocator: std.mem.Allocator, stream_state: *StreamState) !void {
-    while (stream_state.seq_to_tsn.get(stream_state.next_ssn)) |tsn| {
-        try self.ready.ensureUnusedCapacity(allocator, 1);
-        const msg = try self.tryReassemble(allocator, tsn) orelse return;
-        self.ready.pushBackAssumeCapacity(msg);
-        _ = stream_state.seq_to_tsn.swapRemove(stream_state.next_ssn);
-        stream_state.next_ssn +%= 1;
-    }
 }
 
 fn updateAdvertisedWindow(self: *MessageAssembler) void {
@@ -234,44 +368,34 @@ fn updateAdvertisedWindow(self: *MessageAssembler) void {
     }
 }
 
-fn tryReassemble(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32) !?UserMessage {
-    var start_tsn = tsn;
-    while (true) {
-        const frag = self.pending.getPtr(start_tsn) orelse return null;
-        if (frag.flags.start_fragment) break;
-        start_tsn -%= 1;
+fn messageSize(self: *const MessageAssembler, range: TsnRange, d: message.Data) usize {
+    var size: usize = d.user_data.len;
+    var tsn = range.start;
+    while (true) : (tsn +%= 1) {
+        if (tsn != d.tsn) size += self.pending.getPtr(tsn).?.user_data.len;
+        if (tsn == range.end) break;
     }
+    return size;
+}
 
-    var end_tsn = start_tsn;
-    var total_len: usize = 0;
-    while (true) {
-        const frag = self.pending.getPtr(end_tsn) orelse return null;
-        total_len += frag.user_data.len;
-        if (frag.flags.end_fragment) break;
-        end_tsn +%= 1;
-    }
+fn growAssemblyBuffer(self: *MessageAssembler, allocator: std.mem.Allocator, size: usize) AllocError!void {
+    if (size <= self.assembly_buffer.len) return;
+    const buffer = try allocator.alloc(u8, size);
+    allocator.free(self.assembly_buffer);
+    self.assembly_buffer = buffer;
+}
 
-    const data = try allocator.alloc(u8, total_len);
-    errdefer allocator.free(data);
-
+fn assembleMessage(self: *MessageAssembler, allocator: std.mem.Allocator, range: TsnRange) []const u8 {
     var offset: usize = 0;
-    var t = start_tsn;
-    const first = self.pending.get(start_tsn).?;
-    while (true) : (t +%= 1) {
-        const entry = self.pending.fetchSwapRemove(t).?.value;
-        @memcpy(data[offset .. offset + entry.user_data.len], entry.user_data);
-        offset += entry.user_data.len;
-        allocator.free(entry.user_data);
-        if (entry.flags.end_fragment) break;
+    var tsn = range.start;
+    while (true) : (tsn +%= 1) {
+        const fragment = self.pending.fetchSwapRemove(tsn).?.value.user_data;
+        @memcpy(self.assembly_buffer[offset .. offset + fragment.len], fragment);
+        offset += fragment.len;
+        allocator.free(fragment);
+        if (tsn == range.end) break;
     }
-
-    return UserMessage{
-        .stream_id = first.stream_id,
-        .stream_seq = first.stream_seq,
-        .unordered = first.flags.unordered,
-        .ppid = first.ppid,
-        .data = data,
-    };
+    return self.assembly_buffer[0..offset];
 }
 
 fn getStreamState(self: *MessageAssembler, allocator: std.mem.Allocator, stream_id: u16) !*StreamState {
@@ -307,10 +431,9 @@ test "MessageAssembler.receiveData: single-chunk unordered message is delivered 
 
     _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .unordered_complete, "hello"));
 
-    const msg = r.drainReady().?;
-    defer msg.deinit(testing.allocator);
+    const msg = r.drainReady(testing.allocator).?;
     try testing.expectEqualStrings("hello", msg.data);
-    try testing.expect(r.drainReady() == null);
+    try testing.expect(r.drainReady(testing.allocator) == null);
 }
 
 test "MessageAssembler.receiveData: single-chunk ordered message with ssn 0 is delivered immediately" {
@@ -319,10 +442,9 @@ test "MessageAssembler.receiveData: single-chunk ordered message with ssn 0 is d
 
     _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .complete, "hello"));
 
-    const msg = r.drainReady().?;
-    defer msg.deinit(testing.allocator);
+    const msg = r.drainReady(testing.allocator).?;
     try testing.expectEqualStrings("hello", msg.data);
-    try testing.expect(r.drainReady() == null);
+    try testing.expect(r.drainReady(testing.allocator) == null);
 }
 
 test "MessageAssembler.receiveData: unordered message bypasses a pending ordered reorder buffer" {
@@ -330,15 +452,14 @@ test "MessageAssembler.receiveData: unordered message bypasses a pending ordered
     defer r.deinit(testing.allocator);
 
     _ = try r.receiveData(testing.allocator, testData(1, 0, 1, .complete, "ordered-second"));
-    try testing.expect(r.drainReady() == null);
+    try testing.expect(r.drainReady(testing.allocator) == null);
 
     _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .unordered_complete, "unordered"));
-    const msg = r.drainReady().?;
-    defer msg.deinit(testing.allocator);
+    const msg = r.drainReady(testing.allocator).?;
     try testing.expectEqualStrings("unordered", msg.data);
 
     // the ordered ssn-1 message is still pending, unaffected by the unordered delivery
-    try testing.expect(r.drainReady() == null);
+    try testing.expect(r.drainReady(testing.allocator) == null);
 }
 
 test "MessageAssembler.receiveData: zero receive window drops or reneg chunks" {
@@ -351,7 +472,7 @@ test "MessageAssembler.receiveData: zero receive window drops or reneg chunks" {
 
     // ssn 1 waits for ssn 0
     try testing.expect(!try r.receiveData(testing.allocator, testData(tsn +% 1, 1, 1, .complete, payload[0..60])));
-    try testing.expect(r.drainReady() == null);
+    try testing.expect(r.drainReady(testing.allocator) == null);
     try testing.expect(r.pending.contains(tsn +% 1));
     try testing.expectEqual(40, r.advertised_wnd);
 
@@ -382,42 +503,38 @@ test "MessageAssembler.drainReady: re-assemble messages" {
 
     {
         _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .start_frag, "hel"));
-        try testing.expect(r.drainReady() == null);
+        try testing.expect(r.drainReady(testing.allocator) == null);
 
         _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .end_frag, "lo"));
-        const msg = r.drainReady().?;
-        defer msg.deinit(testing.allocator);
+        const msg = r.drainReady(testing.allocator).?;
         try testing.expectEqualStrings("hello", msg.data);
     }
 
     {
         _ = try r.receiveData(testing.allocator, testData(4, 0, 1, .end_frag, "lo"));
-        try testing.expect(r.drainReady() == null);
+        try testing.expect(r.drainReady(testing.allocator) == null);
 
         _ = try r.receiveData(testing.allocator, testData(3, 0, 1, .start_frag, "hel"));
-        const msg = r.drainReady().?;
-        defer msg.deinit(testing.allocator);
+        const msg = r.drainReady(testing.allocator).?;
         try testing.expectEqualStrings("hello", msg.data);
     }
 
     {
         _ = try r.receiveData(testing.allocator, testData(5, 1, 0, .start_frag, "he"));
         _ = try r.receiveData(testing.allocator, testData(7, 1, 0, .end_frag, "lo"));
-        try testing.expect(r.drainReady() == null);
+        try testing.expect(r.drainReady(testing.allocator) == null);
 
         _ = try r.receiveData(testing.allocator, testData(6, 1, 0, .middle_frag, "l"));
-        const msg = r.drainReady().?;
-        defer msg.deinit(testing.allocator);
+        const msg = r.drainReady(testing.allocator).?;
         try testing.expectEqualStrings("hello", msg.data);
     }
 
     {
         _ = try r.receiveData(testing.allocator, testData(8, 2, 0, .unordered_start_frag, "hel"));
-        try testing.expect(r.drainReady() == null);
+        try testing.expect(r.drainReady(testing.allocator) == null);
 
         _ = try r.receiveData(testing.allocator, testData(9, 2, 0, .unordered_end_frag, "lo"));
-        const msg = r.drainReady().?;
-        defer msg.deinit(testing.allocator);
+        const msg = r.drainReady(testing.allocator).?;
         try testing.expectEqualStrings("hello", msg.data);
     }
 }
@@ -428,17 +545,16 @@ test "MessageAssembler.drainReady: re-ordered messages are drained in order" {
 
     _ = try r.receiveData(testing.allocator, testData(3, 0, 2, .complete, "third"));
     _ = try r.receiveData(testing.allocator, testData(2, 0, 1, .complete, "second"));
-    try testing.expect(r.drainReady() == null);
+    try testing.expect(r.drainReady(testing.allocator) == null);
 
     _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .complete, "first"));
 
     for ([_][]const u8{ "first", "second", "third" }) |expected| {
-        const msg = r.drainReady().?;
-        defer msg.deinit(testing.allocator);
+        const msg = r.drainReady(testing.allocator).?;
         try testing.expectEqualStrings(expected, msg.data);
     }
 
-    try testing.expect(r.drainReady() == null);
+    try testing.expect(r.drainReady(testing.allocator) == null);
 }
 
 test "MessageAssembler: independent streams track ssn separately" {
@@ -448,22 +564,19 @@ test "MessageAssembler: independent streams track ssn separately" {
     _ = try r.receiveData(testing.allocator, testData(1, 1, 0, .complete, "stream1"));
     _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .complete, "stream0"));
 
-    const a = r.drainReady().?;
-    defer a.deinit(testing.allocator);
+    const a = r.drainReady(testing.allocator).?;
     try testing.expectEqualStrings("stream1", a.data);
 
-    const b = r.drainReady().?;
-    defer b.deinit(testing.allocator);
+    const b = r.drainReady(testing.allocator).?;
     try testing.expectEqualStrings("stream0", b.data);
 }
 
 fn testExpectReady(r: *MessageAssembler, expected: []const []const u8) !void {
     for (expected) |data| {
-        const msg = r.drainReady().?;
-        defer msg.deinit(testing.allocator);
+        const msg = r.drainReady(testing.allocator).?;
         try testing.expectEqualStrings(data, msg.data);
     }
-    try testing.expectEqual(null, r.drainReady());
+    try testing.expectEqual(null, r.drainReady(testing.allocator));
 }
 
 test "MessageAssembler.resetStreams: restarts the incoming ssn at 0" {
@@ -476,7 +589,7 @@ test "MessageAssembler.resetStreams: restarts the incoming ssn at 0" {
         try testExpectReady(&r, &.{ "a", "b" });
 
         // Streams that are not reset keep their ssn
-        r.resetStreams(&.{ 1, 3 });
+        r.resetStreams(testing.allocator, &.{ 1, 3 });
         _ = try r.receiveData(testing.allocator, testData(3, 1, 0, .complete, "c"));
         _ = try r.receiveData(testing.allocator, testData(4, 2, 1, .complete, "d"));
         try testExpectReady(&r, &.{ "c", "d" });
@@ -491,7 +604,7 @@ test "MessageAssembler.resetStreams: restarts the incoming ssn at 0" {
         _ = try r.receiveData(testing.allocator, testData(2, 2, 0, .complete, "b"));
         try testExpectReady(&r, &.{ "a", "b" });
 
-        r.resetStreams(&.{});
+        r.resetStreams(testing.allocator, &.{});
         _ = try r.receiveData(testing.allocator, testData(3, 1, 0, .complete, "c"));
         _ = try r.receiveData(testing.allocator, testData(4, 2, 0, .complete, "d"));
         try testExpectReady(&r, &.{ "c", "d" });
@@ -502,17 +615,15 @@ test "MessageAssembler: ssn wraparound at 0xFFFF advances to 0" {
     var r: MessageAssembler = .init(4000);
     defer r.deinit(testing.allocator);
 
-    try r.streams.put(testing.allocator, 0, .{ .next_ssn = 0xFFFF, .seq_to_tsn = .empty });
+    try r.streams.put(testing.allocator, 0, .{ .next_ssn = 0xFFFF, .complete_messages = .empty });
 
     _ = try r.receiveData(testing.allocator, testData(1, 0, 0xFFFF, .complete, "last"));
-    const first = r.drainReady().?;
-    defer first.deinit(testing.allocator);
+    const first = r.drainReady(testing.allocator).?;
     try testing.expectEqualStrings("last", first.data);
     try testing.expectEqual(@as(u16, 0), r.streams.get(0).?.next_ssn);
 
     _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .complete, "wrapped"));
-    const second = r.drainReady().?;
-    defer second.deinit(testing.allocator);
+    const second = r.drainReady(testing.allocator).?;
     try testing.expectEqualStrings("wrapped", second.data);
 }
 
@@ -532,15 +643,13 @@ test "MessageAssembler: advertised window" {
     _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .unordered_end_frag, &data_chunk));
     try testing.expectEqual(1000, r.advertised_wnd);
 
-    const msg = r.drainReady().?;
-    msg.deinit(testing.allocator);
+    _ = r.drainReady(testing.allocator).?;
     try testing.expectEqual(3000, r.advertised_wnd);
 
     _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .complete, data_chunk[0..100]));
     try testing.expectEqual(2900, r.advertised_wnd);
 
-    const msg2 = r.drainReady().?;
-    msg2.deinit(testing.allocator);
+    _ = r.drainReady(testing.allocator).?;
     try testing.expectEqual(2900, r.advertised_wnd);
 }
 
@@ -583,72 +692,67 @@ test "MessageAssembler.receiveData: lazy reassembly of ordered messages" {
     defer r.deinit(testing.allocator);
 
     _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .start_frag, "hel"));
-    try testing.expect(r.pending.contains(1));
-
     _ = try r.receiveData(testing.allocator, testData(3, 0, 1, .complete, "hola"));
-    try testing.expect(r.pending.contains(3));
+    try testing.expectEqual(0, r.ready.len);
 
     _ = try r.receiveData(testing.allocator, testData(4, 0, 0, .unordered_complete, "Marhaba"));
-    try testing.expect(!r.pending.contains(4));
-    try testing.expect(r.ready.len == 1);
+    try testing.expectEqual(1, r.ready.len);
 
     _ = try r.receiveData(testing.allocator, testData(6, 0, 0, .unordered_end_frag, "jour"));
-    try testing.expect(r.pending.contains(6));
-    try testing.expect(r.ready.len == 1);
-
+    try testing.expectEqual(1, r.ready.len);
     _ = try r.receiveData(testing.allocator, testData(5, 0, 0, .unordered_start_frag, "bon"));
-    try testing.expect(!r.pending.contains(5));
-    try testing.expect(!r.pending.contains(6));
-    try testing.expect(r.ready.len == 2);
+    try testing.expectEqual(2, r.ready.len);
 
+    // completes ssn 0 and releases ssn 1
     _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .end_frag, "lo"));
-    try testing.expect(r.pending.count() == 0);
-    try testing.expect(r.ready.len == 4);
+    try testing.expectEqual(4, r.ready.len);
 
     _ = try r.receiveData(testing.allocator, testData(7, 0, 0, .unordered_start_frag, "sa"));
-    try testing.expect(r.pending.contains(7));
-    try testing.expect(r.ready.len == 4);
-
+    try testing.expectEqual(4, r.ready.len);
     _ = try r.receiveData(testing.allocator, testData(8, 0, 0, .unordered_end_frag, "lut"));
-    try testing.expect(r.pending.count() == 0);
-    try testing.expect(r.ready.len == 5);
+    try testing.expectEqual(5, r.ready.len);
 
     _ = try r.receiveData(testing.allocator, testData(10, 0, 3, .complete, "ciao"));
-    try testing.expect(r.pending.contains(10));
-    try testing.expect(r.ready.len == 5);
-
+    try testing.expectEqual(5, r.ready.len);
     _ = try r.receiveData(testing.allocator, testData(9, 0, 2, .complete, "hej"));
-    try testing.expect(r.pending.count() == 0);
-    try testing.expect(r.ready.len == 7);
+    try testing.expectEqual(7, r.ready.len);
 
+    // chunks are only assembled when drained, "Marhaba" and "hej" are delivered on arrival without going through pending
+    try testing.expectEqual(8, r.pending.count());
     for ([_][]const u8{ "Marhaba", "bonjour", "hello", "hola", "salut", "hej", "ciao" }) |expected| {
-        const msg = r.drainReady().?;
-        defer msg.deinit(testing.allocator);
+        const msg = r.drainReady(testing.allocator).?;
         try testing.expectEqualStrings(expected, msg.data);
     }
+    try testing.expectEqual(0, r.pending.count());
 }
 
-test "MessageAssembler.dropChunk: drops only chunks held for reordering" {
+test "MessageAssembler.dropChunkWithHighestTsn: withdraws completed messages but not ready ones" {
     var r = MessageAssembler.init(100);
     defer r.deinit(testing.allocator);
 
-    const payload: [60]u8 = @splat(0xAA);
-    _ = try r.receiveData(testing.allocator, testData(2, 0, 1, .complete, &payload));
-    _ = try r.receiveData(testing.allocator, testData(3, 1, 0, .complete, payload[0..40]));
+    const payload: [30]u8 = @splat('a');
+    // ssn 1 of stream 0 waits for ssn 0, stream 1 is ready
+    _ = try r.receiveData(testing.allocator, testData(2, 0, 1, .start_frag, &payload));
+    _ = try r.receiveData(testing.allocator, testData(3, 0, 1, .end_frag, &payload));
+    _ = try r.receiveData(testing.allocator, testData(4, 1, 0, .complete, "b" ** 40));
     try testing.expectEqual(0, r.advertised_wnd);
 
-    // ready messages are not held for reordering
-    try testing.expect(!r.dropChunk(testing.allocator, 3));
-    try testing.expect(!r.dropChunk(testing.allocator, 4));
+    // tsn 4 is ready so tsn 3 is dropped, withdrawing ssn 1
+    _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .complete, "c"));
+    try testing.expect(!r.pending.contains(3));
+    try testing.expect(!r.sack_generator.received.isAcked(3));
+    try testing.expect(r.sack_generator.received.isAcked(4));
+    try testing.expectEqual(0, r.streams.getPtr(0).?.complete_messages.count());
+    try testing.expectEqual(2, TsnBitSet.firstSet(&r.boundary, 1, 3));
+    try testing.expectEqual(2, r.ready.len);
 
-    try testing.expect(r.dropChunk(testing.allocator, 2));
-    try testing.expect(!r.pending.contains(2));
-    try testing.expectEqual(40, r.buffered_data);
-    try testing.expectEqual(60, r.advertised_wnd);
+    for ([_][]const u8{ "b" ** 40, "c" }) |expected| {
+        const msg = r.drainReady(testing.allocator).?;
+        try testing.expectEqualStrings(expected, msg.data);
+    }
 
-    // the dropped chunk can be received again
-    r.sack_generator.reneg(2);
-    try testing.expect(!try r.receiveData(testing.allocator, testData(2, 0, 1, .complete, &payload)));
-    try testing.expect(r.pending.contains(2));
-    try testing.expectEqual(0, r.advertised_wnd);
+    // ssn 1 completes again once the dropped chunk is received again
+    _ = try r.receiveData(testing.allocator, testData(3, 0, 1, .end_frag, &payload));
+    const msg = r.drainReady(testing.allocator).?;
+    try testing.expectEqualStrings(&(payload ++ payload), msg.data);
 }
