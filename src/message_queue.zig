@@ -128,6 +128,7 @@ pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *
 }
 
 pub fn dropMessages(self: *MessageQueue, allocator: std.mem.Allocator, max_streams: u16) std.mem.Allocator.Error![]u16 {
+    std.debug.assert(self.chunks.len == 0 and self.curr_msg == 0 and self.message_offset == 0);
     if (self.isEmpty()) return &.{};
 
     var dropped_streams: std.ArrayList(u16) = .empty;
