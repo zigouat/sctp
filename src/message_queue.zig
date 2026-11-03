@@ -119,14 +119,11 @@ pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *
     try self.messages.ensureUnusedCapacity(allocator, 1);
     try self.streams.ensureUnusedCapacity(allocator, 1);
 
-    var new_msg = msg.*;
     const result = self.streams.getOrPutAssumeCapacity(msg.stream_id);
     if (!result.found_existing) result.value_ptr.* = .init;
-    new_msg.stream_seq = result.value_ptr.stream_seq;
 
-    self.messages.pushBackAssumeCapacity(new_msg);
-    if (!msg.unordered) result.value_ptr.incSeq();
-    result.value_ptr.buffered +|= @intCast(new_msg.data.len);
+    self.messages.pushBackAssumeCapacity(msg.*);
+    result.value_ptr.buffered +|= @intCast(msg.data.len);
 }
 
 pub fn dropMessages(self: *MessageQueue, allocator: std.mem.Allocator, max_streams: u16) AllocError![]u16 {
@@ -437,6 +434,12 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
     const max_payload = std.mem.alignBackward(usize, buffer.len - message.data_chunk_header_size, 4);
     const payload_size = @min(msg.data.len - self.message_offset, max_payload);
 
+    const stream_state = self.streams.getPtr(msg.stream_id).?;
+    if (self.message_offset == 0 and !msg.unordered) {
+        msg.stream_seq = stream_state.stream_seq;
+        stream_state.incSeq();
+    }
+
     const chunk = message.Data{
         .flags = .{
             .start_fragment = self.message_offset == 0,
@@ -467,7 +470,6 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
     self.rwnd -|= @intCast(payload_size);
 
     // The buffered amount only counts data not sent yet, like the W3C `bufferedAmount`.
-    const stream_state = self.streams.getPtr(chunk.stream_id).?;
     if (stream_state.subBuffered(@intCast(payload_size))) {
         self.events.pushBackAssumeCapacity(.{ .buffered_amount_low_threshold = chunk.stream_id });
     }
@@ -524,7 +526,7 @@ fn testAckUpTo(msg_queue: *MessageQueue, allocator: std.mem.Allocator, cumulativ
     }, false);
 }
 
-test "MessageQueue.pushData: increment sequence and buffered size" {
+test "MessageQueue.pushData: increment buffered size" {
     var msg_queue = MessageQueue.init(0x12345678);
     defer msg_queue.deinit(testing.allocator);
 
@@ -533,7 +535,6 @@ test "MessageQueue.pushData: increment sequence and buffered size" {
         .stream_id = 100,
         .unordered = false,
     });
-    try testing.expectEqual(1, msg_queue.streams.get(100).?.stream_seq);
     try testing.expectEqual(5, msg_queue.streams.get(100).?.buffered);
 
     try msg_queue.pushData(testing.allocator, "World", .{
@@ -541,8 +542,25 @@ test "MessageQueue.pushData: increment sequence and buffered size" {
         .stream_id = 100,
         .unordered = true,
     });
-    try testing.expectEqual(1, msg_queue.streams.get(100).?.stream_seq);
     try testing.expectEqual(10, msg_queue.streams.get(100).?.buffered);
+}
+
+test "MessageQueue.nextChunk: ordered messages take the stream sequence when sent" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+    msg_queue.rwnd = 10_000;
+
+    try msg_queue.pushData(testing.allocator, "a", .{ .stream_id = 0, .ppid = 0 });
+    try msg_queue.pushData(testing.allocator, "b", .{ .stream_id = 0, .ppid = 0, .unordered = true });
+    try msg_queue.pushData(testing.allocator, "c", .{ .stream_id = 0, .ppid = 0 });
+    try testing.expectEqual(0, msg_queue.streams.get(0).?.stream_seq);
+
+    var buffer: [64]u8 = undefined;
+    for ([_]u16{ 0, 0, 1 }) |ssn| {
+        _ = (try msg_queue.nextChunk(testing.allocator, &buffer, true)).?;
+        try testing.expectEqual(ssn, std.mem.readInt(u16, buffer[10..12], .big));
+    }
+    try testing.expectEqual(2, msg_queue.streams.get(0).?.stream_seq);
 }
 
 test "MessageQueue.dropMessages: drops the messages of the streams above the limit" {
@@ -657,8 +675,7 @@ test "MessageQueue.setBufferedAmountLowThreshold: initializes the stream state o
     try testing.expectEqual(StreamState{ .stream_seq = 0, .buffered_low_thresh = 100, .buffered = 0 }, msg_queue.streams.get(7).?);
 
     try msg_queue.pushData(testing.allocator, "Hello", .{ .stream_id = 7, .ppid = 0 });
-    try testing.expectEqual(0, msg_queue.messages.at(0).stream_seq);
-    try testing.expectEqual(StreamState{ .stream_seq = 1, .buffered_low_thresh = 100, .buffered = 5 }, msg_queue.streams.get(7).?);
+    try testing.expectEqual(StreamState{ .stream_seq = 0, .buffered_low_thresh = 100, .buffered = 5 }, msg_queue.streams.get(7).?);
 }
 
 test "MessageQueue.handleSack: acknowledging every chunk during a retransmission clears the retransmit index" {
