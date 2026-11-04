@@ -14,6 +14,67 @@ pub const Event = union(enum) {
     buffered_amount_low_threshold: u16,
 };
 
+pub const Message = struct {
+    ptr: [*]const u8,
+    len: u32,
+    ppid: u32,
+    stream_id: u16,
+    stream_seq: u16,
+    flags: packed struct(u8) {
+        unordered: bool,
+        policy: std.meta.Tag(message.Policy),
+        _: u5 = 0,
+    },
+    policy_value: i64,
+
+    pub fn init(payload: []const u8, config: message.UserMessageConfig) Message {
+        return .{
+            .ptr = payload.ptr,
+            .policy_value = switch (config.policy) {
+                .reliable => 0,
+                .max_retransmit => |count| count,
+                .deadline => |deadline| deadline,
+            },
+            .len = @intCast(payload.len),
+            .ppid = config.ppid,
+            .stream_id = config.stream_id,
+            .stream_seq = 0,
+            .flags = .{ .unordered = config.unordered, .policy = config.policy },
+        };
+    }
+
+    pub fn deinit(msg: *const Message, allocator: std.mem.Allocator) void {
+        allocator.free(msg.data());
+    }
+
+    pub fn data(msg: *const Message) []const u8 {
+        return msg.ptr[0..msg.len];
+    }
+
+    pub fn policy(msg: *const Message) message.Policy {
+        return switch (msg.flags.policy) {
+            .reliable => .reliable,
+            .max_retransmit => .{ .max_retransmit = @intCast(msg.policy_value) },
+            .deadline => .{ .deadline = msg.policy_value },
+        };
+    }
+
+    fn toDataChunk(msg: *const Message, offset: u32, length: u16, tsn: u32) message.Data {
+        return message.Data{
+            .flags = .{
+                .start_fragment = offset == 0,
+                .end_fragment = offset + length == msg.len,
+                .unordered = msg.flags.unordered,
+            },
+            .tsn = tsn,
+            .ppid = msg.ppid,
+            .stream_id = msg.stream_id,
+            .stream_seq = msg.stream_seq,
+            .user_data = msg.ptr[offset .. offset + length],
+        };
+    }
+};
+
 const StreamState = struct {
     stream_seq: u16,
     buffered_low_thresh: u32,
@@ -40,6 +101,7 @@ const MessageChunk = struct {
     message_id: u32,
     offset: u32,
     length: u16,
+    retransmit: u16,
 
     fn getSize(self: *const MessageChunk) u32 {
         return std.mem.alignForward(u32, message.data_chunk_header_size + self.length, 4);
@@ -48,7 +110,7 @@ const MessageChunk = struct {
 
 sack_handler: SackHandler,
 streams: std.AutoHashMapUnmanaged(u16, StreamState),
-messages: std.Deque(message.UserMessage),
+messages: std.Deque(Message),
 chunks: std.Deque(MessageChunk),
 events: std.Deque(Event),
 earliest_message_id: u32,
@@ -79,7 +141,7 @@ pub fn init(initial_tsn: u32) MessageQueue {
 }
 
 pub fn deinit(self: *MessageQueue, allocator: std.mem.Allocator) void {
-    while (self.messages.popFront()) |msg| allocator.free(msg.data);
+    while (self.messages.popFront()) |msg| msg.deinit(allocator);
     self.streams.deinit(allocator);
     self.chunks.deinit(allocator);
     self.messages.deinit(allocator);
@@ -89,7 +151,7 @@ pub fn deinit(self: *MessageQueue, allocator: std.mem.Allocator) void {
 pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32) void {
     self.streams.clearAndFree(allocator);
     while (self.chunks.popFront()) |_| {}
-    while (self.messages.popFront()) |msg| allocator.free(msg.data);
+    while (self.messages.popFront()) |msg| msg.deinit(allocator);
     while (self.events.popFront()) |_| {}
     self.message_offset = 0;
     self.earliest_message_id = 0;
@@ -104,18 +166,11 @@ pub fn pushData(self: *MessageQueue, allocator: std.mem.Allocator, data: []const
     const data_copy = try allocator.dupe(u8, data);
     errdefer allocator.free(data_copy);
 
-    const msg = message.UserMessage{
-        .data = data_copy,
-        .ppid = config.ppid,
-        .stream_id = config.stream_id,
-        .stream_seq = 0,
-        .unordered = config.unordered,
-    };
-
+    const msg: Message = .init(data_copy, config);
     return try self.pushUserMessage(allocator, &msg);
 }
 
-pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *const message.UserMessage) !void {
+pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *const Message) !void {
     try self.messages.ensureUnusedCapacity(allocator, 1);
     try self.streams.ensureUnusedCapacity(allocator, 1);
 
@@ -123,7 +178,7 @@ pub fn pushUserMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *
     if (!result.found_existing) result.value_ptr.* = .init;
 
     self.messages.pushBackAssumeCapacity(msg.*);
-    result.value_ptr.buffered +|= @intCast(msg.data.len);
+    result.value_ptr.buffered +|= @intCast(msg.len);
 }
 
 pub fn dropMessages(self: *MessageQueue, allocator: std.mem.Allocator, max_streams: u16) AllocError![]u16 {
@@ -143,7 +198,7 @@ pub fn dropMessages(self: *MessageQueue, allocator: std.mem.Allocator, max_strea
 
     if (dropped_streams.items.len == 0) return &.{};
 
-    var messages_copy: std.Deque(message.UserMessage) = .empty;
+    var messages_copy: std.Deque(Message) = .empty;
     errdefer messages_copy.deinit(allocator);
     try messages_copy.ensureUnusedCapacity(allocator, self.messages.len - dropped_messages);
     const streams = try dropped_streams.toOwnedSlice(allocator);
@@ -151,7 +206,7 @@ pub fn dropMessages(self: *MessageQueue, allocator: std.mem.Allocator, max_strea
     for (streams) |stream_id| _ = self.streams.remove(stream_id);
     while (self.messages.popFront()) |msg| {
         if (msg.stream_id >= max_streams) {
-            allocator.free(msg.data);
+            msg.deinit(allocator);
             continue;
         }
         messages_copy.pushBackAssumeCapacity(msg);
@@ -199,13 +254,6 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
         .has_fast_retransmit = has_fast_retransmit,
         .cumulative_ack_advanced = prev_cumulative_tsn != self.sack_handler.acked.cumulative_tsn,
     };
-}
-
-fn abandonedUnackedSize(self: *const MessageQueue, cumulative_tsn: u32) u32 {
-    var size: u32 = 0;
-    var it = self.sack_handler.iterateAbandonedUnacked(cumulative_tsn);
-    while (it.next()) |tsn| size +|= self.getChunkSizeAt(tsn);
-    return size;
 }
 
 pub fn resetStreams(self: *MessageQueue, streams: []const u16) void {
@@ -330,19 +378,18 @@ fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator) u32 {
 
     const retransmit_index = self.retransmit_index orelse self.chunks.len;
     const dropped = self.sack_handler.acked.cumulative_tsn -% self.earliest_tsn +% 1;
-    var msg = self.messages.frontPtr().?;
     for (0..dropped) |index| {
         const chunk = self.chunks.popFront().?;
-
         if (index < retransmit_index) self.flight_size -= chunk.length;
         data_size +|= chunk.getSize();
+    }
 
-        if (chunk.offset + chunk.length == msg.data.len) {
-            self.curr_msg -= 1;
-            self.earliest_message_id +%= 1;
-            allocator.free(self.messages.popFront().?.data);
-            msg = self.messages.frontPtr() orelse break;
-        }
+    const message_bound = if (self.chunks.front()) |chunk| chunk.message_id else self.earliest_message_id +% self.curr_msg;
+    while (self.earliest_message_id != message_bound) {
+        const msg = self.messages.popFront().?;
+        msg.deinit(allocator);
+        self.earliest_message_id +%= 1;
+        self.curr_msg -= 1;
     }
 
     self.earliest_tsn +%= dropped;
@@ -354,6 +401,13 @@ fn subRetransmitIndex(self: *MessageQueue, count: u32) void {
     if (self.retransmit_index) |index| {
         self.retransmit_index = if (index -| count < self.chunks.len) index -| count else null;
     }
+}
+
+fn abandonedUnackedSize(self: *const MessageQueue, cumulative_tsn: u32) u32 {
+    var size: u32 = 0;
+    var it = self.sack_handler.iterateAbandonedUnacked(cumulative_tsn);
+    while (it.next()) |tsn| size +|= self.getChunkSizeAt(tsn);
+    return size;
 }
 
 fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void {
@@ -393,25 +447,14 @@ fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
 
 fn writeMessageChunk(self: *const MessageQueue, chunk_index: u32, msg_chunk: MessageChunk, buffer: []u8) u32 {
     const msg = self.messages.atPtr(msg_chunk.message_id -% self.earliest_message_id);
-    const data_chunk = message.Data{
-        .flags = .{
-            .start_fragment = msg_chunk.offset == 0,
-            .end_fragment = msg_chunk.offset +% msg_chunk.length == msg.data.len,
-            .unordered = msg.unordered,
-        },
-        .tsn = self.earliest_tsn +% chunk_index,
-        .ppid = msg.ppid,
-        .stream_id = msg.stream_id,
-        .stream_seq = msg.stream_seq,
-        .user_data = msg.data[msg_chunk.offset .. msg_chunk.offset + msg_chunk.length],
-    };
+    const data_chunk = msg.toDataChunk(msg_chunk.offset, msg_chunk.length, self.earliest_tsn +% chunk_index);
     return @intCast(data_chunk.write(buffer));
 }
 
 fn nextChunkSize(self: *MessageQueue, buffer_size: usize, can_fragment: bool) error{WriteFailed}!?u32 {
     if (self.curr_msg >= self.messages.len or self.chunks.len >= SackHandler.bitmap_bits - 1) return null;
     const msg = self.messages.atPtr(self.curr_msg);
-    const curr_payload = msg.data.len - self.message_offset;
+    const curr_payload = msg.len - self.message_offset;
     if (std.mem.alignForward(usize, message.data_chunk_header_size + curr_payload, 4) <= buffer_size) {
         return @intCast(curr_payload);
     }
@@ -419,7 +462,7 @@ fn nextChunkSize(self: *MessageQueue, buffer_size: usize, can_fragment: bool) er
     // A message is never fragmented to fit a short buffer, and a message that fits in one packet is not fragmented
     // at all, it's sent whole on a later call to nextChunk() with a big enough buffer.
     if (!can_fragment or buffer_size < message.data_chunk_header_size + min_fragment_payload or
-        (self.message_offset == 0 and msg.data.len <= message.PMDCS - message.data_chunk_header_size))
+        (self.message_offset == 0 and msg.len <= message.PMDCS - message.data_chunk_header_size))
         return error.WriteFailed;
 
     return @intCast(std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4));
@@ -432,30 +475,20 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
 
     const msg = self.messages.atPtr(self.curr_msg);
     const max_payload = std.mem.alignBackward(usize, buffer.len - message.data_chunk_header_size, 4);
-    const payload_size = @min(msg.data.len - self.message_offset, max_payload);
+    const payload_size = @min(msg.len - self.message_offset, max_payload);
 
     const stream_state = self.streams.getPtr(msg.stream_id).?;
-    if (self.message_offset == 0 and !msg.unordered) {
+    if (self.message_offset == 0 and !msg.flags.unordered) {
         msg.stream_seq = stream_state.stream_seq;
         stream_state.incSeq();
     }
 
-    const chunk = message.Data{
-        .flags = .{
-            .start_fragment = self.message_offset == 0,
-            .end_fragment = self.message_offset + payload_size == msg.data.len,
-            .unordered = msg.unordered,
-        },
-        .tsn = self.curr_tsn,
-        .ppid = msg.ppid,
-        .stream_id = msg.stream_id,
-        .stream_seq = msg.stream_seq,
-        .user_data = msg.data[self.message_offset .. self.message_offset + payload_size],
-    };
+    const chunk = msg.toDataChunk(self.message_offset, @intCast(payload_size), self.curr_tsn);
     self.chunks.pushBackAssumeCapacity(.{
         .message_id = self.earliest_message_id +% self.curr_msg,
         .offset = self.message_offset,
         .length = @intCast(payload_size),
+        .retransmit = 0,
     });
     self.curr_tsn +%= 1;
 

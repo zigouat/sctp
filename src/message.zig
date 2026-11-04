@@ -683,10 +683,17 @@ pub const ParameterIterator = struct {
     }
 };
 
+pub const Policy = union(enum(u2)) {
+    reliable,
+    max_retransmit: u16,
+    deadline: i64,
+};
+
 pub const UserMessageConfig = struct {
     stream_id: u16,
     ppid: u32,
     unordered: bool = false,
+    policy: Policy = .reliable,
 };
 
 pub const UserMessage = struct {

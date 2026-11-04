@@ -945,8 +945,8 @@ fn handleReconfigResponse(self: *Association, resp: *const message.ReConfigRespo
     if (result.part == .incoming) return;
     if (result.succeeded) self.message_queue.resetStreams(result.streams);
 
-    while (self.stream_reset.popMessage()) |user_msg| {
-        try self.message_queue.pushUserMessage(self.allocator, &user_msg);
+    while (self.stream_reset.popMessage()) |msg| {
+        try self.message_queue.pushUserMessage(self.allocator, &msg);
     }
 
     if (result.streams.len == 0) {

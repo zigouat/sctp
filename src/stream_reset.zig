@@ -109,7 +109,7 @@ reset_all_streams: bool,
 /// Only the front request is in flight (RFC6525 - 5.1.1).
 requests: std.Deque(Request),
 /// Messages written to resetting streams, held until the reset completes.
-pending_messages: std.ArrayList(message.UserMessage),
+pending_messages: std.ArrayList(MessageQueue.Message),
 req_seq_num: u32,
 /// Sequence number of the last processed peer request, starts at the peer's initial TSN - 1 (RFC6525 - 4.1).
 resp_seq_num: u32,
@@ -168,19 +168,14 @@ pub fn bufferMessage(self: *StreamReset, allocator: Allocator, data: []const u8,
         return false;
     }
 
-    try self.pending_messages.append(allocator, .{
-        .data = try allocator.dupe(u8, data),
-        .ppid = config.ppid,
-        .stream_id = config.stream_id,
-        .stream_seq = 0,
-        .unordered = config.unordered,
-    });
+    try self.pending_messages.ensureUnusedCapacity(allocator, 1);
+    self.pending_messages.appendAssumeCapacity(.init(try allocator.dupe(u8, data), config));
 
     return true;
 }
 
 /// Pop the oldest buffered message whose stream finished resetting, the caller owns the message.
-pub fn popMessage(self: *StreamReset) ?message.UserMessage {
+pub fn popMessage(self: *StreamReset) ?MessageQueue.Message {
     if (self.reset_all_streams) return null;
     for (self.pending_messages.items, 0..) |msg, index| {
         if (!self.streams.contains(msg.stream_id)) return self.pending_messages.orderedRemove(index);
