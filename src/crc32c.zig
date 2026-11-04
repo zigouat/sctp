@@ -10,4 +10,4 @@ const Soft = std.hash.crc.Crc(u32, .{
     .xor_output = 0xffffffff,
 });
 
-pub const Crc32c = if (builtin.cpu.has(.x86, .crc32)) @import("crc32c/x86.zig") else Soft;
+pub const Crc32c = if (builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .crc32)) @import("crc32c/x86.zig") else Soft;

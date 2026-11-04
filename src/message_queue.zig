@@ -121,6 +121,7 @@ curr_tsn: u32,
 flight_size: u32,
 rwnd: u32,
 retransmit_index: ?u32,
+pending_forward_tsn: bool,
 
 pub fn init(initial_tsn: u32) MessageQueue {
     return .{
@@ -137,6 +138,7 @@ pub fn init(initial_tsn: u32) MessageQueue {
         .retransmit_index = null,
         .flight_size = 0,
         .rwnd = 0,
+        .pending_forward_tsn = false,
     };
 }
 
@@ -249,6 +251,13 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     acked_data -|= abandoned.size;
     self.rwnd = sack.a_rwnd -| self.flight_size;
 
+    // set pending forward conditionally to avoid calling moveAdvancedPeerAckPoint() in nextForwardTsn()
+    const point = if (Helper.tsnGt(self.sack_handler.acked.cumulative_tsn, self.sack_handler.advanced_peer_ack_point))
+        self.sack_handler.acked.cumulative_tsn
+    else
+        self.sack_handler.advanced_peer_ack_point;
+    if (self.sack_handler.isAbandoned(point +% 1)) self.pending_forward_tsn = true;
+
     return .{
         .acked_data = acked_data,
         .duplicate_data = duplicate_data,
@@ -297,6 +306,7 @@ pub fn handleTimeout(self: *MessageQueue) void {
     self.retransmit_index = 0;
     self.flight_size = 0;
     self.sack_handler.clearFastRetransmit();
+    self.pending_forward_tsn = true;
 }
 
 pub fn popEvent(self: *MessageQueue) ?Event {
@@ -354,6 +364,57 @@ pub fn nextFastRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buf
         self.sack_handler.markFastRetransmitted(tsn);
         return .{ .tsn = tsn, .size = self.writeChunkAt(tsn, buffer) };
     }
+}
+
+pub fn nextForwardTsn(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
+    if (!self.pending_forward_tsn) return null;
+    self.pending_forward_tsn = false;
+    self.sack_handler.moveAdvancedPeerAckPoint(self.highestTsnSent());
+    if (self.sack_handler.advanced_peer_ack_point == self.sack_handler.acked.cumulative_tsn) return null;
+
+    if (buffer.len < 12) {
+        self.pending_forward_tsn = true;
+        return error.WriteFailed;
+    }
+    buffer[0] = @intFromEnum(message.ChunkType.forward_tsn);
+    buffer[1] = 0;
+
+    const end_index = self.sack_handler.advanced_peer_ack_point -% self.earliest_tsn;
+    var last_message_id = self.chunks.atPtr(0).message_id -% 1;
+    var offset: u32 = 8;
+    for (0..end_index + 1) |index| {
+        const chunk = self.chunks.atPtr(index);
+        if (chunk.message_id == last_message_id) continue;
+
+        const msg = self.messages.atPtr(chunk.message_id -% self.earliest_message_id);
+        if (msg.flags.unordered) continue;
+
+        var slice = buffer[8..offset];
+        while (slice.len >= 4) {
+            if (std.mem.readInt(u16, slice[0..2], .big) != msg.stream_id) {
+                slice = slice[4..];
+                continue;
+            }
+
+            std.mem.writeInt(u16, slice[2..4], msg.stream_seq, .big);
+            break;
+        } else {
+            if (buffer.len < offset + 4) {
+                self.sack_handler.advanced_peer_ack_point = self.earliest_tsn +% @as(u32, @intCast(index)) -% 1;
+                break;
+            }
+
+            std.mem.writeInt(u16, buffer[offset..][0..2], msg.stream_id, .big);
+            std.mem.writeInt(u16, buffer[offset + 2 ..][0..2], msg.stream_seq, .big);
+            offset += 4;
+        }
+
+        last_message_id = chunk.message_id;
+    }
+
+    std.mem.writeInt(u32, buffer[4..8], self.sack_handler.advanced_peer_ack_point, .big);
+    std.mem.writeInt(u16, buffer[2..4], @intCast(offset), .big);
+    return offset;
 }
 
 pub fn lowestOutstandingTsn(self: *const MessageQueue) u32 {
@@ -605,6 +666,8 @@ fn maybeAbandonMessage(self: *MessageQueue, allocator: std.mem.Allocator, chunk_
         self.curr_msg += 1;
         self.message_offset = 0;
     } else self.releaseMessage(allocator, msg, 0);
+
+    self.pending_forward_tsn = true;
     return true;
 }
 
@@ -898,4 +961,46 @@ test "MessageQueue.nextNewChunk: running out of memory for events sends nothing"
     try testing.expectEqual(1, msg_queue.chunks.len);
     try testing.expectEqual(0, msg_queue.bufferedAmount(0).?);
     try testing.expectEqual(1, msg_queue.events.len);
+}
+
+test "MessageQueue.nextForwardTsn: reports the highest abandoned ssn of each ordered stream" {
+    var msg_queue = MessageQueue.init(1);
+    defer msg_queue.deinit(testing.allocator);
+
+    var buffer: [64]u8 = undefined;
+    try testing.expectEqual(null, msg_queue.nextForwardTsn(&buffer));
+
+    // tsn 1: stream 1 ssn 0, tsn 2-3: stream 1 ssn 1, tsn 4: stream 2 unordered, tsn 5: stream 3 ssn 0, tsn 6: stream 1 ssn 2
+    try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 1, .ppid = 0 });
+    try msg_queue.pushData(testing.allocator, "aaaaaaaa", .{ .stream_id = 1, .ppid = 0 });
+    try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 2, .ppid = 0, .unordered = true });
+    try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 3, .ppid = 0 });
+    try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 1, .ppid = 0 });
+    for (0..6) |_| _ = try msg_queue.nextNewChunk(testing.allocator, buffer[0 .. message.data_chunk_header_size + 4]);
+
+    // nothing abandoned
+    msg_queue.pending_forward_tsn = true;
+    try testing.expectEqual(null, msg_queue.nextForwardTsn(&buffer));
+    try testing.expect(!msg_queue.pending_forward_tsn);
+
+    msg_queue.sack_handler.markAbandoned(1, 5);
+
+    // only one entry fits, the cumulative tsn stops before stream 3's message
+    msg_queue.pending_forward_tsn = true;
+    try testing.expectEqual(12, msg_queue.nextForwardTsn(buffer[0..12]));
+    try testing.expectEqualSlices(u8, &.{
+        @intFromEnum(message.ChunkType.forward_tsn), 0, 0, 12,
+        0,                                           0, 0, 4,
+        0,                                           1, 0, 1,
+    }, buffer[0..12]);
+
+    // stops at tsn 6 which is not abandoned
+    msg_queue.pending_forward_tsn = true;
+    try testing.expectEqual(16, msg_queue.nextForwardTsn(&buffer));
+    try testing.expectEqualSlices(u8, &.{
+        @intFromEnum(message.ChunkType.forward_tsn), 0, 0, 16,
+        0,                                           0, 0, 5,
+        0,                                           1, 0, 1,
+        0,                                           3, 0, 0,
+    }, buffer[0..16]);
 }

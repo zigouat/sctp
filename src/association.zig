@@ -599,11 +599,19 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
             if (written == message.packet_header_size) return err;
             break;
         };
+
         const maybe_control_chunk, const w = next orelse if (written == message.packet_header_size) {
+            if (try self.message_queue.nextForwardTsn(slice)) |forward_tsn_size| {
+                written += forward_tsn_size;
+                self.t3_timer.setDeadline(now);
+                break;
+            }
+
             // The drain is over, the next call starts a new burst.
             self.burst_window = null;
             return null;
         } else break;
+
         written += w;
         slice = slice[w..];
 
