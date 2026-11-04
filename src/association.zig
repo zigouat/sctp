@@ -676,7 +676,7 @@ fn nextChunk(
 
         if (self.fast_recovery) if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
         if (self.burst_window) |window| if (self.message_queue.flight_size >= window) return null;
-        const result = try self.message_queue.nextChunk(self.allocator, buffer, can_fragment) orelse return null;
+        const result = try self.message_queue.nextChunk(self.allocator, buffer, can_fragment, now) orelse return null;
         self.zero_wnd_probe |= result.zero_wnd_probe;
 
         self.t3_timer.setDeadline(now);
@@ -719,8 +719,8 @@ fn nextChunk(
     return .{ chunk_type, written };
 }
 
-fn nextFastRetransmit(self: *Association, buffer: []u8, now: i64) error{WriteFailed}!?u32 {
-    const retransmit = try self.message_queue.nextFastRetransmit(buffer) orelse return null;
+fn nextFastRetransmit(self: *Association, buffer: []u8, now: i64) error{ WriteFailed, OutOfMemory }!?u32 {
+    const retransmit = try self.message_queue.nextFastRetransmit(self.allocator, buffer, now) orelse return null;
     // RFC9260 - 7.2.4. restarting T3-rtx for any other tsn would keep delaying the timeout of the lowest outstanding one.
     if (retransmit.tsn == self.message_queue.lowestOutstandingTsn()) self.t3_timer.restart(now);
     // RFC9260 - 6.3.1. C5 (Karn's algorithm), a retransmitted tsn gives an ambiguous rtt measurement.

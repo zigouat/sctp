@@ -231,7 +231,8 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     var acked_data: u32 = 0;
     var duplicate_data: u32 = 0;
 
-    const abandoned_size = self.abandonedUnackedSize(sack.cumulative_tsn);
+    const abandoned = self.abandonedUnacked(sack.cumulative_tsn);
+    self.flight_size += abandoned.flight;
     const old_gap_size = self.updateGapAckedFlightSize(true);
     const has_fast_retransmit = self.sack_handler.handleSack(&sack, fast_recovery);
 
@@ -245,7 +246,7 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     acked_data += self.dropAcknowledged(allocator);
     acked_data += self.updateGapAckedFlightSize(false);
     acked_data -|= old_gap_size;
-    acked_data -|= abandoned_size;
+    acked_data -|= abandoned.size;
     self.rwnd = sack.a_rwnd -| self.flight_size;
 
     return .{
@@ -283,6 +284,7 @@ pub const CumulativeAck = enum { invalid, unchanged, advanced };
 pub fn handleShutdownChunk(self: *MessageQueue, allocator: std.mem.Allocator, cumulative_tsn: u32) CumulativeAck {
     if (Helper.tsnGt(cumulative_tsn, self.highestTsnSent())) return .invalid;
     if (!Helper.tsnGt(cumulative_tsn, self.sack_handler.acked.cumulative_tsn)) return .unchanged;
+    self.flight_size += self.abandonedUnacked(cumulative_tsn).flight;
     _ = self.updateGapAckedFlightSize(true);
     self.sack_handler.handleCumulativeTsn(cumulative_tsn);
     _ = self.dropAcknowledged(allocator);
@@ -314,8 +316,11 @@ pub fn nextChunk(
     allocator: std.mem.Allocator,
     buffer: []u8,
     can_fragment: bool,
+    now: i64,
 ) NextChunkError!?NextChunkResult {
-    const size = try self.nextRetransmit(buffer) orelse {
+    const size = try self.nextRetransmit(allocator, buffer, now) orelse {
+        try self.dropExpiredMessages(allocator, now);
+
         var zero_wnd_probe = false;
         const next_chunk_size = try self.nextChunkSize(buffer.len, can_fragment) orelse return null;
         if (self.rwnd < next_chunk_size) {
@@ -338,14 +343,17 @@ pub const FastRetransmit = struct {
     size: u32,
 };
 
-pub fn nextFastRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?FastRetransmit {
-    if (self.sack_handler.firstTsnWithThreeMisses(self.lowestOutstandingTsn())) |tsn| {
+pub fn nextFastRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8, now: i64) NextChunkError!?FastRetransmit {
+    while (true) {
+        const tsn = self.sack_handler.firstTsnWithThreeMisses(self.lowestOutstandingTsn()) orelse return null;
+        try self.events.ensureUnusedCapacity(allocator, 1);
+        const chunk_id = tsn -% self.earliest_tsn;
+        if (self.maybeAbandonMessage(allocator, chunk_id, now)) continue;
         if (self.getChunkSizeAt(tsn) > buffer.len) return error.WriteFailed;
+        self.chunks.atPtr(chunk_id).retransmit +|= 1;
         self.sack_handler.markFastRetransmitted(tsn);
         return .{ .tsn = tsn, .size = self.writeChunkAt(tsn, buffer) };
     }
-
-    return null;
 }
 
 pub fn lowestOutstandingTsn(self: *const MessageQueue) u32 {
@@ -403,11 +411,22 @@ fn subRetransmitIndex(self: *MessageQueue, count: u32) void {
     }
 }
 
-fn abandonedUnackedSize(self: *const MessageQueue, cumulative_tsn: u32) u32 {
-    var size: u32 = 0;
+const AbandonedUnacked = struct {
+    size: u32, // size of all abandoned chunks not acknowledged.
+    flight: u32, // size of abandoned chunks that were in flight.
+};
+
+fn abandonedUnacked(self: *const MessageQueue, cumulative_tsn: u32) AbandonedUnacked {
+    var result: AbandonedUnacked = .{ .size = 0, .flight = 0 };
+    const retransmit_index: u32 = self.retransmit_index orelse @intCast(self.chunks.len);
     var it = self.sack_handler.iterateAbandonedUnacked(cumulative_tsn);
-    while (it.next()) |tsn| size +|= self.getChunkSizeAt(tsn);
-    return size;
+    while (it.next()) |tsn| {
+        const index = tsn -% self.earliest_tsn;
+        const chunk = self.chunks.atPtr(index);
+        result.size +|= chunk.getSize();
+        if (index < retransmit_index) result.flight += chunk.length;
+    }
+    return result;
 }
 
 fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void {
@@ -418,34 +437,33 @@ fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void {
 
 fn writeChunkAt(self: *const MessageQueue, tsn: u32, buffer: []u8) u32 {
     const index = tsn -% self.earliest_tsn;
-    return self.writeMessageChunk(index, self.chunks.at(index), buffer);
+    return self.writeMessageChunk(index, self.chunks.atPtr(index), buffer);
 }
 
-fn nextRetransmit(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
-    const start_tsn = self.getCurrentRetransmitTsn() orelse return null;
-    const acked = &self.sack_handler.acked;
-    const highest_tsn = acked.highest_tsn_received;
-    const tsn = if (Helper.tsnGt(start_tsn, highest_tsn))
-        start_tsn
-    else
-        acked.firstUnacked(start_tsn, highest_tsn) orelse highest_tsn +% 1;
+fn nextRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8, now: i64) NextChunkError!?u32 {
+    while (true) {
+        const start_tsn = self.getCurrentRetransmitTsn() orelse return null;
+        try self.events.ensureUnusedCapacity(allocator, 1);
+        const tsn = self.sack_handler.firstUnackedNotAbandonedTsn(start_tsn, self.highestTsnSent()) orelse {
+            self.retransmit_index = null;
+            return null;
+        };
 
-    if (Helper.tsnGt(tsn, self.highestTsnSent())) {
-        self.retransmit_index = null;
-        return null;
+        self.retransmit_index = tsn -% self.earliest_tsn;
+        if (self.maybeAbandonMessage(allocator, self.retransmit_index.?, now)) continue;
+
+        const chunk = self.chunks.atPtr(self.retransmit_index.?);
+        if (chunk.getSize() > buffer.len) return error.WriteFailed;
+        chunk.retransmit +|= 1;
+        self.flight_size += chunk.length;
+        self.rwnd -|= chunk.length;
+        const written = self.writeMessageChunk(self.retransmit_index.?, chunk, buffer);
+        self.nextRetransmitIndex();
+        return written;
     }
-
-    self.retransmit_index = tsn -% self.earliest_tsn;
-    const chunk = self.chunks.at(self.retransmit_index.?);
-    if (chunk.getSize() > buffer.len) return error.WriteFailed;
-    self.flight_size += chunk.length;
-    self.rwnd -|= chunk.length;
-    const written = self.writeMessageChunk(self.retransmit_index.?, chunk, buffer);
-    self.nextRetransmitIndex();
-    return written;
 }
 
-fn writeMessageChunk(self: *const MessageQueue, chunk_index: u32, msg_chunk: MessageChunk, buffer: []u8) u32 {
+fn writeMessageChunk(self: *const MessageQueue, chunk_index: u32, msg_chunk: *const MessageChunk, buffer: []u8) u32 {
     const msg = self.messages.atPtr(msg_chunk.message_id -% self.earliest_message_id);
     const data_chunk = msg.toDataChunk(msg_chunk.offset, msg_chunk.length, self.earliest_tsn +% chunk_index);
     return @intCast(data_chunk.write(buffer));
@@ -510,6 +528,20 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
     return chunk.write(buffer);
 }
 
+fn dropExpiredMessages(self: *MessageQueue, allocator: std.mem.Allocator, now: i64) AllocError!void {
+    while (self.message_offset == 0 and self.curr_msg < self.messages.len) {
+        const msg = self.messages.atPtr(self.curr_msg);
+        if (msg.flags.policy != .deadline or now < msg.policy_value) return;
+
+        try self.events.ensureUnusedCapacity(allocator, 1);
+        self.releaseMessage(allocator, msg, msg.len);
+        if (self.curr_msg == 0) {
+            _ = self.messages.popFront();
+            self.earliest_message_id +%= 1;
+        } else self.curr_msg += 1;
+    }
+}
+
 fn getChunkSizeAt(self: *const MessageQueue, tsn: u32) u32 {
     const index = tsn -% self.earliest_tsn;
     return self.chunks.atPtr(index).getSize();
@@ -538,6 +570,52 @@ fn nextRetransmitIndex(self: *MessageQueue) void {
     } else {
         self.retransmit_index = self.retransmit_index.? + 1;
     }
+}
+
+fn maybeAbandonMessage(self: *MessageQueue, allocator: std.mem.Allocator, chunk_index: u32, now: i64) bool {
+    const chunk = self.chunks.atPtr(chunk_index);
+    const msg_index = chunk.message_id -% self.earliest_message_id;
+    const msg = self.messages.atPtr(msg_index);
+
+    switch (msg.flags.policy) {
+        .reliable => return false,
+        .max_retransmit => if (chunk.retransmit < msg.policy_value) return false,
+        .deadline => if (now < msg.policy_value) return false,
+    }
+
+    var start = chunk_index;
+    while (start > 0 and self.chunks.atPtr(start - 1).message_id == chunk.message_id) : (start -= 1) {}
+
+    var end = chunk_index + 1;
+    while (end < self.chunks.len and self.chunks.atPtr(end).message_id == chunk.message_id) : (end += 1) {}
+
+    // abandoned chunks are not in flight
+    const retransmit_index = self.retransmit_index orelse end;
+    for (start..@min(end, retransmit_index)) |index| {
+        if (!self.sack_handler.isAcked(self.earliest_tsn +% @as(u32, @intCast(index)))) {
+            self.flight_size -= self.chunks.atPtr(index).length;
+        }
+    }
+
+    self.sack_handler.markAbandoned(self.earliest_tsn +% start, self.earliest_tsn +% end -% 1);
+
+    // only the message being fragmented still has unsent data
+    if (msg_index == self.curr_msg) {
+        self.releaseMessage(allocator, msg, msg.len - self.message_offset);
+        self.curr_msg += 1;
+        self.message_offset = 0;
+    } else self.releaseMessage(allocator, msg, 0);
+    return true;
+}
+
+/// Frees the message's data, `unsent` bytes are removed from the stream's buffered amount.
+fn releaseMessage(self: *MessageQueue, allocator: std.mem.Allocator, msg: *Message, unsent: u32) void {
+    const stream_state = self.streams.getPtr(msg.stream_id).?;
+    if (stream_state.subBuffered(unsent)) {
+        self.events.pushBackAssumeCapacity(.{ .buffered_amount_low_threshold = msg.stream_id });
+    }
+    msg.deinit(allocator);
+    msg.len = 0;
 }
 
 const testing = std.testing;
@@ -590,7 +668,7 @@ test "MessageQueue.nextChunk: ordered messages take the stream sequence when sen
 
     var buffer: [64]u8 = undefined;
     for ([_]u16{ 0, 0, 1 }) |ssn| {
-        _ = (try msg_queue.nextChunk(testing.allocator, &buffer, true)).?;
+        _ = (try msg_queue.nextChunk(testing.allocator, &buffer, true, 0)).?;
         try testing.expectEqual(ssn, std.mem.readInt(u16, buffer[10..12], .big));
     }
     try testing.expectEqual(2, msg_queue.streams.get(0).?.stream_seq);
@@ -627,8 +705,8 @@ test "MessageQueue.nextRetransmit: retransmitting the last chunk clears the retr
     msg_queue.flight_size = 0;
 
     var buffer: [64]u8 = undefined;
-    _ = (try msg_queue.nextRetransmit(&buffer)).?;
-    _ = (try msg_queue.nextRetransmit(&buffer)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, 0)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, 0)).?;
 
     try testing.expectEqual(null, msg_queue.retransmit_index);
     try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
@@ -650,10 +728,10 @@ test "MessageQueue.nextRetransmit: gap acked chunks are skipped" {
 
     var buffer: [64]u8 = undefined;
     for ([_]u32{ 2, 5 }) |tsn| {
-        _ = (try msg_queue.nextRetransmit(&buffer)).?;
+        _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, 0)).?;
         try testing.expectEqual(tsn, std.mem.readInt(u32, buffer[4..8], .big));
     }
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(&buffer));
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, 0));
     try testing.expectEqual(null, msg_queue.retransmit_index);
 }
 
@@ -666,8 +744,8 @@ test "MessageQueue.nextChunk: a message that fits in one packet is not fragmente
     try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [message.PMDCS]u8 = undefined;
-    try testing.expectError(error.WriteFailed, msg_queue.nextChunk(testing.allocator, buffer[0..200], true));
-    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, true)).?;
+    try testing.expectError(error.WriteFailed, msg_queue.nextChunk(testing.allocator, buffer[0..200], true, 0));
+    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, true, 0)).?;
     try testing.expectEqual(message.data_chunk_header_size + data.len, result.written);
 }
 
@@ -680,7 +758,7 @@ test "MessageQueue.nextChunk: data chunk padding fits in a buffer not aligned to
     try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [130]u8 = undefined;
-    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, true)).?;
+    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, true, 0)).?;
     try testing.expectEqual(0, result.written % 4);
     try testing.expect(result.written <= buffer.len);
 }
@@ -695,7 +773,7 @@ test "MessageQueue.nextChunk: outstanding tsns stay within the peer's tsn window
     }
 
     var buffer: [64]u8 = undefined;
-    while (try msg_queue.nextChunk(testing.allocator, &buffer, true)) |_| {}
+    while (try msg_queue.nextChunk(testing.allocator, &buffer, true, 0)) |_| {}
     // the peer accepts tsns up to its cumulative tsn + bitmap_bits - 1
     try testing.expectEqual(SackHandler.bitmap_bits - 1, msg_queue.chunks.len);
 }
@@ -720,7 +798,7 @@ test "MessageQueue.handleSack: acknowledging every chunk during a retransmission
     msg_queue.flight_size = 0;
 
     var buffer: [64]u8 = undefined;
-    _ = (try msg_queue.nextRetransmit(&buffer)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, 0)).?;
     try testing.expectEqual(4, msg_queue.flight_size);
 
     _ = try msg_queue.handleSack(testing.allocator, message.Sack{

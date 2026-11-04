@@ -106,7 +106,8 @@ pub fn firstTsnWithThreeMisses(self: *const SackHandler, start_tsn: u32) ?u32 {
     var it = TsnBitSet.WordIterator.init(start_tsn, self.acked.highest_tsn_received, false);
     while (it.next()) |word| {
         const candidates = self.miss_hi.masks[word.index] & self.miss_lo.masks[word.index] &
-            ~self.acked.acked_tsn.masks[word.index] & ~self.fast_retransmitted.masks[word.index];
+            ~self.acked.acked_tsn.masks[word.index] & ~self.fast_retransmitted.masks[word.index] &
+            ~self.abandoned.masks[word.index];
         const bits = candidates & word.mask;
         if (bits != 0) return word.firstTsn(bits);
     }
@@ -114,9 +115,14 @@ pub fn firstTsnWithThreeMisses(self: *const SackHandler, start_tsn: u32) ?u32 {
 }
 
 // RFC 3758
-pub fn markAbandoned(self: *SackHandler, tsn: u32) void {
-    std.debug.assert(Helper.tsnGt(tsn, self.acked.cumulative_tsn));
-    self.abandoned.set(bitIndex(tsn));
+pub fn markAbandoned(self: *SackHandler, start_tsn: u32, end_tsn: u32) void {
+    std.debug.assert(Helper.tsnGt(start_tsn, self.acked.cumulative_tsn));
+    if (start_tsn == end_tsn) {
+        self.abandoned.set(bitIndex(start_tsn));
+        return;
+    }
+    var it = TsnBitSet.WordIterator.init(start_tsn, end_tsn, false);
+    while (it.next()) |word| self.abandoned.masks[word.index] |= word.mask;
 }
 
 pub fn isAbandoned(self: *const SackHandler, tsn: u32) bool {
@@ -140,6 +146,15 @@ pub fn moveAdvancedPeerAckPoint(self: *SackHandler, highest_tsn_sent: u32) void 
         }
     }
     self.advanced_peer_ack_point = highest_tsn_sent;
+}
+
+pub fn firstUnackedNotAbandonedTsn(self: *const SackHandler, start_tsn: u32, end_tsn: u32) ?u32 {
+    var it = TsnBitSet.WordIterator.init(start_tsn, end_tsn, false);
+    while (it.next()) |word| {
+        const bits = ~self.acked.acked_tsn.masks[word.index] & ~self.abandoned.masks[word.index] & word.mask;
+        if (bits != 0) return word.firstTsn(bits);
+    }
+    return null;
 }
 
 pub const AbandonedUnackedIterator = struct {
@@ -576,7 +591,7 @@ test "SackHandler.clearFastRetransmit" {
     _ = try testHandleSack(&h, &testSack(1, &.{ 0, 3, 0, 4 }), 100, false);
     _ = try testHandleSack(&h, &testSack(1, &.{ 0, 3, 0, 5 }), 100, false);
     h.markFastRetransmitted(2);
-    h.markAbandoned(3);
+    h.markAbandoned(3, 3);
 
     h.clearFastRetransmit();
     try testing.expectEqual(0, h.missCount(2));
@@ -590,8 +605,8 @@ test "SackHandler.clearFastRetransmit" {
 test "SackHandler.markAbandoned: abandoned bits are cleared once the cumulative tsn passes them" {
     {
         var h = SackHandler.init(1);
-        h.markAbandoned(3);
-        h.markAbandoned(5);
+        h.markAbandoned(3, 3);
+        h.markAbandoned(5, 5);
         h.handleCumulativeTsn(4);
         try testing.expect(!isBitSet(&h.abandoned, 3));
         try testing.expect(isBitSet(&h.abandoned, 5));
@@ -600,7 +615,7 @@ test "SackHandler.markAbandoned: abandoned bits are cleared once the cumulative 
     // cumulative tsn jumping over the whole bitmap
     {
         var h = SackHandler.init(1);
-        h.markAbandoned(3);
+        h.markAbandoned(3, 3);
         h.handleCumulativeTsn(2 * bitmap_bits);
         try testing.expect(!isBitSet(&h.abandoned, 3));
     }
@@ -610,9 +625,8 @@ test "SackHandler.moveAdvancedPeerAckPoint" {
     // stops before the first tsn that is not abandoned
     {
         var h = SackHandler.init(1);
-        h.markAbandoned(1);
-        h.markAbandoned(2);
-        h.markAbandoned(4);
+        h.markAbandoned(1, 2);
+        h.markAbandoned(4, 4);
         h.moveAdvancedPeerAckPoint(10);
         try testing.expectEqual(2, h.advanced_peer_ack_point);
     }
@@ -621,8 +635,8 @@ test "SackHandler.moveAdvancedPeerAckPoint" {
     {
         var h = SackHandler.init(1);
         h.acked.ack(2);
-        h.markAbandoned(1);
-        h.markAbandoned(3);
+        h.markAbandoned(1, 1);
+        h.markAbandoned(3, 3);
         h.moveAdvancedPeerAckPoint(10);
         try testing.expectEqual(1, h.advanced_peer_ack_point);
     }
@@ -630,7 +644,7 @@ test "SackHandler.moveAdvancedPeerAckPoint" {
     // all sent tsns abandoned
     {
         var h = SackHandler.init(1);
-        for (1..6) |tsn| h.markAbandoned(@intCast(tsn));
+        h.markAbandoned(1, 6);
         h.moveAdvancedPeerAckPoint(5);
         try testing.expectEqual(5, h.advanced_peer_ack_point);
     }
@@ -639,7 +653,7 @@ test "SackHandler.moveAdvancedPeerAckPoint" {
     {
         var h = SackHandler.init(1);
         h.handleCumulativeTsn(3);
-        h.markAbandoned(4);
+        h.markAbandoned(4, 4);
         h.moveAdvancedPeerAckPoint(10);
         try testing.expectEqual(4, h.advanced_peer_ack_point);
     }
@@ -655,7 +669,7 @@ test "SackHandler.moveAdvancedPeerAckPoint" {
     {
         const init_tsn: u32 = 0xFFFFFFF0;
         var h = SackHandler.init(init_tsn);
-        for (0..100) |i| h.markAbandoned(init_tsn +% @as(u32, @intCast(i)));
+        h.markAbandoned(init_tsn, init_tsn +% 99);
         h.moveAdvancedPeerAckPoint(init_tsn +% 200);
         try testing.expectEqual(init_tsn +% 99, h.advanced_peer_ack_point);
     }
