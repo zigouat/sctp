@@ -47,6 +47,11 @@ pub fn clearDuplicates(self: *SackGenerator) void {
     self.duplicate_count = 0;
 }
 
+pub fn setCumulativeTsn(self: *SackGenerator, cumulative_tsn: u32) void {
+    self.received.setCumulativeTsn(cumulative_tsn);
+    self.received.advanceCumulativeTsn();
+}
+
 pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) u32 {
     std.debug.assert(buffer.len >= 16);
 

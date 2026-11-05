@@ -23,6 +23,7 @@ const StreamState = struct {
 
 pub const AllocError = std.mem.Allocator.Error;
 pub const ReceiveError = AllocError || error{NoUserData};
+pub const ForwardTsnError = AllocError || error{ProtocolViolation};
 
 pub const sack_delay = 200;
 
@@ -39,6 +40,9 @@ const Ready = union(enum) {
 sack_generator: SackGenerator,
 /// start and end fragments of the messages not yet complete, single chunk messages are not tracked.
 boundary: BitSet,
+/// the start of the oldest message not yet complete, the tsn after the cumulative tsn when there is none.
+/// It only moves once that message completes, a message abandoned without a FORWARD-TSN holds it forever.
+lowest_held_tsn: u32,
 send_sack: bool,
 sack_deadline: i64,
 /// chunks of the messages not yet drained.
@@ -57,6 +61,7 @@ pub fn init(capacity: u32) MessageAssembler {
     return .{
         .sack_generator = .init(0),
         .boundary = .empty,
+        .lowest_held_tsn = 0,
         .send_sack = false,
         .sack_deadline = std.math.maxInt(i64),
         .pending = .empty,
@@ -95,11 +100,17 @@ pub fn reset(self: *MessageAssembler, allocator: std.mem.Allocator) void {
 
 pub fn setInitTsn(self: *MessageAssembler, init_tsn: u32) void {
     self.sack_generator = .init(init_tsn);
+    self.lowest_held_tsn = init_tsn;
 }
 
 pub fn receiveData(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) ReceiveError!bool {
     if (d.user_data.len == 0) return error.NoUserData;
     self.sack_generator.checkTsn(d.tsn) catch |err| return err == error.Duplicate;
+
+    if (d.tsn -% self.lowest_held_tsn >= bitmap_bits) {
+        @branchHint(.cold);
+        return false;
+    }
 
     const window_full = self.advertised_wnd == 0;
     if (window_full) {
@@ -115,6 +126,57 @@ pub fn receiveData(self: *MessageAssembler, allocator: std.mem.Allocator, d: mes
     } else try self.storeFragment(allocator, stream_state, d);
 
     return window_full or d.flags.immediate;
+}
+
+pub fn handleForwardTsn(self: *MessageAssembler, allocator: std.mem.Allocator, fwd_tsn: *const message.ForwardTsn) ForwardTsnError!void {
+    if (Helper.tsnLte(fwd_tsn.new_cumulative_tsn, self.getCumulativeTsn())) return;
+    // a message abandoned while being fragmented ends at its last sent fragment, but its sent fragments are abandoned together
+    if (self.pending.getPtr(fwd_tsn.new_cumulative_tsn)) |chunk| if (!chunk.flags.end_fragment) {
+        const next = self.pending.getPtr(fwd_tsn.new_cumulative_tsn +% 1);
+        if (next != null and !next.?.flags.start_fragment) return error.ProtocolViolation;
+    };
+
+    var streams_it = fwd_tsn.iterateStreams();
+    var max_ready_counts: u32 = 0;
+    while (streams_it.next()) |stream| {
+        const stream_state = try self.getStreamState(allocator, stream.@"0");
+        max_ready_counts += @intCast(stream_state.complete_messages.count());
+    }
+    try self.ready.ensureUnusedCapacity(allocator, max_ready_counts);
+
+    const received = &self.sack_generator.received;
+    const last_tsn = if (Helper.tsnLte(fwd_tsn.new_cumulative_tsn, received.highest_tsn_received))
+        fwd_tsn.new_cumulative_tsn
+    else
+        received.highest_tsn_received;
+
+    // fragments of a message take consecutive tsns, so walking from the edge of a received run never reaches a complete message
+    self.dropFragmentsUntil(allocator, received.cumulative_tsn);
+    var blocks = received.iterateGapBlocks();
+    while (blocks.next()) |block| {
+        if (Helper.tsnGt(block.start, last_tsn)) break;
+        self.dropFragmentsFrom(allocator, block.start);
+        self.dropFragmentsUntil(allocator, if (Helper.tsnLte(block.end, last_tsn)) block.end else last_tsn);
+    }
+
+    self.sack_generator.setCumulativeTsn(fwd_tsn.new_cumulative_tsn);
+    self.moveLowestHeldTsn();
+
+    var it = fwd_tsn.iterateStreams();
+    while (it.next()) |stream| {
+        const stream_id, const stream_seq = stream;
+        const stream_state = self.streams.getPtr(stream_id).?;
+        if (@as(i16, @bitCast(stream_seq -% stream_state.next_ssn)) < 0) continue;
+
+        while (stream_state.next_ssn != stream_seq +% 1) : (stream_state.next_ssn +%= 1) {
+            const entry = stream_state.complete_messages.fetchSwapRemove(stream_state.next_ssn) orelse continue;
+            self.ready.pushBackAssumeCapacity(.{ .range = entry.value });
+        }
+
+        if (stream_state.complete_messages.fetchSwapRemove(stream_state.next_ssn)) |entry| {
+            self.deliverInOrder(stream_state, .{ .range = entry.value });
+        }
+    }
 }
 
 /// Acknowledges the chunk's tsn but drops its data.
@@ -238,6 +300,7 @@ fn deliverSingleChunk(self: *MessageAssembler, allocator: std.mem.Allocator, str
     var msg = d.toUserMessage();
     msg.data = try allocator.dupe(u8, d.user_data);
     self.commitChunk(d);
+    if (d.tsn == self.lowest_held_tsn) self.moveLowestHeldTsn();
 
     if (stream_state) |state| {
         self.deliverInOrder(state, .{ .message = msg });
@@ -259,7 +322,11 @@ fn storeFragment(self: *MessageAssembler, allocator: std.mem.Allocator, stream_s
 
     // nothing below fails once the buffer is large enough for the message and the chunk is stored
     const tsns = self.completedMessage(d);
-    if (tsns) |range| if (range.start != range.end) try self.growAssemblyBuffer(allocator, self.messageSize(range, d));
+    if (tsns) |range| {
+        // other messages lie between the boundaries, the peer abandoned this one
+        const size = self.messageSize(range, d) orelse return self.dropAbandoned(allocator, d);
+        if (range.start != range.end) try self.growAssemblyBuffer(allocator, size);
+    }
     try self.storeChunk(allocator, d);
     self.commitChunk(d);
 
@@ -270,6 +337,7 @@ fn storeFragment(self: *MessageAssembler, allocator: std.mem.Allocator, stream_s
 
 fn completeMessage(self: *MessageAssembler, allocator: std.mem.Allocator, stream_state: ?*StreamState, range: TsnRange, ssn: u16) void {
     self.setBoundary(range, false);
+    if (range.start == self.lowest_held_tsn) self.moveLowestHeldTsn();
     const state = stream_state orelse return self.ready.pushBackAssumeCapacity(.{ .range = range });
     if (ssn == state.next_ssn) return self.deliverInOrder(state, .{ .range = range });
 
@@ -340,15 +408,55 @@ fn findFragmentEndTsn(self: *const MessageAssembler, tsn: u32) ?u32 {
     return null;
 }
 
+fn moveLowestHeldTsn(self: *MessageAssembler) void {
+    const cumulative_tsn = self.sack_generator.received.cumulative_tsn;
+    self.lowest_held_tsn = cumulative_tsn +% 1;
+    // tsns up to the cumulative tsn are received, a chunk held there that is not an end belongs to an incomplete message
+    const chunk = self.pending.getPtr(cumulative_tsn) orelse return;
+    if (chunk.flags.end_fragment) return;
+    if (chunk.flags.start_fragment) {
+        self.lowest_held_tsn = cumulative_tsn;
+    } else if (self.findFragmentStartTsn(cumulative_tsn)) |start_tsn| self.lowest_held_tsn = start_tsn;
+}
+
 fn dropChunk(self: *MessageAssembler, allocator: std.mem.Allocator, tsn: u32) bool {
     if (self.pending.fetchSwapRemove(tsn)) |d| {
         allocator.free(d.value.user_data);
         self.buffered_data -= @intCast(d.value.user_data.len);
         self.updateAdvertisedWindow();
+        if (d.value.flags.start_fragment or d.value.flags.end_fragment) {
+            self.boundary.unset(TsnBitSet.bitIndex(tsn));
+        }
         return true;
     }
 
     return false;
+}
+
+fn dropFragmentsFrom(self: *MessageAssembler, allocator: std.mem.Allocator, start_tsn: u32) void {
+    var tsn = start_tsn;
+    while (self.pending.getPtr(tsn)) |chunk| : (tsn +%= 1) {
+        if (chunk.flags.start_fragment) return;
+        const end = chunk.flags.end_fragment;
+        _ = self.dropChunk(allocator, tsn);
+        if (end) return;
+    }
+}
+
+fn dropFragmentsUntil(self: *MessageAssembler, allocator: std.mem.Allocator, end_tsn: u32) void {
+    var tsn = end_tsn;
+    while (self.pending.getPtr(tsn)) |chunk| : (tsn -%= 1) {
+        if (chunk.flags.end_fragment) return;
+        const start = chunk.flags.start_fragment;
+        _ = self.dropChunk(allocator, tsn);
+        if (start) return;
+    }
+}
+
+fn dropAbandoned(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) void {
+    if (!d.flags.start_fragment) self.dropFragmentsUntil(allocator, d.tsn -% 1);
+    if (!d.flags.end_fragment) self.dropFragmentsFrom(allocator, d.tsn +% 1);
+    self.sack_generator.receiveTsn(d.tsn);
 }
 
 fn storeChunk(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) !void {
@@ -368,14 +476,17 @@ fn updateAdvertisedWindow(self: *MessageAssembler) void {
     }
 }
 
-fn messageSize(self: *const MessageAssembler, range: TsnRange, d: message.Data) usize {
-    var size: usize = d.user_data.len;
+/// The size of the message in `range`, null if its fragments are not the ones of a single message.
+fn messageSize(self: *const MessageAssembler, range: TsnRange, d: message.Data) ?usize {
+    var size: usize = 0;
     var tsn = range.start;
     while (true) : (tsn +%= 1) {
-        if (tsn != d.tsn) size += self.pending.getPtr(tsn).?.user_data.len;
-        if (tsn == range.end) break;
+        const chunk = if (tsn == d.tsn) d else (self.pending.getPtr(tsn) orelse return null).*;
+        if (chunk.flags.start_fragment != (tsn == range.start) or chunk.flags.end_fragment != (tsn == range.end)) return null;
+        if (!sameMessage(chunk, d)) return null;
+        size += chunk.user_data.len;
+        if (tsn == range.end) return size;
     }
-    return size;
 }
 
 fn growAssemblyBuffer(self: *MessageAssembler, allocator: std.mem.Allocator, size: usize) AllocError!void {
@@ -402,6 +513,11 @@ fn getStreamState(self: *MessageAssembler, allocator: std.mem.Allocator, stream_
     const state = try self.streams.getOrPut(allocator, stream_id);
     if (!state.found_existing) state.value_ptr.* = .init;
     return state.value_ptr;
+}
+
+fn sameMessage(a: message.Data, b: message.Data) bool {
+    if (a.stream_id != b.stream_id or a.flags.unordered != b.flags.unordered) return false;
+    return a.flags.unordered or a.stream_seq == b.stream_seq;
 }
 
 fn testData(tsn: u32, stream_id: u16, stream_seq: u16, flags: message.Data.Flags, payload: []const u8) message.Data {
@@ -755,4 +871,160 @@ test "MessageAssembler.dropChunkWithHighestTsn: withdraws completed messages but
     _ = try r.receiveData(testing.allocator, testData(3, 0, 1, .end_frag, &payload));
     const msg = r.drainReady(testing.allocator).?;
     try testing.expectEqualStrings(&(payload ++ payload), msg.data);
+}
+
+fn testForwardTsn(new_cumulative_tsn: u32, streams: []const u8) message.ForwardTsn {
+    return .{ .new_cumulative_tsn = new_cumulative_tsn, .streams = streams };
+}
+
+test "MessageAssembler.handleForwardTsn: moves the next ssn of the skipped streams" {
+    // the message waiting at the skipped ssn + 1 is delivered
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 1, .complete, "second"));
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(1, &.{ 0, 0, 0, 0 }));
+        try testExpectReady(&r, &.{"second"});
+    }
+    // waiting messages up to the skipped ssn are delivered, then the ones following it
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 1, .complete, "b"));
+        _ = try r.receiveData(testing.allocator, testData(4, 0, 3, .complete, "d"));
+        _ = try r.receiveData(testing.allocator, testData(5, 0, 4, .complete, "e"));
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(3, &.{ 0, 0, 0, 2 }));
+        try testExpectReady(&r, &.{ "b", "d", "e" });
+        try testing.expectEqual(5, r.streams.get(0).?.next_ssn);
+    }
+    // a stream never received from
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(1, &.{ 0, 3, 0, 0 }));
+        _ = try r.receiveData(testing.allocator, testData(2, 3, 1, .complete, "next"));
+        try testExpectReady(&r, &.{"next"});
+    }
+    // a stale ssn doesn't move the next ssn back
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .complete, "a"));
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 1, .complete, "b"));
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(3, &.{ 0, 0, 0, 0 }));
+        try testing.expectEqual(2, r.streams.get(0).?.next_ssn);
+    }
+}
+
+test "MessageAssembler.handleForwardTsn: drops incomplete messages and keeps complete ones" {
+    // complete ordered and unordered messages are kept
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .start_frag, "hel"));
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .end_frag, "lo"));
+        _ = try r.receiveData(testing.allocator, testData(3, 1, 0, .unordered_start_frag, "wor"));
+        _ = try r.receiveData(testing.allocator, testData(4, 1, 0, .unordered_end_frag, "ld"));
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(5, &.{ 0, 0, 0, 1 }));
+        try testExpectReady(&r, &.{ "hello", "world" });
+    }
+    // fragments after a gap are dropped, a complete message after them is kept
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .middle_frag, "m"));
+        _ = try r.receiveData(testing.allocator, testData(3, 0, 0, .end_frag, "e"));
+        _ = try r.receiveData(testing.allocator, testData(4, 0, 0, .unordered_start_frag, "ok"));
+        _ = try r.receiveData(testing.allocator, testData(5, 0, 0, .unordered_end_frag, "!"));
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(5, &.{}));
+        try testExpectReady(&r, &.{"ok!"});
+        try testing.expectEqual(0, r.pending.count());
+        try testing.expectEqual(5, r.getCumulativeTsn());
+    }
+    // a message crossing the old cumulative tsn is dropped
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(0, 0, 0, .unordered_start_frag, "s"));
+        _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .unordered_middle_frag, "m"));
+        _ = try r.receiveData(testing.allocator, testData(3, 0, 0, .unordered_middle_frag, "m"));
+        _ = try r.receiveData(testing.allocator, testData(4, 0, 0, .unordered_end_frag, "e"));
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(4, &.{}));
+        try testing.expectEqual(0, r.pending.count());
+        try testing.expectEqual(0, r.boundary.count());
+    }
+    // an incomplete message at the end of a block is dropped, the waiting one before it is delivered
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(3, 0, 1, .start_frag, "w"));
+        _ = try r.receiveData(testing.allocator, testData(4, 0, 1, .end_frag, "ait"));
+        _ = try r.receiveData(testing.allocator, testData(5, 0, 2, .start_frag, "x"));
+        _ = try r.receiveData(testing.allocator, testData(6, 0, 2, .middle_frag, "x"));
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(7, &.{ 0, 0, 0, 2 }));
+        try testExpectReady(&r, &.{"wait"});
+        try testing.expectEqual(0, r.pending.count());
+        try testing.expectEqual(0, r.boundary.count());
+    }
+}
+
+test "MessageAssembler.handleForwardTsn: message abandoned while being fragmented" {
+    // the new cumulative tsn ends at the last sent fragment, tsn 0 is lost
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(1, 0, 0, .unordered_start_frag, "a"));
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .unordered_middle_frag, "a"));
+        try r.handleForwardTsn(testing.allocator, &testForwardTsn(2, &.{}));
+        try testing.expectEqual(0, r.pending.count());
+        try testing.expectEqual(0, r.boundary.count());
+    }
+    // a stored message cut in two
+    {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        _ = try r.receiveData(testing.allocator, testData(2, 0, 0, .unordered_middle_frag, "a"));
+        _ = try r.receiveData(testing.allocator, testData(3, 0, 0, .unordered_middle_frag, "b"));
+        _ = try r.receiveData(testing.allocator, testData(4, 0, 0, .unordered_end_frag, "c"));
+        try testing.expectError(error.ProtocolViolation, r.handleForwardTsn(testing.allocator, &testForwardTsn(3, &.{})));
+        try testing.expectEqual(3, r.pending.count());
+    }
+}
+
+test "MessageAssembler.handleForwardTsn: allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var r: MessageAssembler = .init(4000);
+    defer r.deinit(testing.allocator);
+    try testing.expectError(error.OutOfMemory, r.handleForwardTsn(failing.allocator(), &testForwardTsn(1, &.{ 0, 3, 0, 0 })));
+    try testing.expectEqual(0xFFFFFFFF, r.getCumulativeTsn());
+
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var assembler: MessageAssembler = .init(4000);
+            defer assembler.deinit(allocator);
+            _ = try assembler.receiveData(allocator, testData(2, 0, 1, .complete, "b"));
+            try assembler.handleForwardTsn(allocator, &testForwardTsn(1, &.{ 0, 0, 0, 0, 0, 3, 0, 0 }));
+        }
+    }.run, .{});
+}
+
+test "MessageAssembler.receiveData: a message abandoned while being fragmented does not block the next one" {
+    // A: start 0, middle 1, its other fragments never sent, B: start 2, end 3
+    const chunks = [_]message.Data{
+        testData(0, 0, 0, .unordered_start_frag, "a"),
+        testData(1, 0, 0, .unordered_middle_frag, "a"),
+        testData(2, 0, 0, .unordered_start_frag, "b"),
+        testData(3, 0, 0, .unordered_end_frag, "b"),
+    };
+    const orders = [_][4]u8{
+        .{ 0, 1, 2, 3 }, .{ 0, 2, 1, 3 }, .{ 0, 2, 3, 1 }, .{ 2, 3, 0, 1 }, .{ 2, 0, 1, 3 },
+        .{ 1, 0, 2, 3 }, .{ 1, 2, 0, 3 }, .{ 3, 2, 1, 0 }, .{ 2, 1, 3, 0 }, .{ 3, 1, 0, 2 },
+    };
+    for (orders) |order| {
+        var r: MessageAssembler = .init(4000);
+        defer r.deinit(testing.allocator);
+        for (order) |i| _ = try r.receiveData(testing.allocator, chunks[i]);
+        try testExpectReady(&r, &.{"bb"});
+        try testing.expectEqual(3, r.getCumulativeTsn());
+    }
 }

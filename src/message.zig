@@ -400,6 +400,12 @@ pub const Error = union(ErrorCode) {
         return 8;
     }
 
+    pub fn writeProtocolViolationErrorBuffer(buffer: []u8) usize {
+        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ErrorCode.protocol_violation), .big);
+        std.mem.writeInt(u16, buffer[2..4], 4, .big);
+        return 4;
+    }
+
     pub fn writeInvalidStreamIdErrorBuffer(buffer: []u8, stream_id: u16) usize {
         std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ErrorCode.invalid_stream_id), .big);
         std.mem.writeInt(u16, buffer[2..4], 8, .big);

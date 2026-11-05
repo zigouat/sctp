@@ -110,6 +110,7 @@ const Transmit = union(enum) {
     sack,
     cookie_ack,
     abort: u32,
+    protocol_violation_abort,
     user_abort,
     ootb_abort: u32,
     cookie_echo: []const u8,
@@ -475,7 +476,17 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 try self.setStateToClosed();
                 return null;
             },
-            .forward_tsn => {},
+            .forward_tsn => |fwd_tsn| {
+                self.message_assembler.handleForwardTsn(self.allocator, &fwd_tsn) catch |err| switch (err) {
+                    error.ProtocolViolation => {
+                        try self.transmits.pushBack(self.allocator, .protocol_violation_abort);
+                        try self.setStateToClosed();
+                        return self.messageIterator();
+                    },
+                    else => |e| return e,
+                };
+                received_data = true;
+            },
             .reconfig => |params| {
                 if (!self.negotiated_extensions.stream_reconfiguration) continue; // send error chunk
                 var it = params;
@@ -707,6 +718,7 @@ fn nextChunk(
         .cookie_echo => |cookie| try writeCookieEcho(cookie, buffer),
         .cookie_ack => self.writeCookieAck(buffer),
         .abort => |tsn| self.writeNoUserDataAbort(tsn, buffer),
+        .protocol_violation_abort => writeProtocolViolationAbort(buffer),
         .user_abort => writeAbort(buffer),
         .ootb_abort => writeReflectedAbort(buffer),
         .sack => self.message_assembler.writeSack(buffer),
@@ -1095,6 +1107,14 @@ fn writeShutdownAck(buffer: []u8) usize {
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
     return 4;
+}
+
+fn writeProtocolViolationAbort(buffer: []u8) usize {
+    buffer[0] = @intFromEnum(message.ChunkType.abort);
+    buffer[1] = 0; // flags
+    const written = message.Error.writeProtocolViolationErrorBuffer(buffer[4..]);
+    std.mem.writeInt(u16, buffer[2..4], @intCast(4 + written), .big);
+    return 4 + written;
 }
 
 fn writeAbort(buffer: []u8) usize {

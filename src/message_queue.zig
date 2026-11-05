@@ -395,7 +395,10 @@ pub fn nextForwardTsn(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32
         if (chunk.message_id == last_message_id) continue;
 
         const msg = self.messages.atPtr(chunk.message_id -% self.earliest_message_id);
-        if (msg.flags.unordered) continue;
+        if (msg.flags.unordered) {
+            last_message_id = chunk.message_id;
+            continue;
+        }
 
         var slice = buffer[8..offset];
         while (slice.len >= 4) {
