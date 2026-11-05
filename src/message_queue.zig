@@ -1022,7 +1022,6 @@ test "MessageQueue.nextForwardTsn: reports the highest abandoned ssn of each ord
     }, buffer[0..16]);
 }
 
-
 test "MessageQueue.moveAdvancedPeerAckPoint: advances over the abandoned chunks above the cumulative tsn" {
     // nothing sent
     {
