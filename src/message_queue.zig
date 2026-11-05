@@ -101,7 +101,10 @@ const MessageChunk = struct {
     message_id: u32,
     offset: u32,
     length: u16,
-    retransmit: u16,
+    retransmit: packed struct(u16) {
+        count: u15 = 0,
+        abandoned: bool = false,
+    },
 
     fn getSize(self: *const MessageChunk) u32 {
         return std.mem.alignForward(u32, message.data_chunk_header_size + self.length, 4);
@@ -121,6 +124,8 @@ curr_tsn: u32,
 flight_size: u32,
 rwnd: u32,
 retransmit_index: ?u32,
+/// RFC 3758 - the tsn up to which the peer is told to move its cumulative tsn with a FORWARD TSN chunk.
+advanced_peer_ack_point: u32,
 pending_forward_tsn: bool,
 
 pub fn init(initial_tsn: u32) MessageQueue {
@@ -138,6 +143,7 @@ pub fn init(initial_tsn: u32) MessageQueue {
         .retransmit_index = null,
         .flight_size = 0,
         .rwnd = 0,
+        .advanced_peer_ack_point = initial_tsn -% 1,
         .pending_forward_tsn = false,
     };
 }
@@ -161,6 +167,8 @@ pub fn close(self: *MessageQueue, allocator: std.mem.Allocator, initial_tsn: u32
     self.earliest_tsn = initial_tsn;
     self.curr_tsn = initial_tsn;
     self.retransmit_index = null;
+    self.advanced_peer_ack_point = initial_tsn -% 1;
+    self.pending_forward_tsn = false;
     self.sack_handler = .init(initial_tsn);
 }
 
@@ -233,8 +241,6 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     var acked_data: u32 = 0;
     var duplicate_data: u32 = 0;
 
-    const abandoned = self.abandonedUnacked(sack.cumulative_tsn);
-    self.flight_size += abandoned.flight;
     const old_gap_size = self.updateGapAckedFlightSize(true);
     const has_fast_retransmit = self.sack_handler.handleSack(&sack, fast_recovery);
 
@@ -248,15 +254,13 @@ pub fn handleSack(self: *MessageQueue, allocator: std.mem.Allocator, sack: messa
     acked_data += self.dropAcknowledged(allocator);
     acked_data += self.updateGapAckedFlightSize(false);
     acked_data -|= old_gap_size;
-    acked_data -|= abandoned.size;
     self.rwnd = sack.a_rwnd -| self.flight_size;
 
     // set pending forward conditionally to avoid calling moveAdvancedPeerAckPoint() in nextForwardTsn()
-    const point = if (Helper.tsnGt(self.sack_handler.acked.cumulative_tsn, self.sack_handler.advanced_peer_ack_point))
-        self.sack_handler.acked.cumulative_tsn
-    else
-        self.sack_handler.advanced_peer_ack_point;
-    if (self.sack_handler.isAbandoned(point +% 1)) self.pending_forward_tsn = true;
+    const front_abandoned = if (self.chunks.front()) |chunk| chunk.retransmit.abandoned else false;
+    if (front_abandoned or Helper.tsnGt(self.advanced_peer_ack_point, self.sack_handler.acked.cumulative_tsn)) {
+        self.pending_forward_tsn = true;
+    }
 
     return .{
         .acked_data = acked_data,
@@ -293,7 +297,6 @@ pub const CumulativeAck = enum { invalid, unchanged, advanced };
 pub fn handleShutdownChunk(self: *MessageQueue, allocator: std.mem.Allocator, cumulative_tsn: u32) CumulativeAck {
     if (Helper.tsnGt(cumulative_tsn, self.highestTsnSent())) return .invalid;
     if (!Helper.tsnGt(cumulative_tsn, self.sack_handler.acked.cumulative_tsn)) return .unchanged;
-    self.flight_size += self.abandonedUnacked(cumulative_tsn).flight;
     _ = self.updateGapAckedFlightSize(true);
     self.sack_handler.handleCumulativeTsn(cumulative_tsn);
     _ = self.dropAcknowledged(allocator);
@@ -358,9 +361,14 @@ pub fn nextFastRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buf
         const tsn = self.sack_handler.firstTsnWithThreeMisses(self.lowestOutstandingTsn()) orelse return null;
         try self.events.ensureUnusedCapacity(allocator, 1);
         const chunk_id = tsn -% self.earliest_tsn;
+        if (self.chunks.atPtr(chunk_id).retransmit.abandoned) {
+            self.sack_handler.markFastRetransmitted(tsn);
+            continue;
+        }
+
         if (self.maybeAbandonMessage(allocator, chunk_id, now)) continue;
         if (self.getChunkSizeAt(tsn) > buffer.len) return error.WriteFailed;
-        self.chunks.atPtr(chunk_id).retransmit +|= 1;
+        self.chunks.atPtr(chunk_id).retransmit.count +|= 1;
         self.sack_handler.markFastRetransmitted(tsn);
         return .{ .tsn = tsn, .size = self.writeChunkAt(tsn, buffer) };
     }
@@ -369,8 +377,8 @@ pub fn nextFastRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buf
 pub fn nextForwardTsn(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32 {
     if (!self.pending_forward_tsn) return null;
     self.pending_forward_tsn = false;
-    self.sack_handler.moveAdvancedPeerAckPoint(self.highestTsnSent());
-    if (self.sack_handler.advanced_peer_ack_point == self.sack_handler.acked.cumulative_tsn) return null;
+    self.moveAdvancedPeerAckPoint();
+    if (self.advanced_peer_ack_point == self.sack_handler.acked.cumulative_tsn) return null;
 
     if (buffer.len < 12) {
         self.pending_forward_tsn = true;
@@ -379,7 +387,7 @@ pub fn nextForwardTsn(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32
     buffer[0] = @intFromEnum(message.ChunkType.forward_tsn);
     buffer[1] = 0;
 
-    const end_index = self.sack_handler.advanced_peer_ack_point -% self.earliest_tsn;
+    const end_index = self.advanced_peer_ack_point -% self.earliest_tsn;
     var last_message_id = self.chunks.atPtr(0).message_id -% 1;
     var offset: u32 = 8;
     for (0..end_index + 1) |index| {
@@ -400,7 +408,7 @@ pub fn nextForwardTsn(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32
             break;
         } else {
             if (buffer.len < offset + 4) {
-                self.sack_handler.advanced_peer_ack_point = self.earliest_tsn +% @as(u32, @intCast(index)) -% 1;
+                self.advanced_peer_ack_point = self.earliest_tsn +% @as(u32, @intCast(index)) -% 1;
                 break;
             }
 
@@ -412,7 +420,7 @@ pub fn nextForwardTsn(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32
         last_message_id = chunk.message_id;
     }
 
-    std.mem.writeInt(u32, buffer[4..8], self.sack_handler.advanced_peer_ack_point, .big);
+    std.mem.writeInt(u32, buffer[4..8], self.advanced_peer_ack_point, .big);
     std.mem.writeInt(u16, buffer[2..4], @intCast(offset), .big);
     return offset;
 }
@@ -449,6 +457,7 @@ fn dropAcknowledged(self: *MessageQueue, allocator: std.mem.Allocator) u32 {
     const dropped = self.sack_handler.acked.cumulative_tsn -% self.earliest_tsn +% 1;
     for (0..dropped) |index| {
         const chunk = self.chunks.popFront().?;
+        if (chunk.retransmit.abandoned) continue;
         if (index < retransmit_index) self.flight_size -= chunk.length;
         data_size +|= chunk.getSize();
     }
@@ -472,24 +481,6 @@ fn subRetransmitIndex(self: *MessageQueue, count: u32) void {
     }
 }
 
-const AbandonedUnacked = struct {
-    size: u32, // size of all abandoned chunks not acknowledged.
-    flight: u32, // size of abandoned chunks that were in flight.
-};
-
-fn abandonedUnacked(self: *const MessageQueue, cumulative_tsn: u32) AbandonedUnacked {
-    var result: AbandonedUnacked = .{ .size = 0, .flight = 0 };
-    const retransmit_index: u32 = self.retransmit_index orelse @intCast(self.chunks.len);
-    var it = self.sack_handler.iterateAbandonedUnacked(cumulative_tsn);
-    while (it.next()) |tsn| {
-        const index = tsn -% self.earliest_tsn;
-        const chunk = self.chunks.atPtr(index);
-        result.size +|= chunk.getSize();
-        if (index < retransmit_index) result.flight += chunk.length;
-    }
-    return result;
-}
-
 fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void {
     const index = tsn -% self.earliest_tsn;
     const chunk_size: u32 = self.chunks.atPtr(index).length;
@@ -505,17 +496,27 @@ fn nextRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u
     while (true) {
         const start_tsn = self.getCurrentRetransmitTsn() orelse return null;
         try self.events.ensureUnusedCapacity(allocator, 1);
-        const tsn = self.sack_handler.firstUnackedNotAbandonedTsn(start_tsn, self.highestTsnSent()) orelse {
+        const highest_received = self.sack_handler.acked.highest_tsn_received;
+        const tsn = if (Helper.tsnGt(start_tsn, highest_received))
+            start_tsn
+        else
+            self.sack_handler.acked.firstUnacked(start_tsn, highest_received) orelse highest_received +% 1;
+        if (Helper.tsnGt(tsn, self.highestTsnSent())) {
             self.retransmit_index = null;
             return null;
-        };
+        }
 
         self.retransmit_index = tsn -% self.earliest_tsn;
+        if (self.chunks.atPtr(self.retransmit_index.?).retransmit.abandoned) {
+            self.nextRetransmitIndex();
+            continue;
+        }
+
         if (self.maybeAbandonMessage(allocator, self.retransmit_index.?, now)) continue;
 
         const chunk = self.chunks.atPtr(self.retransmit_index.?);
         if (chunk.getSize() > buffer.len) return error.WriteFailed;
-        chunk.retransmit +|= 1;
+        chunk.retransmit.count +|= 1;
         self.flight_size += chunk.length;
         self.rwnd -|= chunk.length;
         const written = self.writeMessageChunk(self.retransmit_index.?, chunk, buffer);
@@ -567,7 +568,7 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
         .message_id = self.earliest_message_id +% self.curr_msg,
         .offset = self.message_offset,
         .length = @intCast(payload_size),
-        .retransmit = 0,
+        .retransmit = .{},
     });
     self.curr_tsn +%= 1;
 
@@ -613,6 +614,7 @@ fn updateGapAckedFlightSize(self: *MessageQueue, comptime inc: bool) u32 {
     var acked_data: u32 = 0;
     const max_tsn = if (self.getCurrentRetransmitTsn()) |tsn| tsn -% 1 else self.sack_handler.acked.highest_tsn_received;
     while (it.next()) |tsn| {
+        if (self.chunks.atPtr(tsn -% self.earliest_tsn).retransmit.abandoned) continue;
         if (Helper.tsnLte(tsn, max_tsn)) self.updateFlightSize(tsn, inc);
         acked_data += self.getChunkSizeAt(tsn);
     }
@@ -640,25 +642,23 @@ fn maybeAbandonMessage(self: *MessageQueue, allocator: std.mem.Allocator, chunk_
 
     switch (msg.flags.policy) {
         .reliable => return false,
-        .max_retransmit => if (chunk.retransmit < msg.policy_value) return false,
+        .max_retransmit => if (chunk.retransmit.count < msg.policy_value) return false,
         .deadline => if (now < msg.policy_value) return false,
     }
 
+    const retransmit_index = self.retransmit_index orelse std.math.maxInt(u32);
+    self.abandonChunk(chunk_index, retransmit_index);
+
     var start = chunk_index;
-    while (start > 0 and self.chunks.atPtr(start - 1).message_id == chunk.message_id) : (start -= 1) {}
-
-    var end = chunk_index + 1;
-    while (end < self.chunks.len and self.chunks.atPtr(end).message_id == chunk.message_id) : (end += 1) {}
-
-    // abandoned chunks are not in flight
-    const retransmit_index = self.retransmit_index orelse end;
-    for (start..@min(end, retransmit_index)) |index| {
-        if (!self.sack_handler.isAcked(self.earliest_tsn +% @as(u32, @intCast(index)))) {
-            self.flight_size -= self.chunks.atPtr(index).length;
-        }
+    while (start > 0 and self.chunks.atPtr(start - 1).message_id == chunk.message_id) {
+        start -= 1;
+        self.abandonChunk(start, retransmit_index);
     }
 
-    self.sack_handler.markAbandoned(self.earliest_tsn +% start, self.earliest_tsn +% end -% 1);
+    var end = chunk_index + 1;
+    while (end < self.chunks.len and self.chunks.atPtr(end).message_id == chunk.message_id) : (end += 1) {
+        self.abandonChunk(end, retransmit_index);
+    }
 
     // only the message being fragmented still has unsent data
     if (msg_index == self.curr_msg) {
@@ -669,6 +669,23 @@ fn maybeAbandonMessage(self: *MessageQueue, allocator: std.mem.Allocator, chunk_
 
     self.pending_forward_tsn = true;
     return true;
+}
+
+fn abandonChunk(self: *MessageQueue, index: u32, retransmit_index: u32) void {
+    const msg_chunk = self.chunks.atPtr(index);
+    msg_chunk.retransmit.abandoned = true;
+    if (index < retransmit_index and !self.sack_handler.isAcked(self.earliest_tsn +% index)) {
+        self.flight_size -= msg_chunk.length;
+    }
+}
+
+fn moveAdvancedPeerAckPoint(self: *MessageQueue) void {
+    const cumulative_tsn = self.sack_handler.acked.cumulative_tsn;
+    if (Helper.tsnGt(cumulative_tsn, self.advanced_peer_ack_point)) self.advanced_peer_ack_point = cumulative_tsn;
+
+    var index = self.advanced_peer_ack_point +% 1 -% self.earliest_tsn;
+    while (index < self.chunks.len and self.chunks.atPtr(index).retransmit.abandoned) : (index += 1) {}
+    self.advanced_peer_ack_point = self.earliest_tsn +% index -% 1;
 }
 
 /// Frees the message's data, `unsent` bytes are removed from the stream's buffered amount.
@@ -983,7 +1000,7 @@ test "MessageQueue.nextForwardTsn: reports the highest abandoned ssn of each ord
     try testing.expectEqual(null, msg_queue.nextForwardTsn(&buffer));
     try testing.expect(!msg_queue.pending_forward_tsn);
 
-    msg_queue.sack_handler.markAbandoned(1, 5);
+    for (0..5) |index| msg_queue.chunks.atPtr(index).retransmit.abandoned = true;
 
     // only one entry fits, the cumulative tsn stops before stream 3's message
     msg_queue.pending_forward_tsn = true;
@@ -1003,4 +1020,46 @@ test "MessageQueue.nextForwardTsn: reports the highest abandoned ssn of each ord
         0,                                           1, 0, 1,
         0,                                           3, 0, 0,
     }, buffer[0..16]);
+}
+
+
+test "MessageQueue.moveAdvancedPeerAckPoint: advances over the abandoned chunks above the cumulative tsn" {
+    // nothing sent
+    {
+        var msg_queue = MessageQueue.init(1);
+        defer msg_queue.deinit(testing.allocator);
+        msg_queue.moveAdvancedPeerAckPoint();
+        try testing.expectEqual(0, msg_queue.advanced_peer_ack_point);
+    }
+
+    // stops before the first chunk that is not abandoned
+    {
+        var msg_queue = MessageQueue.init(1);
+        defer msg_queue.deinit(testing.allocator);
+        try testSendChunks(&msg_queue, 6);
+        for ([_]u32{ 0, 1, 3 }) |index| msg_queue.chunks.atPtr(index).retransmit.abandoned = true;
+        msg_queue.moveAdvancedPeerAckPoint();
+        try testing.expectEqual(2, msg_queue.advanced_peer_ack_point);
+    }
+
+    // all sent chunks abandoned
+    {
+        var msg_queue = MessageQueue.init(1);
+        defer msg_queue.deinit(testing.allocator);
+        try testSendChunks(&msg_queue, 6);
+        for (0..6) |index| msg_queue.chunks.atPtr(index).retransmit.abandoned = true;
+        msg_queue.moveAdvancedPeerAckPoint();
+        try testing.expectEqual(6, msg_queue.advanced_peer_ack_point);
+    }
+
+    // starts from the cumulative tsn when it is ahead
+    {
+        var msg_queue = MessageQueue.init(1);
+        defer msg_queue.deinit(testing.allocator);
+        try testSendChunks(&msg_queue, 6);
+        try testAckUpTo(&msg_queue, testing.allocator, 3);
+        msg_queue.chunks.atPtr(0).retransmit.abandoned = true;
+        msg_queue.moveAdvancedPeerAckPoint();
+        try testing.expectEqual(4, msg_queue.advanced_peer_ack_point);
+    }
 }

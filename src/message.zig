@@ -685,7 +685,7 @@ pub const ParameterIterator = struct {
 
 pub const Policy = union(enum(u2)) {
     reliable,
-    max_retransmit: u16,
+    max_retransmit: u15,
     deadline: i64,
 };
 
