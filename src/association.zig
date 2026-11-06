@@ -640,7 +640,7 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
     var slice = buffer[written..@min(buffer.len, message.MTU)];
     const chunk_options: MessageQueue.ChunkOptions = .{
         .can_fragment = buffer.len >= message.MTU,
-        // RFC7053 - 4.1. the SHUTDOWN waits for the peer to acknowledge all outstanding data, a delayed SACK would hold it back
+        // RFC9260 - 6.1. the SHUTDOWN waits for the peer to acknowledge all outstanding data, a delayed SACK would hold it back
         .immediate = self.state == .shutdown_pending,
     };
     self.writeCommonHeader(buffer);
