@@ -638,7 +638,11 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
     if (buffer.len < message.packet_header_size) return error.WriteFailed;
     var written: usize = message.packet_header_size;
     var slice = buffer[written..@min(buffer.len, message.MTU)];
-    const can_fragment = buffer.len >= message.MTU;
+    const chunk_options: MessageQueue.ChunkOptions = .{
+        .can_fragment = buffer.len >= message.MTU,
+        // RFC7053 - 4.1. the SHUTDOWN waits for the peer to acknowledge all outstanding data, a delayed SACK would hold it back
+        .immediate = self.state == .shutdown_pending,
+    };
     self.writeCommonHeader(buffer);
 
     const prev_curr_msg = self.message_queue.curr_msg;
@@ -647,7 +651,7 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
     }
 
     while (true) {
-        const next = self.nextChunk(slice, now, written == message.packet_header_size, can_fragment) catch |err| {
+        const next = self.nextChunk(slice, now, written == message.packet_header_size, chunk_options) catch |err| {
             if (written == message.packet_header_size) return err;
             break;
         };
@@ -751,11 +755,11 @@ fn nextChunk(
     buffer: []u8,
     now: i64,
     first_chunk: bool,
-    can_fragment: bool,
+    options: MessageQueue.ChunkOptions,
 ) TransmitError!?struct { ?Transmit, usize } {
     if (self.fast_retransmit) {
         @branchHint(.unlikely);
-        if (self.nextFastRetransmit(buffer, now) catch |err| {
+        if (self.nextFastRetransmit(buffer, options, now) catch |err| {
             if (first_chunk) return err;
             self.fast_retransmit = false;
             return null;
@@ -778,10 +782,10 @@ fn nextChunk(
 
         if (self.fast_recovery) {
             @branchHint(.unlikely);
-            if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
+            if (try self.nextFastRetransmit(buffer, options, now)) |size| return .{ null, size };
         }
         if (self.burst_window) |window| if (self.message_queue.flight_size >= window) return null;
-        const result = try self.message_queue.nextChunk(self.allocator, buffer, can_fragment, now) orelse return null;
+        const result = try self.message_queue.nextChunk(self.allocator, buffer, options, now) orelse return null;
         self.zero_wnd_probe |= result.zero_wnd_probe;
 
         self.t3_timer.setDeadline(now);
@@ -830,8 +834,8 @@ fn nextChunk(
     return .{ chunk_type, written };
 }
 
-fn nextFastRetransmit(self: *Association, buffer: []u8, now: i64) error{ WriteFailed, OutOfMemory }!?u32 {
-    const retransmit = try self.message_queue.nextFastRetransmit(self.allocator, buffer, now) orelse return null;
+fn nextFastRetransmit(self: *Association, buffer: []u8, options: MessageQueue.ChunkOptions, now: i64) error{ WriteFailed, OutOfMemory }!?u32 {
+    const retransmit = try self.message_queue.nextFastRetransmit(self.allocator, buffer, options, now) orelse return null;
     // RFC9260 - 7.2.4. restarting T3-rtx for any other tsn would keep delaying the timeout of the lowest outstanding one.
     if (retransmit.tsn == self.message_queue.lowestOutstandingTsn()) self.t3_timer.restart(now);
     // RFC9260 - 6.3.1. C5 (Karn's algorithm), a retransmitted tsn gives an ambiguous rtt measurement.
@@ -1440,6 +1444,29 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
     try testing.expectEqual(null, try assoc.pollTransmit(&out, 10_000));
 }
 
+test "Association.pollTransmit: data sent in shutdown pending has the I bit set" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    const immediate: u8 = @bitCast(message.Data.Flags{ .immediate = true });
+    var out: [message.MTU]u8 = undefined;
+
+    try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
+    var packet = (try assoc.pollTransmit(&out, 0)).?;
+    try testing.expectEqual(0, packet[13] & immediate);
+
+    try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
+    try assoc.shutdown();
+    packet = (try assoc.pollTransmit(&out, 0)).?;
+    try testing.expectEqual(assoc.initial_tsn +% 1, std.mem.readInt(u32, packet[16..20], .big));
+    try testing.expectEqual(immediate, packet[13] & immediate);
+
+    // retransmissions
+    try assoc.handleTimeout(10_000);
+    packet = (try assoc.pollTransmit(&out, 10_000)).?;
+    try testing.expectEqual(assoc.initial_tsn, std.mem.readInt(u32, packet[16..20], .big));
+    try testing.expectEqual(immediate, packet[13] & immediate);
+}
+
 test "Association.pollTransmit: control chunks are sent before retransmissions" {
     var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
@@ -1766,7 +1793,7 @@ test "Association.handleRead: data in shutdown pending is delivered and acknowle
         &lens,
     );
     try testing.expectEqual(1, messages_len.len);
-    try testing.expect(assoc.message_assembler.send_sack);
+    try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
 }
 
 test "Association.handleRead: shutdown in shutdown pending moves to shutdown received" {
@@ -2083,6 +2110,7 @@ test "Association.handleRead: data on an invalid stream is acknowledged and answ
     var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
     assoc.inbound_streams = 2;
+    assoc.message_assembler.send_sack = false;
 
     var buffer: [64]u8 = undefined;
     var lens: [1]usize = undefined;

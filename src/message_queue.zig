@@ -59,12 +59,13 @@ pub const Message = struct {
         };
     }
 
-    fn toDataChunk(msg: *const Message, offset: u32, length: u16, tsn: u32) message.Data {
+    fn toDataChunk(msg: *const Message, offset: u32, length: u16, tsn: u32, immediate: bool) message.Data {
         return message.Data{
             .flags = .{
                 .start_fragment = offset == 0,
                 .end_fragment = offset + length == msg.len,
                 .unordered = msg.flags.unordered,
+                .immediate = immediate,
             },
             .tsn = tsn,
             .ppid = msg.ppid,
@@ -324,24 +325,31 @@ pub const NextChunkResult = packed struct {
 
 pub const NextChunkError = error{WriteFailed} || std.mem.Allocator.Error;
 
+pub const ChunkOptions = packed struct(u8) {
+    can_fragment: bool = true,
+    /// sets the I bit so the peer does not delay its SACK.
+    immediate: bool = false,
+    _pad: u6 = 0,
+};
+
 pub fn nextChunk(
     self: *MessageQueue,
     allocator: std.mem.Allocator,
     buffer: []u8,
-    can_fragment: bool,
+    options: ChunkOptions,
     now: i64,
 ) NextChunkError!?NextChunkResult {
-    const size = try self.nextRetransmit(allocator, buffer, now) orelse {
+    const size = try self.nextRetransmit(allocator, buffer, options.immediate, now) orelse {
         try self.dropExpiredMessages(allocator, now);
 
         var zero_wnd_probe = false;
-        const next_chunk_size = try self.nextChunkSize(buffer.len, can_fragment) orelse return null;
+        const next_chunk_size = try self.nextChunkSize(buffer.len, options.can_fragment) orelse return null;
         if (self.rwnd < next_chunk_size) {
             if (self.chunks.len != 0) return null;
             zero_wnd_probe = true;
         }
 
-        const written = try self.nextNewChunk(allocator, buffer);
+        const written = try self.nextNewChunk(allocator, buffer, options.immediate);
         return NextChunkResult{
             .written = @intCast(written),
             .zero_wnd_probe = zero_wnd_probe,
@@ -356,7 +364,7 @@ pub const FastRetransmit = struct {
     size: u32,
 };
 
-pub fn nextFastRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8, now: i64) NextChunkError!?FastRetransmit {
+pub fn nextFastRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8, options: ChunkOptions, now: i64) NextChunkError!?FastRetransmit {
     while (true) {
         const tsn = self.sack_handler.firstTsnWithThreeMisses(self.lowestOutstandingTsn()) orelse return null;
         try self.events.ensureUnusedCapacity(allocator, 1);
@@ -370,7 +378,7 @@ pub fn nextFastRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buf
         if (self.getChunkSizeAt(tsn) > buffer.len) return error.WriteFailed;
         self.chunks.atPtr(chunk_id).retransmit.count +|= 1;
         self.sack_handler.markFastRetransmitted(tsn);
-        return .{ .tsn = tsn, .size = self.writeChunkAt(tsn, buffer) };
+        return .{ .tsn = tsn, .size = self.writeChunkAt(tsn, buffer, options.immediate) };
     }
 }
 
@@ -490,12 +498,12 @@ fn updateFlightSize(self: *MessageQueue, tsn: u32, comptime inc: bool) void {
     if (inc) self.flight_size += chunk_size else self.flight_size -= chunk_size;
 }
 
-fn writeChunkAt(self: *const MessageQueue, tsn: u32, buffer: []u8) u32 {
+fn writeChunkAt(self: *const MessageQueue, tsn: u32, buffer: []u8, immediate: bool) u32 {
     const index = tsn -% self.earliest_tsn;
-    return self.writeMessageChunk(index, self.chunks.atPtr(index), buffer);
+    return self.writeMessageChunk(index, self.chunks.atPtr(index), buffer, immediate);
 }
 
-fn nextRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8, now: i64) NextChunkError!?u32 {
+fn nextRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8, immediate: bool, now: i64) NextChunkError!?u32 {
     while (true) {
         const start_tsn = self.getCurrentRetransmitTsn() orelse return null;
         try self.events.ensureUnusedCapacity(allocator, 1);
@@ -522,15 +530,15 @@ fn nextRetransmit(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u
         chunk.retransmit.count +|= 1;
         self.flight_size += chunk.length;
         self.rwnd -|= chunk.length;
-        const written = self.writeMessageChunk(self.retransmit_index.?, chunk, buffer);
+        const written = self.writeMessageChunk(self.retransmit_index.?, chunk, buffer, immediate);
         self.nextRetransmitIndex();
         return written;
     }
 }
 
-fn writeMessageChunk(self: *const MessageQueue, chunk_index: u32, msg_chunk: *const MessageChunk, buffer: []u8) u32 {
+fn writeMessageChunk(self: *const MessageQueue, chunk_index: u32, msg_chunk: *const MessageChunk, buffer: []u8, immediate: bool) u32 {
     const msg = self.messages.atPtr(msg_chunk.message_id -% self.earliest_message_id);
-    const data_chunk = msg.toDataChunk(msg_chunk.offset, msg_chunk.length, self.earliest_tsn +% chunk_index);
+    const data_chunk = msg.toDataChunk(msg_chunk.offset, msg_chunk.length, self.earliest_tsn +% chunk_index, immediate);
     return @intCast(data_chunk.write(buffer));
 }
 
@@ -551,7 +559,7 @@ fn nextChunkSize(self: *MessageQueue, buffer_size: usize, can_fragment: bool) er
     return @intCast(std.mem.alignBackward(usize, buffer_size - message.data_chunk_header_size, 4));
 }
 
-fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8) std.mem.Allocator.Error!usize {
+fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8, immediate: bool) std.mem.Allocator.Error!usize {
     std.debug.assert(self.curr_msg < self.messages.len);
     try self.chunks.ensureUnusedCapacity(allocator, 1);
     try self.events.ensureUnusedCapacity(allocator, 1);
@@ -566,7 +574,7 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
         stream_state.incSeq();
     }
 
-    const chunk = msg.toDataChunk(self.message_offset, @intCast(payload_size), self.curr_tsn);
+    const chunk = msg.toDataChunk(self.message_offset, @intCast(payload_size), self.curr_tsn, immediate);
     self.chunks.pushBackAssumeCapacity(.{
         .message_id = self.earliest_message_id +% self.curr_msg,
         .offset = self.message_offset,
@@ -741,7 +749,7 @@ fn testSendChunks(msg_queue: *MessageQueue, count: usize) !void {
     var buffer: [64]u8 = undefined;
     for (0..count) |_| {
         try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 0, .ppid = 0 });
-        _ = try msg_queue.nextNewChunk(testing.allocator, &buffer);
+        _ = try msg_queue.nextNewChunk(testing.allocator, &buffer, false);
     }
 }
 
@@ -785,7 +793,7 @@ test "MessageQueue.nextChunk: ordered messages take the stream sequence when sen
 
     var buffer: [64]u8 = undefined;
     for ([_]u16{ 0, 0, 1 }) |ssn| {
-        _ = (try msg_queue.nextChunk(testing.allocator, &buffer, true, 0)).?;
+        _ = (try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0)).?;
         try testing.expectEqual(ssn, std.mem.readInt(u16, buffer[10..12], .big));
     }
     try testing.expectEqual(2, msg_queue.streams.get(0).?.stream_seq);
@@ -822,8 +830,8 @@ test "MessageQueue.nextRetransmit: retransmitting the last chunk clears the retr
     msg_queue.flight_size = 0;
 
     var buffer: [64]u8 = undefined;
-    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, 0)).?;
-    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, 0)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0)).?;
 
     try testing.expectEqual(null, msg_queue.retransmit_index);
     try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
@@ -839,8 +847,8 @@ test "MessageQueue.nextChunk: a message that fits in one packet is not fragmente
     try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [message.PMDCS]u8 = undefined;
-    try testing.expectError(error.WriteFailed, msg_queue.nextChunk(testing.allocator, buffer[0..200], true, 0));
-    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, true, 0)).?;
+    try testing.expectError(error.WriteFailed, msg_queue.nextChunk(testing.allocator, buffer[0..200], .{}, 0));
+    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0)).?;
     try testing.expectEqual(message.data_chunk_header_size + data.len, result.written);
 }
 
@@ -853,7 +861,7 @@ test "MessageQueue.nextChunk: data chunk padding fits in a buffer not aligned to
     try msg_queue.pushData(testing.allocator, &data, .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [130]u8 = undefined;
-    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, true, 0)).?;
+    const result = (try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0)).?;
     try testing.expectEqual(0, result.written % 4);
     try testing.expect(result.written <= buffer.len);
 }
@@ -868,7 +876,7 @@ test "MessageQueue.nextChunk: outstanding tsns stay within the peer's tsn window
     }
 
     var buffer: [64]u8 = undefined;
-    while (try msg_queue.nextChunk(testing.allocator, &buffer, true, 0)) |_| {}
+    while (try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0)) |_| {}
     // the peer accepts tsns up to its cumulative tsn + bitmap_bits - 1
     try testing.expectEqual(SackHandler.bitmap_bits - 1, msg_queue.chunks.len);
 }
@@ -900,12 +908,12 @@ test "MessageQueue.nextChunk: abandon expired new messages" {
     try msg_queue.pushData(testing.allocator, "next", .{ .ppid = 0, .stream_id = 1 });
 
     var buffer: [message.PMDCS]u8 = undefined;
-    _ = try msg_queue.nextChunk(testing.allocator, &buffer, false, 110) orelse return error.TestFailure;
+    _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{ .can_fragment = false }, 110) orelse return error.TestFailure;
     try testing.expectEqual(4, msg_queue.messages.len); // First message dropped
     try testing.expectEqualStrings("World", msg_queue.messages.at(0).data());
     try testing.expect(!msg_queue.pending_forward_tsn);
 
-    _ = try msg_queue.nextChunk(testing.allocator, &buffer, true, 201) orelse return error.TestFailure;
+    _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 201) orelse return error.TestFailure;
     try testing.expectEqual(4, msg_queue.messages.len);
     try testing.expectEqualStrings("", msg_queue.messages.at(1).data()); // Second message abandoned, but not deleted from messages list
     try testing.expect(!msg_queue.pending_forward_tsn);
@@ -924,7 +932,7 @@ test "MessageQueue.nextChunk: abandon expired new messages" {
     try testing.expect(msg_queue.pending_forward_tsn);
 
     // the next message is not skipped
-    _ = try msg_queue.nextChunk(testing.allocator, &buffer, true, 301) orelse return error.TestFailure;
+    _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 301) orelse return error.TestFailure;
     try testing.expectEqual(4, std.mem.readInt(u32, buffer[4..8], .big));
     try testing.expectEqualStrings("next", buffer[16..20]);
 
@@ -952,7 +960,7 @@ test "MessageQueue.nextChunk: abandon an expired message whose sent fragments ar
     try msg_queue.pushData(testing.allocator, "next", .{ .ppid = 0, .stream_id = 1 });
 
     var buffer: [message.PMDCS]u8 = undefined;
-    _ = try msg_queue.nextChunk(testing.allocator, &buffer, true, 0) orelse return error.TestFailure;
+    _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0) orelse return error.TestFailure;
     try testAckUpTo(&msg_queue, testing.allocator, 1);
 
     // the message stays queued while the placeholder chunk references it
@@ -979,28 +987,28 @@ test "MessageQueue.nextChunk: abandon messages on retransmission" {
 
     var buffer: [message.PMDCS]u8 = undefined;
     for (0..3) |_| {
-        _ = try msg_queue.nextChunk(testing.allocator, &buffer, true, 0) orelse return error.TestFailure;
+        _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0) orelse return error.TestFailure;
     }
     try testing.expectEqual(3, msg_queue.chunks.len);
 
     msg_queue.handleTimeout();
     // all chunks are retransmitted
     for (0..3) |_| {
-        _ = try msg_queue.nextChunk(testing.allocator, &buffer, true, 0) orelse return error.TestFailure;
+        _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0) orelse return error.TestFailure;
     }
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, 200));
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false,200));
 
     msg_queue.handleTimeout();
-    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, 100) orelse return error.TestFailure;
+    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false,100) orelse return error.TestFailure;
     try testing.expect(msg_queue.chunks.at(0).retransmit.abandoned);
 
     // Fragment of the large message is retransmitted
-    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, 200) orelse return error.TestFailure;
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, 200));
+    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false,200) orelse return error.TestFailure;
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false,200));
 
     msg_queue.handleTimeout();
-    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, 400) orelse return error.TestFailure;
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, 400));
+    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false,400) orelse return error.TestFailure;
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false,400));
     try testing.expectEqual(4, msg_queue.chunks.len);
     try testing.expect(msg_queue.chunks.at(2).retransmit.abandoned);
     // place holder chunk
@@ -1026,7 +1034,7 @@ test "MessageQueue.nextFastRetransmit: abandon messages" {
 
         try msg_queue.pushData(testing.allocator, "a", .{ .stream_id = 1, .ppid = 0, .policy = .{ .max_retransmit = 0 } });
         for (0..3) |_| try msg_queue.pushData(testing.allocator, "b", .{ .stream_id = 0, .ppid = 0 });
-        for (0..4) |_| _ = try msg_queue.nextChunk(testing.allocator, &buffer, true, 0) orelse return error.TestFailure;
+        for (0..4) |_| _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0) orelse return error.TestFailure;
 
         // tsn 1 gets three miss indications
         for ([_]u8{ 2, 3, 4 }) |end| {
@@ -1038,7 +1046,7 @@ test "MessageQueue.nextFastRetransmit: abandon messages" {
             }, false);
         }
 
-        try testing.expectEqual(null, try msg_queue.nextFastRetransmit(testing.allocator, &buffer, 0));
+        try testing.expectEqual(null, try msg_queue.nextFastRetransmit(testing.allocator, &buffer, .{}, 0));
         try testing.expect(msg_queue.chunks.at(0).retransmit.abandoned);
         try testing.expectEqual(4, msg_queue.chunks.len);
         try testing.expectEqual(0, msg_queue.flight_size);
@@ -1059,7 +1067,7 @@ test "MessageQueue.nextFastRetransmit: abandon messages" {
         var big_message: [5 * message.PMDCS]u8 = undefined;
         try msg_queue.pushData(testing.allocator, &big_message, .{ .stream_id = 1, .ppid = 0, .policy = .{ .deadline = 100 } });
         try msg_queue.pushData(testing.allocator, "next", .{ .stream_id = 1, .ppid = 0 });
-        for (0..4) |_| _ = try msg_queue.nextChunk(testing.allocator, &buffer, true, 0) orelse return error.TestFailure;
+        for (0..4) |_| _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0) orelse return error.TestFailure;
 
         for ([_]u8{ 2, 3, 4 }) |end| {
             _ = try msg_queue.handleSack(testing.allocator, message.Sack{
@@ -1070,7 +1078,7 @@ test "MessageQueue.nextFastRetransmit: abandon messages" {
             }, false);
         }
 
-        try testing.expectEqual(null, try msg_queue.nextFastRetransmit(testing.allocator, &buffer, 100));
+        try testing.expectEqual(null, try msg_queue.nextFastRetransmit(testing.allocator, &buffer, .{}, 100));
         try testing.expectEqual(5, msg_queue.chunks.len);
         for (0..5) |index| try testing.expect(msg_queue.chunks.at(index).retransmit.abandoned);
         try testing.expectEqual(0, msg_queue.chunks.at(4).length);
@@ -1103,10 +1111,10 @@ test "MessageQueue.nextRetransmit: gap acked chunks are skipped" {
 
     var buffer: [64]u8 = undefined;
     for ([_]u32{ 2, 5 }) |tsn| {
-        _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, 0)).?;
+        _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0)).?;
         try testing.expectEqual(tsn, std.mem.readInt(u32, buffer[4..8], .big));
     }
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, 0));
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0));
     try testing.expectEqual(null, msg_queue.retransmit_index);
 }
 
@@ -1130,7 +1138,7 @@ test "MessageQueue.handleSack: acknowledging every chunk during a retransmission
     msg_queue.flight_size = 0;
 
     var buffer: [64]u8 = undefined;
-    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, 0)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0)).?;
     try testing.expectEqual(4, msg_queue.flight_size);
 
     _ = try msg_queue.handleSack(testing.allocator, message.Sack{
@@ -1154,16 +1162,16 @@ test "MessageQueue.nextNewChunk: buffered amount low event is emitted only when 
 
     var buffer: [64]u8 = undefined;
     // 12 -> 8: still above the threshold
-    _ = try msg_queue.nextNewChunk(testing.allocator, &buffer);
+    _ = try msg_queue.nextNewChunk(testing.allocator, &buffer, false);
     try testing.expectEqual(0, msg_queue.events.len);
 
     // 8 -> 4: crosses the threshold
-    _ = try msg_queue.nextNewChunk(testing.allocator, &buffer);
+    _ = try msg_queue.nextNewChunk(testing.allocator, &buffer, false);
     try testing.expectEqual(1, msg_queue.events.len);
     try testing.expectEqual(Event{ .buffered_amount_low_threshold = 0 }, msg_queue.events.at(0));
 
     // 4 -> 0: was already at or below the threshold
-    _ = try msg_queue.nextNewChunk(testing.allocator, &buffer);
+    _ = try msg_queue.nextNewChunk(testing.allocator, &buffer, false);
     try testing.expectEqual(1, msg_queue.events.len);
 }
 
@@ -1177,7 +1185,7 @@ test "MessageQueue.nextNewChunk: one buffered amount low event per stream crossi
 
     // Room for 4 bytes of payload: stream 1 is sent as three fragments
     var buffer: [message.data_chunk_header_size + 4]u8 = undefined;
-    for (0..4) |_| _ = try msg_queue.nextNewChunk(testing.allocator, &buffer);
+    for (0..4) |_| _ = try msg_queue.nextNewChunk(testing.allocator, &buffer, false);
 
     try testing.expectEqual(2, msg_queue.events.len);
     try testing.expectEqual(Event{ .buffered_amount_low_threshold = 1 }, msg_queue.events.at(0));
@@ -1219,14 +1227,14 @@ test "MessageQueue.nextNewChunk: running out of memory for events sends nothing"
     failing.resize_fail_index = failing.resize_index;
 
     var buffer: [64]u8 = undefined;
-    try testing.expectError(error.OutOfMemory, msg_queue.nextNewChunk(allocator, &buffer));
+    try testing.expectError(error.OutOfMemory, msg_queue.nextNewChunk(allocator, &buffer, false));
     try testing.expectEqual(0, msg_queue.chunks.len);
     try testing.expectEqual(4, msg_queue.bufferedAmount(0).?);
     try testing.expectEqual(0, msg_queue.flight_size);
 
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
-    _ = try msg_queue.nextNewChunk(allocator, &buffer);
+    _ = try msg_queue.nextNewChunk(allocator, &buffer, false);
     try testing.expectEqual(1, msg_queue.chunks.len);
     try testing.expectEqual(0, msg_queue.bufferedAmount(0).?);
     try testing.expectEqual(1, msg_queue.events.len);
@@ -1245,7 +1253,7 @@ test "MessageQueue.nextForwardTsn: reports the highest abandoned ssn of each ord
     try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 2, .ppid = 0, .unordered = true });
     try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 3, .ppid = 0 });
     try msg_queue.pushData(testing.allocator, "aaaa", .{ .stream_id = 1, .ppid = 0 });
-    for (0..6) |_| _ = try msg_queue.nextNewChunk(testing.allocator, buffer[0 .. message.data_chunk_header_size + 4]);
+    for (0..6) |_| _ = try msg_queue.nextNewChunk(testing.allocator, buffer[0 .. message.data_chunk_header_size + 4], false);
 
     // nothing abandoned
     msg_queue.pending_forward_tsn = true;

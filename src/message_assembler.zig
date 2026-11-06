@@ -62,7 +62,8 @@ pub fn init(capacity: u32) MessageAssembler {
         .sack_generator = .init(0),
         .boundary = .empty,
         .lowest_held_tsn = 0,
-        .send_sack = false,
+        // RFC9260 - 5.1. the first DATA chunk is acknowledged immediately
+        .send_sack = true,
         .sack_deadline = std.math.maxInt(i64),
         .pending = .empty,
         .streams = .empty,
