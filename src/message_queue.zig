@@ -830,8 +830,8 @@ test "MessageQueue.nextRetransmit: retransmitting the last chunk clears the retr
     msg_queue.flight_size = 0;
 
     var buffer: [64]u8 = undefined;
-    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0)).?;
-    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 0)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 0)).?;
 
     try testing.expectEqual(null, msg_queue.retransmit_index);
     try testing.expectEqual(null, msg_queue.getCurrentRetransmitTsn());
@@ -996,19 +996,19 @@ test "MessageQueue.nextChunk: abandon messages on retransmission" {
     for (0..3) |_| {
         _ = try msg_queue.nextChunk(testing.allocator, &buffer, .{}, 0) orelse return error.TestFailure;
     }
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false,200));
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 200));
 
     msg_queue.handleTimeout();
-    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false,100) orelse return error.TestFailure;
+    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 100) orelse return error.TestFailure;
     try testing.expect(msg_queue.chunks.at(0).retransmit.abandoned);
 
     // Fragment of the large message is retransmitted
-    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false,200) orelse return error.TestFailure;
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false,200));
+    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 200) orelse return error.TestFailure;
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 200));
 
     msg_queue.handleTimeout();
-    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false,400) orelse return error.TestFailure;
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false,400));
+    _ = try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 400) orelse return error.TestFailure;
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 400));
     try testing.expectEqual(4, msg_queue.chunks.len);
     try testing.expect(msg_queue.chunks.at(2).retransmit.abandoned);
     // place holder chunk
@@ -1111,10 +1111,10 @@ test "MessageQueue.nextRetransmit: gap acked chunks are skipped" {
 
     var buffer: [64]u8 = undefined;
     for ([_]u32{ 2, 5 }) |tsn| {
-        _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0)).?;
+        _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 0)).?;
         try testing.expectEqual(tsn, std.mem.readInt(u32, buffer[4..8], .big));
     }
-    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0));
+    try testing.expectEqual(null, try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 0));
     try testing.expectEqual(null, msg_queue.retransmit_index);
 }
 
@@ -1138,7 +1138,7 @@ test "MessageQueue.handleSack: acknowledging every chunk during a retransmission
     msg_queue.flight_size = 0;
 
     var buffer: [64]u8 = undefined;
-    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false,0)).?;
+    _ = (try msg_queue.nextRetransmit(testing.allocator, &buffer, false, 0)).?;
     try testing.expectEqual(4, msg_queue.flight_size);
 
     _ = try msg_queue.handleSack(testing.allocator, message.Sack{
