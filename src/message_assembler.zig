@@ -104,7 +104,10 @@ pub fn setInitTsn(self: *MessageAssembler, init_tsn: u32) void {
 }
 
 pub fn receiveData(self: *MessageAssembler, allocator: std.mem.Allocator, d: message.Data) ReceiveError!bool {
-    if (d.user_data.len == 0) return error.NoUserData;
+    if (d.user_data.len == 0) {
+        @branchHint(.cold);
+        return error.NoUserData;
+    }
     self.sack_generator.checkTsn(d.tsn) catch |err| return err == error.Duplicate;
 
     if (d.tsn -% self.lowest_held_tsn >= bitmap_bits) {

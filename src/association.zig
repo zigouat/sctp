@@ -21,7 +21,9 @@ pub const Error = error{InvalidState} || std.mem.Allocator.Error;
 pub const Extensions = packed struct(u8) {
     /// If `true`, the association will negotiate stream reset reconfiguration (RFC6525).
     stream_reconfiguration: bool = false,
-    _pad: u7 = 0,
+    /// If `true`, the association will negotiate partial reliability (RFC3758).
+    partial_reliability: bool = false,
+    _pad: u6 = 0,
 
     fn fromChunks(chunks: []const message.ChunkType) Extensions {
         var extensions: Extensions = .{};
@@ -38,8 +40,19 @@ pub const Extensions = packed struct(u8) {
 
     // The parameter is at most 8 bytes and the smallest buffer we can write to is 128 bytes, so this should never fail.
     fn write(extensions: Extensions, buffer: []u8) usize {
-        if (!extensions.stream_reconfiguration) return 0;
-        return message.Parameter.writeBuffer(.{ .supported_extensions = &.{.reconfig} }, buffer) catch unreachable;
+        var written: usize = 0;
+        if (extensions.stream_reconfiguration) {
+            written += message.Parameter.writeBuffer(
+                .{ .supported_extensions = &.{.reconfig} },
+                buffer,
+            ) catch unreachable;
+        }
+
+        if (extensions.partial_reliability) {
+            written += message.Parameter.writeBuffer(.forward_tsn_supported, buffer[written..]) catch unreachable;
+        }
+
+        return written;
     }
 };
 
@@ -352,17 +365,23 @@ pub fn resetStreams(self: *Association, streams: []const u16, direction: StreamR
     self.stream_reset.maybeStartTransmitting(&self.message_queue);
 }
 
+pub const HandleWriteError = error{ UnsupportedExtension, InvalidState, InvalidStream } || std.mem.Allocator.Error;
+
 /// Write a message to the association.
 ///
 /// The `data` is copied internally.
-pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMessageConfig) (Error || error{InvalidStream})!void {
+pub fn handleWrite(self: *Association, data: []const u8, options: message.UserMessageConfig) HandleWriteError!void {
     std.debug.assert(data.len > 0);
+    if (options.policy != .reliable and !self.negotiated_extensions.partial_reliability) return error.UnsupportedExtension;
     switch (self.state) {
         .established, .cookie_wait, .cookie_echoed => {},
         else => return error.InvalidState,
     }
+
     if (options.stream_id >= self.outbound_streams) return error.InvalidStream;
+
     if (!try self.stream_reset.bufferMessage(self.allocator, data, options)) {
+        @branchHint(.likely);
         try self.message_queue.pushData(self.allocator, data, options);
     }
 }
@@ -403,13 +422,16 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
         if (packet.verification_tag == 0 and chunk != .init) break;
 
         // RFC9260 - 8.4. (8)
-        if (self.state == .closed) switch (chunk) {
-            .data, .init_ack, .sack, .heartbeat, .shutdown => {
-                try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
-                return null;
-            },
-            else => {},
-        };
+        if (self.state == .closed) {
+            @branchHint(.unlikely);
+            switch (chunk) {
+                .data, .init_ack, .sack, .heartbeat, .shutdown => {
+                    try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
+                    return null;
+                },
+                else => {},
+            }
+        }
 
         switch (chunk) {
             // the tag is only checked against the first chunk of the packet
@@ -432,13 +454,13 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 if (packet.verification_tag != self.verification_tag or !std.mem.eql(u8, cookie, &self.cookie)) break;
 
                 self.transmits.pushBackAssumeCapacity(.cookie_ack);
-                if (self.state == .closed or self.state == .cookie_wait) try self.setStateToEstablished();
+                if (self.beforePeerInit()) try self.setStateToEstablished();
             },
             .cookie_ack => if (self.state == .cookie_echoed) try self.setStateToEstablished(),
             .data => |d| {
-                switch (self.state) {
-                    .established, .shutdown_pending, .shutdown_sent => {},
-                    else => break,
+                if (!self.acceptData()) {
+                    @branchHint(.unlikely);
+                    continue;
                 }
 
                 if (d.stream_id >= self.inbound_streams) {
@@ -477,6 +499,12 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 return null;
             },
             .forward_tsn => |fwd_tsn| {
+                if (!self.negotiated_extensions.partial_reliability) {
+                    // send error chunk
+                    continue;
+                }
+                if (!self.acceptData()) continue;
+
                 self.message_assembler.handleForwardTsn(self.allocator, &fwd_tsn) catch |err| switch (err) {
                     error.ProtocolViolation => {
                         try self.transmits.pushBack(self.allocator, .protocol_violation_abort);
@@ -664,6 +692,25 @@ pub fn pollTimeout(self: *Association) ?i64 {
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
+fn acceptData(self: *const Association) bool {
+    return switch (self.state) {
+        .established, .shutdown_pending, .shutdown_sent => true,
+        else => false,
+    };
+}
+
+fn beforeEstablished(self: *const Association) bool {
+    return switch (self.state) {
+        .closed, .cookie_wait, .cookie_echoed => true,
+        else => false,
+    };
+}
+
+/// No INIT or INIT ACK received from the peer yet.
+fn beforePeerInit(self: *const Association) bool {
+    return self.state == .closed or self.state == .cookie_wait;
+}
+
 fn nextChunk(
     self: *Association,
     buffer: []u8,
@@ -672,6 +719,7 @@ fn nextChunk(
     can_fragment: bool,
 ) TransmitError!?struct { ?Transmit, usize } {
     if (self.fast_retransmit) {
+        @branchHint(.unlikely);
         if (self.nextFastRetransmit(buffer, now) catch |err| {
             if (first_chunk) return err;
             self.fast_retransmit = false;
@@ -693,7 +741,10 @@ fn nextChunk(
 
         if (self.message_queue.flight_size >= self.cwnd) return null;
 
-        if (self.fast_recovery) if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
+        if (self.fast_recovery) {
+            @branchHint(.unlikely);
+            if (try self.nextFastRetransmit(buffer, now)) |size| return .{ null, size };
+        }
         if (self.burst_window) |window| if (self.message_queue.flight_size >= window) return null;
         const result = try self.message_queue.nextChunk(self.allocator, buffer, can_fragment, now) orelse return null;
         self.zero_wnd_probe |= result.zero_wnd_probe;
@@ -798,7 +849,7 @@ fn handleInitChunk(self: *Association, chunk: message.Init) !void {
     const supported_extensions = try getPeerSupportedExtensions(chunk);
     try self.transmits.pushBack(self.allocator, .{ .init_ack = chunk.initiate_tag });
 
-    if (self.state == .closed or self.state == .cookie_wait) {
+    if (self.beforePeerInit()) {
         self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
         self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
         self.message_assembler.setInitTsn(chunk.initial_tsn);
@@ -819,6 +870,7 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     while (try it.next()) |param| switch (param) {
         .state_cookie => |value| cookie_param = value,
         .supported_extensions => |chunks| supported_extensions = .fromChunks(chunks),
+        .forward_tsn_supported => supported_extensions.partial_reliability = true,
         else => {},
     };
     const cookie = cookie_param orelse return error.MissingCookie;
@@ -854,6 +906,7 @@ fn getPeerSupportedExtensions(chunk: message.Init) !Extensions {
     var it = chunk.iterateParameters();
     while (try it.next()) |param| switch (param) {
         .supported_extensions => |chunks| supported_extensions = .fromChunks(chunks),
+        .forward_tsn_supported => supported_extensions.partial_reliability = true,
         else => {},
     };
 
@@ -886,6 +939,7 @@ fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
             self.fast_recovery_exit_tsn = 0;
         }
     } else if (result.has_fast_retransmit) {
+        @branchHint(.unlikely);
         self.fast_recovery = true;
         self.fast_retransmit = true;
         self.fast_recovery_exit_tsn = self.message_queue.highestTsnSent();
@@ -928,8 +982,9 @@ fn handleShutdownAck(self: *Association, verification_tag: u32) !void {
             try self.setStateToClosed();
         },
         // RFC9260 - 8.5.1. (E) a shutdown ack received before the association is established is out of the blue
-        .closed, .cookie_wait, .cookie_echoed => try self.transmits.pushBack(self.allocator, .{ .shutdown_complete = verification_tag }),
-        else => return,
+        else => if (self.beforeEstablished()) {
+            try self.transmits.pushBack(self.allocator, .{ .shutdown_complete = verification_tag });
+        },
     }
 }
 
@@ -991,10 +1046,7 @@ fn isValidVerificationTag(self: *const Association, packet: *const message.Packe
     return switch (@as(message.ChunkType, @enumFromInt(packet.chunks[0]))) {
         .init => packet.verification_tag == 0,
         .abort, .shutdown_complete => packet.verification_tag == if (reflected) self.peer_verification_tag else self.verification_tag,
-        .shutdown_ack => switch (self.state) {
-            .closed, .cookie_wait, .cookie_echoed => true,
-            else => packet.verification_tag == self.verification_tag,
-        },
+        .shutdown_ack => self.beforeEstablished() or packet.verification_tag == self.verification_tag,
         // RFC9260 - 8.4. out of the blue packets have no association to check the tag against
         else => self.state == .closed or packet.verification_tag == self.verification_tag,
     };
@@ -1284,6 +1336,47 @@ fn testReconfigPacket(assoc: *const Association, buffer: []u8, params: []const u
     @memset(buffer[message.packet_header_size + 4 + params.len .. size], 0);
     Helper.checkSum(buffer[0..size]);
     return buffer[0..size];
+}
+
+test "Association: negotiate extensions" {
+    var buffer: [message.PMDCS]u8 = undefined;
+
+    const cases = comptime blk: {
+        var result: [16][3][2]bool = undefined;
+        for (&result, 0..) |*case, i| {
+            const a = [2]bool{ (i & 1) != 0, (i & 2) != 0 };
+            const b = [2]bool{ (i & 4) != 0, (i & 8) != 0 };
+            case.* = .{ a, b, .{ a[0] and b[0], a[1] and b[1] } };
+        }
+        break :blk result;
+    };
+
+    for (cases) |case| {
+        var assoc1 = testAssoc();
+        defer assoc1.deinit();
+
+        var assoc2 = testAssoc();
+        defer assoc2.deinit();
+
+        assoc1.supported_extensions = .{ .partial_reliability = case[0][1], .stream_reconfiguration = case[0][0] };
+        assoc2.supported_extensions = .{ .partial_reliability = case[1][1], .stream_reconfiguration = case[1][0] };
+
+        try assoc1.connect();
+        var packet = try assoc1.pollTransmit(&buffer, 0) orelse return error.UnexpectedFailedTest;
+        _ = try assoc2.handleRead(packet, 0);
+
+        packet = try assoc2.pollTransmit(&buffer, 0) orelse return error.UnexpectedFailedTest;
+        _ = try assoc1.handleRead(packet, 0);
+
+        packet = try assoc1.pollTransmit(&buffer, 0) orelse return error.UnexpectedFailedTest;
+        _ = try assoc2.handleRead(packet, 0);
+
+        try testing.expectEqual(assoc1.negotiated_extensions, assoc2.negotiated_extensions);
+        try testing.expectEqual(case[2][0], assoc1.negotiated_extensions.stream_reconfiguration);
+        try testing.expectEqual(case[2][0], assoc2.negotiated_extensions.stream_reconfiguration);
+        try testing.expectEqual(case[2][1], assoc1.negotiated_extensions.partial_reliability);
+        try testing.expectEqual(case[2][1], assoc2.negotiated_extensions.partial_reliability);
+    }
 }
 
 test "Association.pollTransmits: a timed out message that was gap acked is not retransmitted" {

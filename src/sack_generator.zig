@@ -25,6 +25,7 @@ pub const TsnError = error{ OutOfWindow, Duplicate };
 
 pub fn checkTsn(self: *SackGenerator, tsn: u32) TsnError!void {
     if (Helper.tsnLte(tsn, self.received.cumulative_tsn)) {
+        @branchHint(.unlikely);
         self.recordDuplicate(tsn);
         return error.Duplicate;
     }
@@ -33,6 +34,7 @@ pub fn checkTsn(self: *SackGenerator, tsn: u32) TsnError!void {
     if (offset >= bitmap_bits - 1) return error.OutOfWindow;
 
     if (self.received.isAcked(tsn)) {
+        @branchHint(.unlikely);
         self.recordDuplicate(tsn);
         return error.Duplicate;
     }

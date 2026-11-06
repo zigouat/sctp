@@ -596,7 +596,10 @@ fn nextNewChunk(self: *MessageQueue, allocator: std.mem.Allocator, buffer: []u8)
 fn dropExpiredMessages(self: *MessageQueue, allocator: std.mem.Allocator, now: i64) AllocError!void {
     while (self.curr_msg < self.messages.len) {
         const msg = self.messages.atPtr(self.curr_msg);
-        if (msg.flags.policy != .deadline or now < msg.policy_value) return;
+        if (msg.flags.policy != .deadline or now < msg.policy_value) {
+            @branchHint(.likely);
+            return;
+        }
 
         try self.events.ensureUnusedCapacity(allocator, 1);
         if (self.message_offset != 0) {
