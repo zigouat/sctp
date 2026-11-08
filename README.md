@@ -24,7 +24,7 @@ This is a sans-IO implementation of SCTP, meaning that it does not handle any I/
 Requires Zig `0.16.0`.
 
 ```sh
-zig fetch --save git+https://github.com/zigouat/sctp
+zig fetch --save git+https://github.com/zigouat/sctp.git#v0.1.0
 ```
 
 In `build.zig`:
