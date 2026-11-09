@@ -731,7 +731,7 @@ fn beforePeerInit(self: *const Association) bool {
 fn pushForwardTsnError(self: *Association, fwd_tsn: *const message.ForwardTsn, reported_chunk: *bool) !void {
     const length = 8 + fwd_tsn.streams.len;
     const chunk = try self.reserveUnrecognizedChunkError(length, reported_chunk) orelse return;
-    chunk[0] = @intFromEnum(message.ChunkType.forward_tsn);
+    chunk[0] = @backingInt(message.ChunkType.forward_tsn);
     chunk[1] = 0;
     std.mem.writeInt(u16, chunk[2..4], @intCast(length), .big);
     std.mem.writeInt(u32, chunk[4..8], fwd_tsn.new_cumulative_tsn, .big);
@@ -1087,7 +1087,7 @@ fn handleReconfigResponse(self: *Association, resp: *const message.ReConfigRespo
 fn isValidVerificationTag(self: *const Association, packet: *const message.Packet) bool {
     if (packet.chunks.len < 2) return packet.verification_tag == self.verification_tag;
     const reflected = packet.chunks[1] & 0x01 != 0;
-    return switch (@as(message.ChunkType, @enumFromInt(packet.chunks[0]))) {
+    return switch (@as(message.ChunkType, @fromBackingInt(@intCast(packet.chunks[0])))) {
         .init => packet.verification_tag == 0,
         .abort, .shutdown_complete => packet.verification_tag == if (reflected) self.peer_verification_tag else self.verification_tag,
         .shutdown_ack => self.beforeEstablished() or packet.verification_tag == self.verification_tag,
@@ -1116,7 +1116,7 @@ fn setInitTimer(self: *Association, now: i64) void {
 }
 
 fn writeInit(self: *Association, buffer: []u8) usize {
-    buffer[0] = @intFromEnum(message.ChunkType.init);
+    buffer[0] = @backingInt(message.ChunkType.init);
     buffer[1] = 0; // flags
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
     std.mem.writeInt(u32, buffer[8..12], self.message_assembler.capacity, .big);
@@ -1130,7 +1130,7 @@ fn writeInit(self: *Association, buffer: []u8) usize {
 }
 
 fn writeInitAck(self: *Association, buffer: []u8) usize {
-    buffer[0] = @intFromEnum(message.ChunkType.init_ack);
+    buffer[0] = @backingInt(message.ChunkType.init_ack);
     buffer[1] = 0; // flags
 
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
@@ -1154,7 +1154,7 @@ fn writeInitAck(self: *Association, buffer: []u8) usize {
 fn writeCookieEcho(cookie: []const u8, buffer: []u8) error{WriteFailed}!usize {
     const size = std.mem.alignForward(usize, cookie.len + 4, 4);
     if (buffer.len < size) return error.WriteFailed;
-    buffer[0] = @intFromEnum(message.ChunkType.cookie_echo);
+    buffer[0] = @backingInt(message.ChunkType.cookie_echo);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], @intCast(4 + cookie.len), .big);
     @memcpy(buffer[4..][0..cookie.len], cookie);
@@ -1165,7 +1165,7 @@ fn writeCookieEcho(cookie: []const u8, buffer: []u8) error{WriteFailed}!usize {
 
 fn writeCookieAck(self: *Association, buffer: []u8) usize {
     _ = self;
-    buffer[0] = @intFromEnum(message.ChunkType.cookie_ack);
+    buffer[0] = @backingInt(message.ChunkType.cookie_ack);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
 
@@ -1175,18 +1175,18 @@ fn writeCookieAck(self: *Association, buffer: []u8) usize {
 // An ABORT with a single cause has the layout of an ERROR chunk, only the type differs.
 fn writeNoUserDataAbort(buffer: []u8, tsn: u32) usize {
     const written = message.Error.writeNoUserDataErrorChunk(buffer, tsn) catch unreachable;
-    buffer[0] = @intFromEnum(message.ChunkType.abort);
+    buffer[0] = @backingInt(message.ChunkType.abort);
     return written;
 }
 
 fn writeProtocolViolationAbort(buffer: []u8) usize {
     const written = message.Error.writeProtocolViolationErrorChunk(buffer) catch unreachable;
-    buffer[0] = @intFromEnum(message.ChunkType.abort);
+    buffer[0] = @backingInt(message.ChunkType.abort);
     return written;
 }
 
 fn writeHeartbeatAck(data: []const u8, buffer: []u8) !usize {
-    buffer[0] = @intFromEnum(message.ChunkType.heartbeat_ack);
+    buffer[0] = @backingInt(message.ChunkType.heartbeat_ack);
     buffer[1] = 0; // flags
     const written = try message.Parameter.writeBuffer(.{ .heartbeat_info = data }, buffer[4..]);
     std.mem.writeInt(u16, buffer[2..4], @intCast(written + 4), .big);
@@ -1194,7 +1194,7 @@ fn writeHeartbeatAck(data: []const u8, buffer: []u8) !usize {
 }
 
 fn writeShutdown(buffer: []u8, tsn: u32) usize {
-    buffer[0] = @intFromEnum(message.ChunkType.shutdown);
+    buffer[0] = @backingInt(message.ChunkType.shutdown);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 8, .big);
     std.mem.writeInt(u32, buffer[4..8], tsn, .big);
@@ -1202,28 +1202,28 @@ fn writeShutdown(buffer: []u8, tsn: u32) usize {
 }
 
 fn writeShutdownAck(buffer: []u8) usize {
-    buffer[0] = @intFromEnum(message.ChunkType.shutdown_ack);
+    buffer[0] = @backingInt(message.ChunkType.shutdown_ack);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
     return 4;
 }
 
 fn writeAbort(buffer: []u8) usize {
-    buffer[0] = @intFromEnum(message.ChunkType.abort);
+    buffer[0] = @backingInt(message.ChunkType.abort);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
     return 4;
 }
 
 fn writeReflectedAbort(buffer: []u8) usize {
-    buffer[0] = @intFromEnum(message.ChunkType.abort);
+    buffer[0] = @backingInt(message.ChunkType.abort);
     buffer[1] = 0x01; // T bit
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
     return 4;
 }
 
 fn writeShutdownComplete(buffer: []u8, reflected: bool) usize {
-    buffer[0] = @intFromEnum(message.ChunkType.shutdown_complete);
+    buffer[0] = @backingInt(message.ChunkType.shutdown_complete);
     buffer[1] = @intFromBool(reflected);
     std.mem.writeInt(u16, buffer[2..4], 4, .big);
     return 4;
@@ -1265,7 +1265,7 @@ fn testPacket(buffer: *[16]u8, vtag: u32, chunk_type: message.ChunkType, flags: 
     std.mem.writeInt(u16, buffer[2..4], 5000, .big);
     std.mem.writeInt(u32, buffer[4..8], vtag, .big);
     std.mem.writeInt(u32, buffer[8..12], 0, .big);
-    buffer[12] = @intFromEnum(chunk_type);
+    buffer[12] = @backingInt(chunk_type);
     buffer[13] = flags;
     std.mem.writeInt(u16, buffer[14..16], 4, .big);
     Helper.checkSum(buffer);
@@ -1315,7 +1315,7 @@ fn testShutdownPacket(assoc: *const Association, buffer: []u8, tsn: u32) []const
 
 fn testSackPacket(buffer: []u8, assoc: *const Association, cumulative_tsn: u32, gaps: []const u16, a_rwnd: u32) []const u8 {
     assoc.writeCommonHeader(buffer);
-    buffer[12] = @intFromEnum(message.ChunkType.sack);
+    buffer[12] = @backingInt(message.ChunkType.sack);
     buffer[13] = 0;
     std.mem.writeInt(u32, buffer[16..20], cumulative_tsn, .big);
     std.mem.writeInt(u32, buffer[20..24], a_rwnd, .big);
@@ -1336,10 +1336,10 @@ fn testOutgoingResetPacket(assoc: *const Association, buffer: []u8, req_seq_num:
     assoc.writeCommonHeader(buffer);
     const chunk = buffer[message.packet_header_size..];
     const param_length: u16 = @intCast(16 + 2 * streams.len);
-    chunk[0] = @intFromEnum(message.ChunkType.reconfig);
+    chunk[0] = @backingInt(message.ChunkType.reconfig);
     chunk[1] = 0;
     std.mem.writeInt(u16, chunk[2..4], 4 + param_length, .big);
-    std.mem.writeInt(u16, chunk[4..6], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
+    std.mem.writeInt(u16, chunk[4..6], @backingInt(message.ParameterType.outgoing_ssn_reset_req), .big);
     std.mem.writeInt(u16, chunk[6..8], param_length, .big);
     std.mem.writeInt(u32, chunk[8..12], req_seq_num, .big);
     std.mem.writeInt(u32, chunk[12..16], 0, .big);
@@ -1366,7 +1366,7 @@ fn testStreamData(tsn: u32, stream_id: u16, stream_seq: u16) message.Data {
 fn testReconfigPacket(assoc: *const Association, buffer: []u8, params: []const u8) []const u8 {
     assoc.writeCommonHeader(buffer);
     const chunk = buffer[message.packet_header_size..];
-    chunk[0] = @intFromEnum(message.ChunkType.reconfig);
+    chunk[0] = @backingInt(message.ChunkType.reconfig);
     chunk[1] = 0;
     std.mem.writeInt(u16, chunk[2..4], @intCast(4 + params.len), .big);
     @memcpy(chunk[4..][0..params.len], params);
@@ -1570,7 +1570,7 @@ test "Association.pollTransmit: cookie echo is padded when bundled" {
     try testing.expectEqual(message.packet_header_size + 12 + 4, packet.len);
     try testing.expectEqual(9, std.mem.readInt(u16, packet[14..16], .big));
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, packet[21..24]);
-    try testing.expectEqual(@intFromEnum(message.ChunkType.cookie_ack), packet[24]);
+    try testing.expectEqual(@backingInt(message.ChunkType.cookie_ack), packet[24]);
 }
 
 test "Association.pollTransmit: a cookie echo that does not fit does not arm the init timer" {
@@ -1654,7 +1654,7 @@ test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
 
     var buffer: [20]u8 = undefined;
     assoc.writeCommonHeader(&buffer);
-    buffer[12] = @intFromEnum(message.ChunkType.shutdown);
+    buffer[12] = @backingInt(message.ChunkType.shutdown);
     buffer[13] = 0;
     std.mem.writeInt(u16, buffer[14..16], 8, .big);
     std.mem.writeInt(u32, buffer[16..20], assoc.initial_tsn, .big);
@@ -1701,7 +1701,7 @@ test "Association.abort: drops queued data and sends a single abort chunk" {
     const packet = (try assoc.pollTransmit(&out, 0)).?;
     try testing.expectEqual(message.packet_header_size + 4, packet.len);
     try testing.expectEqual(assoc.peer_verification_tag, std.mem.readInt(u32, packet[4..8], .big));
-    try testing.expectEqual(@intFromEnum(message.ChunkType.abort), packet[12]);
+    try testing.expectEqual(@backingInt(message.ChunkType.abort), packet[12]);
     try testing.expectEqual(0, packet[13]);
 
     try testing.expectEqual(null, try assoc.pollTransmit(&out, 0));
@@ -1834,7 +1834,7 @@ test "Association.handleRead: out of the blue shutdown ack is answered with a re
     var out: [message.MTU]u8 = undefined;
     const packet = (try assoc.pollTransmit(&out, 0)).?;
     try testing.expectEqual(0x55667788, std.mem.readInt(u32, packet[4..8], .big));
-    try testing.expectEqual(@intFromEnum(message.ChunkType.shutdown_complete), packet[12]);
+    try testing.expectEqual(@backingInt(message.ChunkType.shutdown_complete), packet[12]);
     try testing.expectEqual(0x01, packet[13]);
 }
 
@@ -1863,7 +1863,7 @@ test "Association.handleRead: out of the blue packets are answered with a reflec
         const packet = (try assoc.pollTransmit(&out, 0)).?;
         try testing.expectEqual(message.packet_header_size + 4, packet.len);
         try testing.expectEqual(0x55667788, std.mem.readInt(u32, packet[4..8], .big));
-        try testing.expectEqual(@intFromEnum(message.ChunkType.abort), packet[12]);
+        try testing.expectEqual(@backingInt(message.ChunkType.abort), packet[12]);
         try testing.expectEqual(0x01, packet[13]);
         try testing.expectEqual(0, assoc.message_assembler.ready.len);
     }
@@ -1871,7 +1871,7 @@ test "Association.handleRead: out of the blue packets are answered with a reflec
     // unrecognized chunk type
     {
         var buffer: [16]u8 = undefined;
-        _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, @enumFromInt(0x40), 0), 0);
+        _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, @fromBackingInt(@intCast(0x40)), 0), 0);
         try testing.expectEqual(Transmit{ .ootb_abort = 0x55667788 }, assoc.transmits.popFront().?);
     }
 
@@ -1889,10 +1889,10 @@ test "Association.handleRead: out of the blue cookie echo with a wrong tag is di
     std.mem.writeInt(u16, buffer[2..4], 5000, .big);
     std.mem.writeInt(u32, buffer[4..8], assoc.verification_tag +% 1, .big);
     std.mem.writeInt(u32, buffer[8..12], 0, .big);
-    buffer[12] = @intFromEnum(message.ChunkType.cookie_ack);
+    buffer[12] = @backingInt(message.ChunkType.cookie_ack);
     buffer[13] = 0;
     std.mem.writeInt(u16, buffer[14..16], 4, .big);
-    buffer[16] = @intFromEnum(message.ChunkType.cookie_echo);
+    buffer[16] = @backingInt(message.ChunkType.cookie_echo);
     buffer[17] = 0;
     std.mem.writeInt(u16, buffer[18..20], 36, .big);
     @memcpy(buffer[20..], &assoc.cookie);
@@ -1916,7 +1916,7 @@ test "Association.handleRead: a replayed cookie echo does not reopen a closed as
     var buffer: [message.packet_header_size + 36]u8 = undefined;
     std.mem.writeInt(u16, buffer[0..2], 5000, .big);
     std.mem.writeInt(u16, buffer[2..4], 5000, .big);
-    buffer[12] = @intFromEnum(message.ChunkType.cookie_echo);
+    buffer[12] = @backingInt(message.ChunkType.cookie_echo);
     buffer[13] = 0;
     std.mem.writeInt(u16, buffer[14..16], 36, .big);
     @memcpy(buffer[16..], &assoc.cookie);
@@ -2471,14 +2471,14 @@ test "Association.handleRead: a data channel close resets the stream in both dir
 
     // Outgoing SSN Reset Request (seq N) and Incoming SSN Reset Request (seq N + 1) for stream 1
     var params: [32]u8 = undefined;
-    std.mem.writeInt(u16, params[0..2], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
+    std.mem.writeInt(u16, params[0..2], @backingInt(message.ParameterType.outgoing_ssn_reset_req), .big);
     std.mem.writeInt(u16, params[2..4], 18, .big);
     std.mem.writeInt(u32, params[4..8], tsn, .big);
     std.mem.writeInt(u32, params[8..12], 0, .big);
     std.mem.writeInt(u32, params[12..16], tsn -% 1, .big);
     std.mem.writeInt(u16, params[16..18], 1, .big);
     @memset(params[18..20], 0);
-    std.mem.writeInt(u16, params[20..22], @intFromEnum(message.ParameterType.incoming_ssn_reset_req), .big);
+    std.mem.writeInt(u16, params[20..22], @backingInt(message.ParameterType.incoming_ssn_reset_req), .big);
     std.mem.writeInt(u16, params[22..24], 10, .big);
     std.mem.writeInt(u32, params[24..28], tsn +% 1, .big);
     std.mem.writeInt(u16, params[28..30], 1, .big);
@@ -2506,10 +2506,10 @@ test "Association.handleRead: a data channel close resets the stream in both dir
 
     // The peer accepts our request
     var response_param: [12]u8 = undefined;
-    std.mem.writeInt(u16, response_param[0..2], @intFromEnum(message.ParameterType.reconfig_response), .big);
+    std.mem.writeInt(u16, response_param[0..2], @backingInt(message.ParameterType.reconfig_response), .big);
     std.mem.writeInt(u16, response_param[2..4], 12, .big);
     std.mem.writeInt(u32, response_param[4..8], request.req_seq_num, .big);
-    std.mem.writeInt(u32, response_param[8..12], @intFromEnum(message.ReConfigResponse.Result.success_performed), .big);
+    std.mem.writeInt(u32, response_param[8..12], @backingInt(message.ReConfigResponse.Result.success_performed), .big);
 
     _ = try testRead(&assoc, testReconfigPacket(&assoc, &buffer, &response_param), 0, &lens);
     try testing.expectEqual(Event{ .outgoing_stream_reset = 1 }, assoc.pollEvent().?);

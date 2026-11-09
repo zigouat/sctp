@@ -58,7 +58,7 @@ pub fn writeSack(self: *const SackGenerator, buffer: []u8, a_rwnd: u32) u32 {
     std.debug.assert(buffer.len >= 16);
 
     const cumulative_tsn = self.received.cumulative_tsn;
-    buffer[0] = @intFromEnum(message.ChunkType.sack);
+    buffer[0] = @backingInt(message.ChunkType.sack);
     buffer[1] = 0; // flags
     std.mem.writeInt(u32, buffer[4..8], cumulative_tsn, .big);
     std.mem.writeInt(u32, buffer[8..12], a_rwnd, .big);
@@ -171,7 +171,7 @@ test "SackGenerator.writeSack: writeSack encodes cumulative tsn, gap ack blocks,
     var buffer: [64]u8 = undefined;
     const chunk = buffer[0..g.writeSack(&buffer, 1500)];
 
-    try testing.expectEqual(@intFromEnum(message.ChunkType.sack), chunk[0]);
+    try testing.expectEqual(@backingInt(message.ChunkType.sack), chunk[0]);
     try testing.expectEqual(0, chunk[1]);
     try testing.expectEqual(chunk.len, std.mem.readInt(u16, chunk[2..4], .big));
     try testing.expectEqual(1, std.mem.readInt(u32, chunk[4..8], .big));

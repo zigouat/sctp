@@ -66,7 +66,7 @@ pub const ChunkIterator = struct {
     fn parseChunk(self: *ChunkIterator) ParseError!?Chunk {
         if (self.slice.len < 4) return error.InvalidChunk;
 
-        const chunk_type: ChunkType = @enumFromInt(self.slice[0]);
+        const chunk_type: ChunkType = @fromBackingInt(@intCast(self.slice[0]));
         const flags = self.slice[1];
         const length = std.mem.readInt(u16, self.slice[2..4], .big);
         const padded_length = std.mem.alignForward(u32, length, 4);
@@ -225,7 +225,7 @@ pub const Data = struct {
     pub fn write(self: *const Data, buffer: []u8) usize {
         const size = self.getSize();
 
-        buffer[0] = @intFromEnum(ChunkType.data);
+        buffer[0] = @backingInt(ChunkType.data);
         buffer[1] = @bitCast(self.flags);
         std.mem.writeInt(u16, buffer[2..4], @intCast(self.user_data.len + data_chunk_header_size), .big);
         std.mem.writeInt(u32, buffer[4..8], self.tsn, .big);
@@ -419,10 +419,10 @@ pub const Error = union(ErrorCode) {
         const size = std.mem.alignForward(usize, length, 4);
         if (buffer.len < size) return error.WriteFailed;
 
-        buffer[0] = @intFromEnum(ChunkType.@"error");
+        buffer[0] = @backingInt(ChunkType.@"error");
         buffer[1] = 0; // flags
         std.mem.writeInt(u16, buffer[2..4], @intCast(length), .big);
-        std.mem.writeInt(u16, buffer[4..6], @intFromEnum(code), .big);
+        std.mem.writeInt(u16, buffer[4..6], @backingInt(code), .big);
         std.mem.writeInt(u16, buffer[6..8], @intCast(4 + info.len), .big);
         @memcpy(buffer[8..length], info);
         @memset(buffer[length..size], 0);
@@ -494,7 +494,7 @@ pub const ErrorIterator = struct {
             const length = std.mem.readInt(u16, self.slice[2..4], .big);
             const padded_length = std.mem.alignForward(u32, length, 4);
             if (length < 4 or length > self.slice.len) return error.InvalidParameter;
-            const err: ErrorCode = @enumFromInt(error_code);
+            const err: ErrorCode = @fromBackingInt(@intCast(error_code));
 
             defer self.slice = if (self.slice.len >= padded_length) self.slice[padded_length..] else self.slice[length..];
             return switch (err) {
@@ -643,11 +643,11 @@ pub const ReConfigResponse = struct {
         if (data.len != 8 and data.len != 16) return error.InvalidParameter;
 
         const result = std.mem.readInt(u32, data[4..8], .big);
-        if (result > @intFromEnum(Result.in_progress)) return error.InvalidParameter;
+        if (result > @backingInt(Result.in_progress)) return error.InvalidParameter;
 
         return ReConfigResponse{
             .resp_seq_num = std.mem.readInt(u32, data[0..4], .big),
-            .result = @enumFromInt(result),
+            .result = @fromBackingInt(@intCast(result)),
             .sender_next_tsn = if (data.len == 16) std.mem.readInt(u32, data[8..12], .big) else null,
             .receiver_next_tsn = if (data.len == 16) std.mem.readInt(u32, data[12..16], .big) else null,
         };
@@ -674,10 +674,10 @@ pub const Parameter = union(enum) {
                 const size: usize = if (resp.sender_next_tsn != null) 16 else 8;
                 if (size + 4 > buffer.len) return error.WriteFailed;
 
-                std.mem.writeInt(u16, buffer[0..2], @intFromEnum(ParameterType.reconfig_response), .big);
+                std.mem.writeInt(u16, buffer[0..2], @backingInt(ParameterType.reconfig_response), .big);
                 std.mem.writeInt(u16, buffer[2..4], @intCast(size + 4), .big);
                 std.mem.writeInt(u32, buffer[4..8], resp.resp_seq_num, .big);
-                std.mem.writeInt(u32, buffer[8..12], @intFromEnum(resp.result), .big);
+                std.mem.writeInt(u32, buffer[8..12], @backingInt(resp.result), .big);
                 if (resp.sender_next_tsn) |_| {
                     std.mem.writeInt(u32, buffer[12..16], resp.sender_next_tsn.?, .big);
                     std.mem.writeInt(u32, buffer[16..20], resp.receiver_next_tsn.?, .big);
@@ -686,7 +686,7 @@ pub const Parameter = union(enum) {
                 break :blk size + 4;
             },
             .forward_tsn_supported => writeTLV(ParameterType.forward_tsn_supported, &.{}, buffer),
-            .unknown => |param| writeTLV(@enumFromInt(param.param_type), param.value, buffer),
+            .unknown => |param| writeTLV(@fromBackingInt(@intCast(param.param_type)), param.value, buffer),
             else => unreachable,
         };
     }
@@ -695,7 +695,7 @@ pub const Parameter = union(enum) {
         const total_size = std.mem.alignForward(usize, data.len + 4, 4);
         if (buffer.len < total_size) return error.WriteFailed;
 
-        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(typ), .big);
+        std.mem.writeInt(u16, buffer[0..2], @backingInt(typ), .big);
         std.mem.writeInt(u16, buffer[2..4], @intCast(data.len + 4), .big);
         @memcpy(buffer[4..][0..data.len], data);
         @memset(buffer[4 + data.len .. total_size], 0);
@@ -714,7 +714,7 @@ pub const ParameterIterator = struct {
         if (self.slice.len == 0) return null;
         if (self.slice.len < 4) return error.InvalidParameter;
 
-        const param_type: ParameterType = @enumFromInt(std.mem.readInt(u16, self.slice[0..2], .big));
+        const param_type: ParameterType = @fromBackingInt(@intCast(std.mem.readInt(u16, self.slice[0..2], .big)));
         const length = std.mem.readInt(u16, self.slice[2..4], .big);
         const padded_length = (length + 3) & ~@as(u16, 3); // Align to 4 bytes
 
@@ -734,7 +734,7 @@ pub const ParameterIterator = struct {
                 break :blk .forward_tsn_supported;
             },
             .supported_extensions => .{ .supported_extensions = std.mem.bytesAsSlice(ChunkType, value) },
-            else => .{ .unknown = .{ .param_type = @intFromEnum(param_type), .value = value } },
+            else => .{ .unknown = .{ .param_type = @backingInt(param_type), .value = value } },
         };
     }
 };
@@ -1068,8 +1068,8 @@ test "ParameterIterator: rejects lengths shorter than the header" {
 
 test "ParameterIterator: round-trip supported extensions parameter" {
     const data = [_]u8{
-        0x80,                                  0x08,                             0x00,                               0x07,
-        @intFromEnum(ChunkType.heartbeat_ack), @intFromEnum(ChunkType.shutdown), @intFromEnum(ChunkType.cookie_ack), 0,
+        0x80,                                 0x08,                            0x00,                              0x07,
+        @backingInt(ChunkType.heartbeat_ack), @backingInt(ChunkType.shutdown), @backingInt(ChunkType.cookie_ack), 0,
     };
 
     var it = ParameterIterator.init(data[0..]);
