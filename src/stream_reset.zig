@@ -48,7 +48,7 @@ const Request = struct {
     fn writeOutgoingRequest(request: *const Request, streams_it: std.Deque(u16).Iterator, buffer: []u8) void {
         const param_length: u32 = 16 + 2 * @as(u32, request.stream_count);
 
-        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.outgoing_ssn_reset_req), .big);
+        std.mem.writeInt(u16, buffer[0..2], @backingInt(message.ParameterType.outgoing_ssn_reset_req), .big);
         std.mem.writeInt(u16, buffer[2..4], @intCast(param_length), .big);
         std.mem.writeInt(u32, buffer[4..8], request.seq_num, .big);
         std.mem.writeInt(u32, buffer[8..12], request.resp_seq_num, .big);
@@ -63,7 +63,7 @@ const Request = struct {
     fn writeIncomingRequest(request: *const Request, streams_it: std.Deque(u16).Iterator, buffer: []u8) void {
         const param_length: u32 = 8 + 2 * @as(u32, request.stream_count);
 
-        std.mem.writeInt(u16, buffer[0..2], @intFromEnum(message.ParameterType.incoming_ssn_reset_req), .big);
+        std.mem.writeInt(u16, buffer[0..2], @backingInt(message.ParameterType.incoming_ssn_reset_req), .big);
         std.mem.writeInt(u16, buffer[2..4], @intCast(param_length), .big);
         std.mem.writeInt(u32, buffer[4..8], request.incomingSeqNum(), .big);
 
@@ -372,7 +372,7 @@ pub fn pollTransmit(self: *StreamReset, buffer: []u8, now: i64, rto: u32) error{
     // The chunk length excludes the padding of the last parameter (RFC9260 - 3.2), only an odd stream count adds one
     const padding = streams_size % 4;
 
-    buffer[0] = @intFromEnum(message.ChunkType.reconfig);
+    buffer[0] = @backingInt(message.ChunkType.reconfig);
     buffer[1] = 0; // flags
     std.mem.writeInt(u16, buffer[2..4], @intCast(size - padding), .big);
 

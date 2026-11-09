@@ -1,5 +1,5 @@
 const std = @import("std");
-const Crc32c = @import("crc32c.zig").Crc32c;
+const Crc32c = std.hash.crc.@"CRC-32/ISCSI";
 
 pub fn tsnLte(a: u32, b: u32) bool {
     return @as(i32, @bitCast(a -% b)) <= 0;

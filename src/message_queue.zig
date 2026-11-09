@@ -392,7 +392,7 @@ pub fn nextForwardTsn(self: *MessageQueue, buffer: []u8) error{WriteFailed}!?u32
         self.pending_forward_tsn = true;
         return error.WriteFailed;
     }
-    buffer[0] = @intFromEnum(message.ChunkType.forward_tsn);
+    buffer[0] = @backingInt(message.ChunkType.forward_tsn);
     buffer[1] = 0;
 
     const end_index = self.advanced_peer_ack_point -% self.earliest_tsn;
@@ -1266,19 +1266,19 @@ test "MessageQueue.nextForwardTsn: reports the highest abandoned ssn of each ord
     msg_queue.pending_forward_tsn = true;
     try testing.expectEqual(12, msg_queue.nextForwardTsn(buffer[0..12]));
     try testing.expectEqualSlices(u8, &.{
-        @intFromEnum(message.ChunkType.forward_tsn), 0, 0, 12,
-        0,                                           0, 0, 4,
-        0,                                           1, 0, 1,
+        @backingInt(message.ChunkType.forward_tsn), 0, 0, 12,
+        0,                                          0, 0, 4,
+        0,                                          1, 0, 1,
     }, buffer[0..12]);
 
     // stops at tsn 6 which is not abandoned
     msg_queue.pending_forward_tsn = true;
     try testing.expectEqual(16, msg_queue.nextForwardTsn(&buffer));
     try testing.expectEqualSlices(u8, &.{
-        @intFromEnum(message.ChunkType.forward_tsn), 0, 0, 16,
-        0,                                           0, 0, 5,
-        0,                                           1, 0, 1,
-        0,                                           3, 0, 0,
+        @backingInt(message.ChunkType.forward_tsn), 0, 0, 16,
+        0,                                          0, 0, 5,
+        0,                                          1, 0, 1,
+        0,                                          3, 0, 0,
     }, buffer[0..16]);
 }
 
