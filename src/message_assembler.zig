@@ -854,7 +854,7 @@ test "MessageAssembler.dropChunkWithHighestTsn: withdraws completed messages but
     // ssn 1 of stream 0 waits for ssn 0, stream 1 is ready
     _ = try r.receiveData(testing.allocator, testData(2, 0, 1, .start_frag, &payload));
     _ = try r.receiveData(testing.allocator, testData(3, 0, 1, .end_frag, &payload));
-    _ = try r.receiveData(testing.allocator, testData(4, 1, 0, .complete, "b" ** 40));
+    _ = try r.receiveData(testing.allocator, testData(4, 1, 0, .complete, &@as([40]u8, @splat('b'))));
     try testing.expectEqual(0, r.advertised_wnd);
 
     // tsn 4 is ready so tsn 3 is dropped, withdrawing ssn 1
@@ -866,7 +866,7 @@ test "MessageAssembler.dropChunkWithHighestTsn: withdraws completed messages but
     try testing.expectEqual(2, TsnBitSet.firstSet(&r.boundary, 1, 3));
     try testing.expectEqual(2, r.ready.len);
 
-    for ([_][]const u8{ "b" ** 40, "c" }) |expected| {
+    for ([_][]const u8{ &@as([40]u8, @splat('b')), "c" }) |expected| {
         const msg = r.drainReady(testing.allocator).?;
         try testing.expectEqualStrings(expected, msg.data);
     }
