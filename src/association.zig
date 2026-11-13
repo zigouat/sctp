@@ -487,6 +487,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 };
                 received_data = true;
             },
+            .idata => {},
             .sack => |sack| switch (self.state) {
                 .established, .shutdown_pending, .shutdown_received, .cookie_echoed => try self.handleSack(sack, now),
                 else => {},
@@ -521,6 +522,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 };
                 received_data = true;
             },
+            .iforward_tsn => {},
             .reconfig => |params| {
                 if (!self.negotiated_extensions.stream_reconfiguration) continue; // send error chunk
                 var it = params;
@@ -1871,7 +1873,7 @@ test "Association.handleRead: out of the blue packets are answered with a reflec
     // unrecognized chunk type
     {
         var buffer: [16]u8 = undefined;
-        _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, @fromBackingInt(@intCast(0x40)), 0), 0);
+        _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, @fromBackingInt(@intCast(0x41)), 0), 0);
         try testing.expectEqual(Transmit{ .ootb_abort = 0x55667788 }, assoc.transmits.popFront().?);
     }
 

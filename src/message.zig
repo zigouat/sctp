@@ -4,6 +4,7 @@ const Helper = @import("helper.zig");
 
 pub const packet_header_size = 12;
 pub const data_chunk_header_size = 16;
+pub const idata_chunk_header_size = 20;
 pub const reconfig_response_size = 12;
 pub const MTU = 1200;
 pub const PMDCS = MTU - packet_header_size;
@@ -100,7 +101,9 @@ pub const ChunkIterator = struct {
                 if (length != 4) return error.InvalidChunk;
                 chunk = .shutdown_ack;
             },
+            .idata => chunk = .{ .idata = try IData.parse(flags, self.slice[4..length]) },
             .forward_tsn => chunk = .{ .forward_tsn = try ForwardTsn.parse(self.slice[4..length]) },
+            .iforward_tsn => chunk = .{ .iforward_tsn = try IForwardTsn.parse(self.slice[4..length]) },
             .reconfig => chunk = .{ .reconfig = ParameterIterator.init(self.slice[4..length]) },
             .@"error" => chunk = .{ .@"error" = ErrorIterator.init(self.slice[4..length]) },
             .heartbeat_ack, .ecne, .cwr => {},
@@ -128,8 +131,10 @@ pub const ChunkType = enum(u8) {
     ecne,
     cwr,
     shutdown_complete,
+    idata = 0x40,
     reconfig = 0x82,
     forward_tsn = 0xC0,
+    iforward_tsn = 0xC2,
     _,
 };
 
@@ -145,7 +150,9 @@ pub const Chunk = union(enum) {
     shutdown: u32,
     shutdown_complete: bool, // T bit
     shutdown_ack,
+    idata: IData,
     forward_tsn: ForwardTsn,
+    iforward_tsn: IForwardTsn,
     reconfig: ParameterIterator,
     @"error": ErrorIterator,
     /// The whole chunk without padding.
@@ -255,6 +262,53 @@ pub const Data = struct {
             .unordered = chunk.flags.unordered,
             .data = chunk.user_data,
         };
+    }
+};
+
+pub const IData = struct {
+    flags: Data.Flags,
+    tsn: u32,
+    stream_id: u16,
+    mid: u32,
+    fsn: u32,
+    user_data: []const u8,
+
+    pub fn parse(flags: u8, data: []const u8) error{InvalidChunk}!IData {
+        if (data.len < 16) {
+            @branchHint(.unlikely);
+            return error.InvalidChunk;
+        }
+
+        return IData{
+            .flags = @bitCast(flags),
+            .tsn = std.mem.readInt(u32, data[0..4], .big),
+            .stream_id = std.mem.readInt(u16, data[4..6], .big),
+            .mid = std.mem.readInt(u32, data[8..12], .big),
+            .fsn = std.mem.readInt(u32, data[12..16], .big),
+            .user_data = data[16..],
+        };
+    }
+
+    pub fn getSize(self: *const IData) u32 {
+        return std.mem.alignForward(u32, @intCast(idata_chunk_header_size + self.user_data.len), 4);
+    }
+
+    pub fn write(self: *const IData, buffer: []u8) usize {
+        const size = self.getSize();
+
+        buffer[0] = @backingInt(ChunkType.idata);
+        buffer[1] = @backingInt(self.flags);
+        std.mem.writeInt(u16, buffer[2..4], @intCast(self.user_data.len + idata_chunk_header_size), .big);
+        std.mem.writeInt(u32, buffer[4..8], self.tsn, .big);
+        std.mem.writeInt(u16, buffer[8..10], self.stream_id, .big);
+        std.mem.writeInt(u16, buffer[10..12], 0, .big);
+        std.mem.writeInt(u32, buffer[12..16], self.mid, .big);
+        std.mem.writeInt(u32, buffer[16..20], self.fsn, .big);
+        @memcpy(buffer[idata_chunk_header_size..][0..self.user_data.len], self.user_data);
+
+        const pad = size - idata_chunk_header_size - self.user_data.len;
+        @memset(buffer[idata_chunk_header_size + self.user_data.len ..][0..pad], 0);
+        return size;
     }
 };
 
@@ -558,6 +612,49 @@ pub const ForwardTsn = struct {
     }
 
     pub fn iterateStreams(self: *const ForwardTsn) StreamIterator {
+        return StreamIterator.init(self.streams);
+    }
+};
+
+pub const IForwardTsn = struct {
+    new_cumulative_tsn: u32,
+    streams: []const u8,
+
+    pub const StreamIterator = struct {
+        slice: []const u8,
+
+        pub fn init(slice: []const u8) StreamIterator {
+            return StreamIterator{ .slice = slice };
+        }
+
+        pub const Stream = struct {
+            stream_id: u16,
+            unordered: bool,
+            mid: u32,
+        };
+
+        pub fn next(self: *StreamIterator) ?Stream {
+            if (self.slice.len < 8) return null;
+            defer self.slice = self.slice[8..];
+
+            return .{
+                .stream_id = std.mem.readInt(u16, self.slice[0..2], .big),
+                .unordered = (self.slice[3] & 0x01) != 0,
+                .mid = std.mem.readInt(u32, self.slice[4..8], .big),
+            };
+        }
+    };
+
+    pub fn parse(data: []const u8) error{InvalidChunk}!IForwardTsn {
+        if (data.len < 4 or @rem(data.len - 4, 8) != 0) return error.InvalidChunk;
+
+        return .{
+            .new_cumulative_tsn = std.mem.readInt(u32, data[0..4], .big),
+            .streams = data[4..],
+        };
+    }
+
+    pub fn iterateStreams(self: *const IForwardTsn) StreamIterator {
         return StreamIterator.init(self.streams);
     }
 };
@@ -900,6 +997,99 @@ test "Data: round trip through ChunkIterator" {
     try std.testing.expectEqual(null, try it.next());
 }
 
+test "IData.parse" {
+    const payload = [_]u8{
+        0x00, 0x00, 0x00, 0x2a, 0x00, 0x03, 0xff, 0xff,
+        0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x33,
+        'h',  'e',  'l',  'l',  'o',
+    };
+
+    {
+        const d = try IData.parse(0x03, &payload);
+        try std.testing.expectEqual(Data.Flags{ .end_fragment = true, .start_fragment = true }, d.flags);
+        try std.testing.expectEqual(42, d.tsn);
+        try std.testing.expectEqual(3, d.stream_id);
+        try std.testing.expectEqual(0x01020304, d.mid);
+        try std.testing.expectEqual(51, d.fsn);
+        try std.testing.expectEqualSlices(u8, "hello", d.user_data);
+    }
+
+    {
+        const d = try IData.parse(0x0c, &payload);
+        try std.testing.expectEqual(Data.Flags{ .unordered = true, .immediate = true }, d.flags);
+    }
+
+    {
+        const d = try IData.parse(0, payload[0..16]);
+        try std.testing.expectEqual(0, d.user_data.len);
+    }
+
+    {
+        try std.testing.expectError(error.InvalidChunk, IData.parse(0, payload[0..15]));
+    }
+}
+
+test "IData.write" {
+    {
+        const d = IData{
+            .flags = .{ .end_fragment = true, .start_fragment = true, .unordered = true },
+            .tsn = 0x01020304,
+            .stream_id = 0x0506,
+            .mid = 0x0708090a,
+            .fsn = 0x0b0c0d0e,
+            .user_data = "hello",
+        };
+
+        var buffer: [32]u8 = @splat(0xff);
+        const n = d.write(&buffer);
+        try std.testing.expectEqual(28, n);
+        try std.testing.expectEqualSlices(u8, &.{
+            0x40, 0x07, 0x00, 0x19, 0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x00, 0x00, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 'h',  'e',  'l',  'l',
+            'o',  0x00, 0x00, 0x00,
+        }, buffer[0..n]);
+        try std.testing.expectEqual(0xff, buffer[n]);
+    }
+
+    {
+        const d = IData{ .flags = .{}, .tsn = 1, .stream_id = 0, .mid = 0, .fsn = 0, .user_data = "abcd" };
+        var buffer: [24]u8 = undefined;
+        const n = d.write(&buffer);
+        try std.testing.expectEqual(24, n);
+        try std.testing.expectEqual(24, std.mem.readInt(u16, buffer[2..4], .big));
+        try std.testing.expectEqualSlices(u8, "abcd", buffer[20..24]);
+    }
+}
+
+test "IData: round trip through ChunkIterator" {
+    const original = IData{
+        .flags = .{ .start_fragment = true },
+        .tsn = 0xfffffffe,
+        .stream_id = 9,
+        .mid = 0xffffffff,
+        .fsn = 46,
+        .user_data = "sctp!",
+    };
+
+    var buffer: [64]u8 = undefined;
+    var n = original.write(&buffer);
+    n += original.write(buffer[n..]);
+
+    var it = ChunkIterator.init(buffer[0..n]);
+    for (0..2) |_| {
+        const chunk = (try it.next()).?;
+        const d = chunk.idata;
+        try std.testing.expectEqual(original.flags, d.flags);
+        try std.testing.expectEqual(original.tsn, d.tsn);
+        try std.testing.expectEqual(original.stream_id, d.stream_id);
+        try std.testing.expectEqual(original.mid, d.mid);
+        try std.testing.expectEqual(original.fsn, d.fsn);
+        try std.testing.expectEqualSlices(u8, original.user_data, d.user_data);
+    }
+    try std.testing.expectEqual(null, try it.next());
+}
+
 test "Sack.parse" {
     const payload = [_]u8{
         0x00, 0x00, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00,
@@ -990,6 +1180,50 @@ test "ForwardTsn.parse" {
 
     try std.testing.expectError(error.InvalidChunk, ForwardTsn.parse(&.{ 0, 0, 0 }));
     try std.testing.expectError(error.InvalidChunk, ForwardTsn.parse(&.{ 0, 0, 0, 1, 0, 1 }));
+}
+
+test "IForwardTsn.parse" {
+    // without streams
+    {
+        const fwd = try IForwardTsn.parse(&.{ 0, 0, 0, 100 });
+        try std.testing.expectEqual(100, fwd.new_cumulative_tsn);
+        var it = fwd.iterateStreams();
+        try std.testing.expectEqual(null, it.next());
+    }
+
+    // with streams, the U bit is the lowest bit of the reserved field
+    {
+        const fwd = try IForwardTsn.parse(&.{
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0,    1,    0,    0,
+            0,    0,    0,    2,
+            0xAB, 0xCD, 0,    1,
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0,    1,    0xFF, 0xFE,
+            0x01, 0x02, 0x03, 0x04,
+        });
+        try std.testing.expectEqual(0xFFFFFFFF, fwd.new_cumulative_tsn);
+        var it = fwd.iterateStreams();
+        try std.testing.expectEqual(IForwardTsn.StreamIterator.Stream{ .stream_id = 1, .unordered = false, .mid = 2 }, it.next().?);
+        try std.testing.expectEqual(IForwardTsn.StreamIterator.Stream{ .stream_id = 0xABCD, .unordered = true, .mid = 0xFFFFFFFF }, it.next().?);
+        try std.testing.expectEqual(IForwardTsn.StreamIterator.Stream{ .stream_id = 1, .unordered = false, .mid = 0x01020304 }, it.next().?);
+        try std.testing.expectEqual(null, it.next());
+    }
+
+    // through ChunkIterator
+    {
+        var it = ChunkIterator.init(&.{ 0xC2, 0, 0, 16, 0, 0, 0, 7, 0, 3, 0, 1, 0, 0, 0, 5 });
+        const fwd = (try it.next()).?.iforward_tsn;
+        try std.testing.expectEqual(7, fwd.new_cumulative_tsn);
+        var streams = fwd.iterateStreams();
+        try std.testing.expectEqual(IForwardTsn.StreamIterator.Stream{ .stream_id = 3, .unordered = true, .mid = 5 }, streams.next().?);
+        try std.testing.expectEqual(null, streams.next());
+        try std.testing.expectEqual(null, try it.next());
+    }
+
+    try std.testing.expectError(error.InvalidChunk, IForwardTsn.parse(&.{ 0, 0, 0 }));
+    try std.testing.expectError(error.InvalidChunk, IForwardTsn.parse(&.{ 0, 0, 0, 1, 0, 1, 0, 0 }));
+    try std.testing.expectError(error.InvalidChunk, IForwardTsn.parse(&.{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0 }));
 }
 
 test "ChunkIterator: parse hearbeat" {
