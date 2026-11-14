@@ -310,6 +310,20 @@ pub const IData = struct {
         @memset(buffer[idata_chunk_header_size + self.user_data.len ..][0..pad], 0);
         return size;
     }
+
+    pub fn isComplete(self: *const IData) bool {
+        return self.flags.start_fragment and self.flags.end_fragment;
+    }
+
+    pub fn toUserMessage(chunk: *const IData) UserMessage {
+        return UserMessage{
+            .stream_id = chunk.stream_id,
+            .unordered = chunk.flags.unordered,
+            .ppid = chunk.fsn,
+            .data = chunk.user_data,
+            .stream_seq = 0,
+        };
+    }
 };
 
 pub const Sack = struct {

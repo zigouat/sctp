@@ -146,7 +146,8 @@ pub fn handleForwardTsn(self: *MessageAssembler, allocator: std.mem.Allocator, f
         const stream_state = try self.getStreamState(allocator, stream.@"0");
         max_ready_counts += @intCast(stream_state.complete_messages.count());
     }
-    try self.ready.ensureUnusedCapacity(allocator, max_ready_counts);
+    // a stream listed many times is counted each time, but every released message still holds a pending chunk
+    try self.ready.ensureUnusedCapacity(allocator, @min(max_ready_counts, self.pending.count()));
 
     const received = &self.sack_generator.received;
     const last_tsn = if (Helper.tsnLte(fwd_tsn.new_cumulative_tsn, received.highest_tsn_received))
