@@ -188,11 +188,8 @@ pub fn maybeStartTransmitting(self: *StreamReset, msg_queue: *const MessageQueue
     if (request.flags.started) return;
 
     if (request.flags.direction.outgoing) {
-        // Messages before `curr_msg` are fully assigned TSNs, the one at `curr_msg` may be partially sent.
-        for (msg_queue.curr_msg..msg_queue.messages.len) |index| {
-            if (request.stream_count == 0 or self.streams.contains(msg_queue.messages.atPtr(index).stream_id)) return;
-        }
-        request.last_assigned_tsn = msg_queue.curr_tsn -% 1;
+        if (msg_queue.hasUnsentMessages(if (request.stream_count == 0) null else &self.streams)) return;
+        request.last_assigned_tsn = msg_queue.highestTsnSent();
     }
     request.flags.started = true;
     self.retransmit = true;

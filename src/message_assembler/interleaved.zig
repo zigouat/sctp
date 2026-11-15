@@ -1,12 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
-const message = @import("message.zig");
+const message = @import("../message.zig");
 
 const MessageAssembler = @This();
 const UserMessage = message.UserMessage;
-const SackGenerator = @import("sack_generator.zig");
-const TsnBitSet = @import("tsn_bit_set.zig");
-const Helper = @import("helper.zig");
+const SackGenerator = @import("../sack_generator.zig");
+const TsnBitSet = @import("../tsn_bit_set.zig");
+const Helper = @import("../helper.zig");
 const BitSet = std.bit_set.StaticBitSet(bitmap_bits);
 const bitmap_bits = SackGenerator.bitmap_bits;
 
