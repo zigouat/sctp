@@ -23,27 +23,35 @@ pub const Extensions = packed struct(u8) {
     stream_reconfiguration: bool = false,
     /// If `true`, the association will negotiate partial reliability (RFC3758).
     partial_reliability: bool = false,
-    _pad: u6 = 0,
-
-    fn fromChunks(chunks: []const message.ChunkType) Extensions {
-        var extensions: Extensions = .{};
-        for (chunks) |c| switch (c) {
-            .reconfig => extensions.stream_reconfiguration = true,
-            else => {},
-        };
-        return extensions;
-    }
+    /// If `true`, the association will negotiate message interleaving (RFC8260), I-DATA chunks then replace DATA chunks.
+    message_interleaving: bool = false,
+    _pad: u5 = 0,
 
     fn intersect(a: Extensions, b: Extensions) Extensions {
         return @bitCast(@as(u8, @bitCast(a)) & @as(u8, @bitCast(b)));
     }
 
-    // The parameter is at most 8 bytes and the smallest buffer we can write to is 128 bytes, so this should never fail.
     fn write(extensions: Extensions, buffer: []u8) usize {
-        var written: usize = 0;
+        var chunks: [3]message.ChunkType = undefined;
+        var count: usize = 0;
         if (extensions.stream_reconfiguration) {
+            chunks[count] = .reconfig;
+            count += 1;
+        }
+        if (extensions.message_interleaving) {
+            chunks[count] = .idata;
+            count += 1;
+            // RFC8260 - 2.3.1. I-FORWARD-TSN is listed when partial reliability is supported too
+            if (extensions.partial_reliability) {
+                chunks[count] = .iforward_tsn;
+                count += 1;
+            }
+        }
+
+        var written: usize = 0;
+        if (count != 0) {
             written += message.Parameter.writeBuffer(
-                .{ .supported_extensions = &.{.reconfig} },
+                .{ .supported_extensions = chunks[0..count] },
                 buffer,
             ) catch unreachable;
         }
@@ -53,6 +61,32 @@ pub const Extensions = packed struct(u8) {
         }
 
         return written;
+    }
+};
+
+/// The extensions listed in the peer's INIT or INIT ACK.
+const PeerExtensions = struct {
+    extensions: Extensions = .{},
+    iforward_tsn: bool = false,
+
+    fn handleParameter(peer: *PeerExtensions, param: message.Parameter) void {
+        switch (param) {
+            .supported_extensions => |chunks| for (chunks) |c| switch (c) {
+                .reconfig => peer.extensions.stream_reconfiguration = true,
+                .idata => peer.extensions.message_interleaving = true,
+                .iforward_tsn => peer.iforward_tsn = true,
+                else => {},
+            },
+            .forward_tsn_supported => peer.extensions.partial_reliability = true,
+            else => {},
+        }
+    }
+
+    fn negotiate(peer: PeerExtensions, local: Extensions) Extensions {
+        var negotiated = peer.extensions.intersect(local);
+        // RFC8260 - 2.3.1. partial reliability over I-DATA needs I-FORWARD-TSN, FORWARD TSN can't be used
+        if (negotiated.message_interleaving and !peer.iforward_tsn) negotiated.partial_reliability = false;
+        return negotiated;
     }
 };
 
@@ -427,7 +461,7 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
         if (self.state == .closed) {
             @branchHint(.unlikely);
             switch (chunk) {
-                .data, .init_ack, .sack, .heartbeat, .shutdown => {
+                .data, .idata, .init_ack, .sack, .heartbeat, .shutdown => {
                     try self.transmits.pushBack(self.allocator, .{ .ootb_abort = packet.verification_tag });
                     return null;
                 },
@@ -463,10 +497,17 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 if (self.beforePeerInit()) try self.setStateToEstablished();
             },
             .cookie_ack => if (self.state == .cookie_echoed) try self.setStateToEstablished(),
-            .data => |d| {
+            inline .data, .idata => |d, chunk_type| {
                 if (!self.acceptData()) {
                     @branchHint(.unlikely);
                     continue;
+                }
+
+                // RFC8260 - 2.2.1. only the negotiated one of DATA and I-DATA chunks may be received
+                if ((self.message_assembler.inner == .idata) != (chunk_type == .idata)) {
+                    @branchHint(.cold);
+                    try self.abortWithProtocolViolation();
+                    return self.messageIterator();
                 }
 
                 if (d.stream_id >= self.inbound_streams) {
@@ -483,7 +524,11 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                         try self.setStateToClosed();
                         return self.messageIterator();
                     },
-                    else => |e| return e,
+                    error.ProtocolViolation => {
+                        try self.abortWithProtocolViolation();
+                        return self.messageIterator();
+                    },
+                    error.OutOfMemory => |e| return e,
                 };
                 received_data = true;
             },
@@ -504,17 +549,23 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
                 try self.setStateToClosed();
                 return null;
             },
-            .forward_tsn => |fwd_tsn| {
+            inline .forward_tsn, .iforward_tsn => |fwd_tsn, chunk_type| {
                 if (!self.negotiated_extensions.partial_reliability) {
-                    try self.pushForwardTsnError(&fwd_tsn, &reported_chunk);
+                    if (chunk_type == .forward_tsn) try self.pushForwardTsnError(&fwd_tsn, &reported_chunk);
                     continue;
                 }
                 if (!self.acceptData()) continue;
 
-                self.message_assembler.handleForwardTsn(self.allocator, &fwd_tsn) catch |err| switch (err) {
+                // RFC8260 - 2.3.1. I-FORWARD-TSN replaces FORWARD TSN once I-DATA is negotiated
+                if ((self.message_assembler.inner == .idata) != (chunk_type == .iforward_tsn)) {
+                    @branchHint(.cold);
+                    try self.abortWithProtocolViolation();
+                    return self.messageIterator();
+                }
+
+                self.message_assembler.handleForwardTsn(self.allocator, fwd_tsn) catch |err| switch (err) {
                     error.ProtocolViolation => {
-                        try self.transmits.pushBack(self.allocator, .protocol_violation_abort);
-                        try self.setStateToClosed();
+                        try self.abortWithProtocolViolation();
                         return self.messageIterator();
                     },
                     else => |e| return e,
@@ -583,7 +634,7 @@ pub fn handleTimeout(self: *Association, now: i64) std.mem.Allocator.Error!void 
         }
     }
 
-    if (now >= self.message_assembler.sack_deadline) try self.pushSack();
+    if (now >= self.message_assembler.sackDeadline()) try self.pushSack();
 
     // T3-rtx and T2-shutdown share the deadline, no data is in flight once shutdown starts
     if (now >= self.t3_timer.deadline) {
@@ -645,9 +696,9 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
     };
     self.writeCommonHeader(buffer);
 
-    const prev_curr_msg = self.message_queue.curr_msg;
+    const prev_progress = self.message_queue.sendProgress();
     if (self.burst_window == null and self.max_burst != 0) {
-        self.burst_window = self.message_queue.flight_size +| @as(u32, self.max_burst) * message.PMDCS;
+        self.burst_window = self.message_queue.flightSize() +| @as(u32, self.max_burst) * message.PMDCS;
     }
 
     while (true) {
@@ -690,14 +741,16 @@ pub fn pollTransmit(self: *Association, buffer: []u8, now: i64) TransmitError!?[
 
     Helper.checkSum(buffer[0..written]);
 
-    if (prev_curr_msg != self.message_queue.curr_msg) self.stream_reset.maybeStartTransmitting(&self.message_queue);
+    if (prev_progress == null or prev_progress != self.message_queue.sendProgress()) {
+        self.stream_reset.maybeStartTransmitting(&self.message_queue);
+    }
     return buffer[0..written];
 }
 
 pub fn pollTimeout(self: *Association) ?i64 {
     var deadline: i64 = std.math.maxInt(i64);
     for (&[_]i64{
-        self.message_assembler.sack_deadline,
+        self.message_assembler.sackDeadline(),
         self.init_deadline,
         self.t3_timer.deadline,
         self.t3_timer.idle_deadline,
@@ -778,13 +831,13 @@ fn nextChunk(
             else => return null,
         }
 
-        if (self.message_queue.flight_size >= self.cwnd) return null;
+        if (self.message_queue.flightSize() >= self.cwnd) return null;
 
         if (self.fast_recovery) {
             @branchHint(.unlikely);
             if (try self.nextFastRetransmit(buffer, options, now)) |size| return .{ null, size };
         }
-        if (self.burst_window) |window| if (self.message_queue.flight_size >= window) return null;
+        if (self.burst_window) |window| if (self.message_queue.flightSize() >= window) return null;
         const result = try self.message_queue.nextChunk(self.allocator, buffer, options, now) orelse return null;
         self.zero_wnd_probe |= result.zero_wnd_probe;
 
@@ -844,7 +897,7 @@ fn nextFastRetransmit(self: *Association, buffer: []u8, options: MessageQueue.Ch
 }
 
 fn messageIterator(self: *Association) ?MessageIterator {
-    return if (self.message_assembler.ready.len != 0) .{ .assoc = self } else null;
+    return if (self.message_assembler.hasReady()) .{ .assoc = self } else null;
 }
 
 fn setStateToClosed(self: *Association) !void {
@@ -857,7 +910,9 @@ fn resetToClosed(self: *Association) void {
     self.verification_tag = 0;
     self.resetInitTimer();
     self.message_queue.close(self.allocator, self.initial_tsn);
+    self.message_queue.useSequential(self.allocator, self.initial_tsn);
     self.message_assembler.reset(self.allocator);
+    self.message_assembler.setInterleaving(self.allocator, false);
     self.t3_timer = .init;
     self.zero_wnd_probe = false;
     self.fast_retransmit = false;
@@ -890,17 +945,18 @@ fn updateT3Timer(self: *Association, cumulative_tsn_advanced: bool, now: i64) vo
 }
 
 fn handleInitChunk(self: *Association, chunk: message.Init) !void {
-    const supported_extensions = try getPeerSupportedExtensions(chunk);
+    const peer_extensions = try getPeerExtensions(chunk);
     try self.transmits.pushBack(self.allocator, .{ .init_ack = chunk.initiate_tag });
 
     if (self.beforePeerInit()) {
+        self.negotiated_extensions = peer_extensions.negotiate(self.supported_extensions);
+        try self.useNegotiatedDataChunks();
         self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
         self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
         self.message_assembler.setInitTsn(chunk.initial_tsn);
         self.stream_reset.setPeerInitTsn(chunk.initial_tsn);
         self.peer_verification_tag = chunk.initiate_tag;
-        self.message_queue.rwnd = chunk.a_rwnd;
-        self.negotiated_extensions = supported_extensions.intersect(self.supported_extensions);
+        self.message_queue.setRwnd(chunk.a_rwnd);
         try self.checkQueuedMessages();
     }
 }
@@ -908,14 +964,12 @@ fn handleInitChunk(self: *Association, chunk: message.Init) !void {
 fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     try self.transmits.ensureUnusedCapacity(self.allocator, 1);
 
-    var supported_extensions: Extensions = .{};
+    var peer_extensions: PeerExtensions = .{};
     var cookie_param: ?[]const u8 = null;
     var it = chunk.iterateParameters();
     while (try it.next()) |param| switch (param) {
         .state_cookie => |value| cookie_param = value,
-        .supported_extensions => |chunks| supported_extensions = .fromChunks(chunks),
-        .forward_tsn_supported => supported_extensions.partial_reliability = true,
-        else => {},
+        else => peer_extensions.handleParameter(param),
     };
     const cookie = cookie_param orelse return error.MissingCookie;
 
@@ -925,17 +979,24 @@ fn handleInitAckChunk(self: *Association, chunk: message.Init) !void {
     }
     self.peer_cookie = try self.allocator.dupe(u8, cookie);
 
+    self.negotiated_extensions = peer_extensions.negotiate(self.supported_extensions);
+    try self.useNegotiatedDataChunks();
     self.inbound_streams = @min(self.inbound_streams, chunk.outbound_streams);
     self.outbound_streams = @min(self.outbound_streams, chunk.inbound_streams);
     self.message_assembler.setInitTsn(chunk.initial_tsn);
     self.stream_reset.setPeerInitTsn(chunk.initial_tsn);
     self.peer_verification_tag = chunk.initiate_tag;
-    self.message_queue.rwnd = chunk.a_rwnd;
+    self.message_queue.setRwnd(chunk.a_rwnd);
     self.state = .cookie_echoed;
     self.resetInitTimer();
     self.transmits.pushBackAssumeCapacity(.{ .cookie_echo = self.peer_cookie });
-    self.negotiated_extensions = supported_extensions.intersect(self.supported_extensions);
     try self.checkQueuedMessages();
+}
+
+fn useNegotiatedDataChunks(self: *Association) !void {
+    if (!self.negotiated_extensions.message_interleaving) return;
+    self.message_assembler.setInterleaving(self.allocator, true);
+    try self.message_queue.useInterleaving(self.allocator, self.initial_tsn);
 }
 
 fn checkQueuedMessages(self: *Association) !void {
@@ -945,20 +1006,15 @@ fn checkQueuedMessages(self: *Association) !void {
     for (streams) |stream_id| self.events.pushBackAssumeCapacity(.{ .send_failed = stream_id });
 }
 
-fn getPeerSupportedExtensions(chunk: message.Init) !Extensions {
-    var supported_extensions: Extensions = .{};
+fn getPeerExtensions(chunk: message.Init) !PeerExtensions {
+    var peer_extensions: PeerExtensions = .{};
     var it = chunk.iterateParameters();
-    while (try it.next()) |param| switch (param) {
-        .supported_extensions => |chunks| supported_extensions = .fromChunks(chunks),
-        .forward_tsn_supported => supported_extensions.partial_reliability = true,
-        else => {},
-    };
-
-    return supported_extensions;
+    while (try it.next()) |param| peer_extensions.handleParameter(param);
+    return peer_extensions;
 }
 
 fn handleSack(self: *Association, sack: message.Sack, now: i64) !void {
-    const prev_flight_size = self.message_queue.flight_size;
+    const prev_flight_size = self.message_queue.flightSize();
     const result = try self.message_queue.handleSack(self.allocator, sack, self.fast_recovery) orelse return;
 
     if (self.cwnd <= self.ssthresh) {
@@ -1060,7 +1116,6 @@ fn resetIncomingStreams(self: *Association, streams: []u16) !void {
 fn handleReconfigResponse(self: *Association, resp: *const message.ReConfigResponse) !void {
     var streams: [StreamReset.max_streams]u16 = undefined;
     const result = self.stream_reset.handleResponse(resp, &streams) orelse return;
-    self.stream_reset.maybeStartTransmitting(&self.message_queue);
     if (result.part == .incoming) return;
     if (result.succeeded) self.message_queue.resetStreams(result.streams);
 
@@ -1096,6 +1151,11 @@ fn isValidVerificationTag(self: *const Association, packet: *const message.Packe
     };
 }
 
+fn abortWithProtocolViolation(self: *Association) !void {
+    try self.transmits.pushBack(self.allocator, .protocol_violation_abort);
+    try self.setStateToClosed();
+}
+
 fn pushSack(self: *Association) !void {
     self.message_assembler.clearDelayedSack();
     if (self.pending_sack) return;
@@ -1119,7 +1179,7 @@ fn writeInit(self: *Association, buffer: []u8) usize {
     buffer[0] = @backingInt(message.ChunkType.init);
     buffer[1] = 0; // flags
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
-    std.mem.writeInt(u32, buffer[8..12], self.message_assembler.capacity, .big);
+    std.mem.writeInt(u32, buffer[8..12], self.message_assembler.getCapacity(), .big);
     std.mem.writeInt(u16, buffer[12..14], self.outbound_streams, .big);
     std.mem.writeInt(u16, buffer[14..16], self.inbound_streams, .big);
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
@@ -1134,7 +1194,7 @@ fn writeInitAck(self: *Association, buffer: []u8) usize {
     buffer[1] = 0; // flags
 
     std.mem.writeInt(u32, buffer[4..8], self.verification_tag, .big);
-    std.mem.writeInt(u32, buffer[8..12], self.message_assembler.capacity, .big);
+    std.mem.writeInt(u32, buffer[8..12], self.message_assembler.getCapacity(), .big);
     std.mem.writeInt(u16, buffer[12..14], self.outbound_streams, .big);
     std.mem.writeInt(u16, buffer[14..16], self.inbound_streams, .big);
     std.mem.writeInt(u32, buffer[16..20], self.initial_tsn, .big);
@@ -1248,7 +1308,7 @@ fn testAssoc() Association {
     });
     assoc.peer_verification_tag = assoc.verification_tag;
     assoc.message_assembler.setInitTsn(assoc.initial_tsn);
-    assoc.message_queue.rwnd = 1024 * 1024;
+    assoc.message_queue.inner.data.rwnd = 1024 * 1024;
     return assoc;
 }
 
@@ -1436,7 +1496,7 @@ test "Association.pollTransmits: a timed out message that was gap acked is not r
     while (try assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, assoc.message_assembler.advertised_wnd), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, assoc.message_assembler.inner.data.advertised_wnd), 0);
     try assoc.handleTimeout(10_000);
 
     const packet = (try assoc.pollTransmit(&out, 10_000)).?;
@@ -1636,13 +1696,13 @@ test "Association.handleRead: a sack acknowledging unsent tsns is ignored" {
     try assoc.handleWrite("bbbb", .{ .stream_id = 0, .ppid = 0 });
 
     var buffer: [32]u8 = undefined;
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}, assoc.message_assembler.advertised_wnd), 0);
-    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }, assoc.message_assembler.advertised_wnd), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 1, &.{}, assoc.message_assembler.inner.data.advertised_wnd), 0);
+    _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 1, 2 }, assoc.message_assembler.inner.data.advertised_wnd), 0);
 
     // sending the first message emptied the buffered amount, the ignored sacks produce nothing else
     try testing.expectEqual(Event{ .buffered_amount_low_threshold = 0 }, assoc.pollEvent().?);
     try testing.expectEqual(null, assoc.pollEvent());
-    try testing.expectEqual(2, assoc.message_queue.messages.len);
+    try testing.expectEqual(2, assoc.message_queue.inner.data.messages.len);
     try testing.expect(try assoc.pollTransmit(&out, 0) != null);
 }
 
@@ -1662,7 +1722,7 @@ test "Association.handleRead: a shutdown acknowledging unsent tsns is ignored" {
     _ = try assoc.handleRead(&buffer, 0);
 
     try testing.expectEqual(.established, assoc.state);
-    try testing.expectEqual(1, assoc.message_queue.messages.len);
+    try testing.expectEqual(1, assoc.message_queue.inner.data.messages.len);
 }
 
 test "Association.handleRead: a shutdown acknowledging gap acked chunks does not subtract them twice from the flight size" {
@@ -1676,12 +1736,12 @@ test "Association.handleRead: a shutdown acknowledging gap acked chunks does not
 
     var sack_buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&sack_buffer, &assoc, assoc.initial_tsn, &.{ 2, 2 }, 1000), 0);
-    try testing.expectEqual(200, assoc.message_queue.flight_size);
+    try testing.expectEqual(200, assoc.message_queue.inner.data.flight_size);
 
     var buffer: [20]u8 = undefined;
     _ = try assoc.handleRead(assoc.testShutdownPacket(&buffer, assoc.initial_tsn +% 2), 0);
 
-    try testing.expectEqual(100, assoc.message_queue.flight_size);
+    try testing.expectEqual(100, assoc.message_queue.inner.data.flight_size);
 }
 
 test "Association.abort: drops queued data and sends a single abort chunk" {
@@ -1865,13 +1925,13 @@ test "Association.handleRead: out of the blue packets are answered with a reflec
         try testing.expectEqual(0x55667788, std.mem.readInt(u32, packet[4..8], .big));
         try testing.expectEqual(@backingInt(message.ChunkType.abort), packet[12]);
         try testing.expectEqual(0x01, packet[13]);
-        try testing.expectEqual(0, assoc.message_assembler.ready.len);
+        try testing.expectEqual(0, assoc.message_assembler.inner.data.ready.len);
     }
 
     // unrecognized chunk type
     {
         var buffer: [16]u8 = undefined;
-        _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, @fromBackingInt(@intCast(0x40)), 0), 0);
+        _ = try assoc.handleRead(testPacket(&buffer, 0x55667788, @fromBackingInt(@intCast(0x41)), 0), 0);
         try testing.expectEqual(Transmit{ .ootb_abort = 0x55667788 }, assoc.transmits.popFront().?);
     }
 
@@ -1953,13 +2013,13 @@ test "Association.handleRead: all acked chunks with gap blocks stop the timer" {
     while (try assoc.pollTransmit(&out, 0)) |_| {}
 
     var buffer: [32]u8 = undefined;
-    var sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{}, assoc.message_assembler.advertised_wnd);
+    var sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{}, assoc.message_assembler.inner.data.advertised_wnd);
     _ = try assoc.handleRead(sack, 5);
 
     try testing.expectEqual(0, assoc.t3_timer.error_count);
     try testing.expect(assoc.t3_timer.deadline != std.math.maxInt(i64));
 
-    sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 }, assoc.message_assembler.advertised_wnd);
+    sack = testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 3, &.{ 1, 2 }, assoc.message_assembler.inner.data.advertised_wnd);
     _ = try assoc.handleRead(sack, 10);
     try testing.expect(assoc.t3_timer.deadline == std.math.maxInt(i64));
 }
@@ -1983,7 +2043,7 @@ test "Association.handleTimeout: cwnd decays per rto while idle" {
 
     var out: [message.MTU]u8 = undefined;
     var buffer: [32]u8 = undefined;
-    const wnd = assoc.message_assembler.advertised_wnd;
+    const wnd = assoc.message_assembler.inner.data.advertised_wnd;
 
     {
         try assoc.handleWrite("aaaa", .{ .stream_id = 0, .ppid = 0 });
@@ -2037,7 +2097,7 @@ test "Association.pollTransmit: a fast retransmit restarts T3-rtx only for the l
 
     var buffer: [64]u8 = undefined;
     const cumulative_tsn = assoc.initial_tsn -% 1;
-    const wnd = assoc.message_assembler.advertised_wnd;
+    const wnd = assoc.message_assembler.inner.data.advertised_wnd;
 
     // the lowest outstanding tsn
     for ([_]u16{ 2, 3, 4 }) |end| _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, cumulative_tsn, &.{ 2, end }, wnd), 100);
@@ -2063,7 +2123,7 @@ test "Association.pollTransmit: a lost fast retransmission is not fast retransmi
 
     var buffer: [64]u8 = undefined;
     const cumulative_tsn = assoc.initial_tsn -% 1;
-    const wnd = assoc.message_assembler.advertised_wnd;
+    const wnd = assoc.message_assembler.inner.data.advertised_wnd;
 
     for ([_]u16{ 2, 3, 4 }) |end| _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, cumulative_tsn, &.{ 2, end }, wnd), 100);
     const packet = (try assoc.pollTransmit(&out, 100)).?;
@@ -2103,14 +2163,14 @@ test "Association.handleRead: a duplicate followed by new data in the same packe
 
     try testing.expectEqual(1, (try testRead(&assoc, buffer[0..len], MessageAssembler.sack_delay, &lens)).len);
     try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
-    try testing.expect(!assoc.message_assembler.send_sack);
+    try testing.expect(!assoc.message_assembler.inner.data.send_sack);
 }
 
 test "Association.handleRead: data on an invalid stream is acknowledged and answered with an error" {
     var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
     assoc.inbound_streams = 2;
-    assoc.message_assembler.send_sack = false;
+    assoc.message_assembler.inner.data.send_sack = false;
 
     var buffer: [64]u8 = undefined;
     var lens: [1]usize = undefined;
@@ -2119,7 +2179,7 @@ test "Association.handleRead: data on an invalid stream is acknowledged and answ
     try testing.expectEqual(Transmit{ .invalid_stream_error = 5 }, assoc.transmits.popFront().?);
     try testing.expectEqual(0, assoc.transmits.len);
     try testing.expectEqual(assoc.initial_tsn, assoc.message_assembler.getCumulativeTsn());
-    try testing.expect(assoc.message_assembler.send_sack);
+    try testing.expect(assoc.message_assembler.inner.data.send_sack);
 
     // a retransmission is sacked immediately
     try testing.expectEqual(0, (try testRead(&assoc, packet, 0, &lens)).len);
@@ -2221,14 +2281,14 @@ test "Association.shutdown: an empty queue sends a shutdown right away" {
 test "Association.rwnd: sending subtracts the user data size, not the chunk size" {
     var assoc = try testEstablishedAssoc();
     defer assoc.deinit();
-    assoc.message_queue.rwnd = 1000;
+    assoc.message_queue.inner.data.rwnd = 1000;
 
     const data: [101]u8 = @splat('a');
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
     var out: [message.MTU]u8 = undefined;
     _ = (try assoc.pollTransmit(&out, 0)).?;
 
-    try testing.expectEqual(899, assoc.message_queue.rwnd);
+    try testing.expectEqual(899, assoc.message_queue.inner.data.rwnd);
 }
 
 test "Association.rwnd: a sack subtracts the outstanding data from the advertised window" {
@@ -2242,7 +2302,7 @@ test "Association.rwnd: a sack subtracts the outstanding data from the advertise
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn, &.{}, 1000), 0);
-    try testing.expectEqual(800, assoc.message_queue.rwnd);
+    try testing.expectEqual(800, assoc.message_queue.inner.data.rwnd);
 }
 
 test "Association.rwnd: gap acked chunks are not outstanding" {
@@ -2257,7 +2317,7 @@ test "Association.rwnd: gap acked chunks are not outstanding" {
     // acks the second chunk only
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, 1000), 0);
-    try testing.expectEqual(800, assoc.message_queue.rwnd);
+    try testing.expectEqual(800, assoc.message_queue.inner.data.rwnd);
 }
 
 test "Association.rwnd: a sack with a window smaller than the outstanding data saturates to zero" {
@@ -2271,7 +2331,7 @@ test "Association.rwnd: a sack with a window smaller than the outstanding data s
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 100), 0);
-    try testing.expectEqual(0, assoc.message_queue.rwnd);
+    try testing.expectEqual(0, assoc.message_queue.inner.data.rwnd);
 }
 
 test "Association.rwnd: a timeout adds back the unacked data and the retransmission subtracts it" {
@@ -2285,13 +2345,13 @@ test "Association.rwnd: a timeout adds back the unacked data and the retransmiss
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{ 2, 2 }, 1000), 0);
-    try testing.expectEqual(900, assoc.message_queue.rwnd);
+    try testing.expectEqual(900, assoc.message_queue.inner.data.rwnd);
 
     try assoc.handleTimeout(10_000);
-    try testing.expectEqual(1000, assoc.message_queue.rwnd);
+    try testing.expectEqual(1000, assoc.message_queue.inner.data.rwnd);
 
     _ = (try assoc.pollTransmit(&out, 10_000)).?;
-    try testing.expectEqual(900, assoc.message_queue.rwnd);
+    try testing.expectEqual(900, assoc.message_queue.inner.data.rwnd);
 }
 
 test "Association.rwnd: a second timeout during a retransmission does not add the pending chunks twice" {
@@ -2305,17 +2365,17 @@ test "Association.rwnd: a second timeout during a retransmission does not add th
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 10_000), 0);
-    try testing.expectEqual(10_000 - 2 * data.len, assoc.message_queue.rwnd);
+    try testing.expectEqual(10_000 - 2 * data.len, assoc.message_queue.inner.data.rwnd);
 
     try assoc.handleTimeout(10_000);
-    try testing.expectEqual(10_000, assoc.message_queue.rwnd);
+    try testing.expectEqual(10_000, assoc.message_queue.inner.data.rwnd);
 
     // only the first chunk is retransmitted before the timer expires again
     _ = (try assoc.pollTransmit(&out, 10_000)).?;
-    try testing.expectEqual(10_000 - data.len, assoc.message_queue.rwnd);
+    try testing.expectEqual(10_000 - data.len, assoc.message_queue.inner.data.rwnd);
 
     try assoc.handleTimeout(20_000);
-    try testing.expectEqual(10_000, assoc.message_queue.rwnd);
+    try testing.expectEqual(10_000, assoc.message_queue.inner.data.rwnd);
 }
 
 test "Association.rwnd: adding back the outstanding data on a timeout saturates" {
@@ -2327,9 +2387,9 @@ test "Association.rwnd: adding back the outstanding data on a timeout saturates"
     var out: [message.MTU]u8 = undefined;
     _ = (try assoc.pollTransmit(&out, 0)).?;
 
-    assoc.message_queue.rwnd = std.math.maxInt(u32) - 10;
+    assoc.message_queue.inner.data.rwnd = std.math.maxInt(u32) - 10;
     try assoc.handleTimeout(10_000);
-    try testing.expectEqual(std.math.maxInt(u32), assoc.message_queue.rwnd);
+    try testing.expectEqual(std.math.maxInt(u32), assoc.message_queue.inner.data.rwnd);
 }
 
 test "Association.rwnd: new data is not sent while the window is smaller than the next chunk" {
@@ -2343,17 +2403,17 @@ test "Association.rwnd: new data is not sent while the window is smaller than th
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn -% 1, &.{}, 150), 0);
-    try testing.expectEqual(50, assoc.message_queue.rwnd);
+    try testing.expectEqual(50, assoc.message_queue.inner.data.rwnd);
 
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
     try testing.expectEqual(null, try assoc.pollTransmit(&out, 0));
 
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn, &.{}, 1000), 0);
-    try testing.expectEqual(1000, assoc.message_queue.rwnd);
+    try testing.expectEqual(1000, assoc.message_queue.inner.data.rwnd);
 
     const packet = (try assoc.pollTransmit(&out, 0)).?;
     try testing.expectEqual(assoc.initial_tsn +% 1, std.mem.readInt(u32, packet[16..20], .big));
-    try testing.expectEqual(900, assoc.message_queue.rwnd);
+    try testing.expectEqual(900, assoc.message_queue.inner.data.rwnd);
 }
 
 test "Association.pollTransmit: send zero window probe" {
@@ -2367,7 +2427,7 @@ test "Association.pollTransmit: send zero window probe" {
 
     var buffer: [32]u8 = undefined;
     _ = try assoc.handleRead(testSackPacket(&buffer, &assoc, assoc.initial_tsn +% 2, &.{}, 50), 0);
-    try testing.expectEqual(50, assoc.message_queue.rwnd);
+    try testing.expectEqual(50, assoc.message_queue.inner.data.rwnd);
 
     try assoc.handleWrite(&data, .{ .stream_id = 0, .ppid = 0 });
     try testing.expect(try assoc.pollTransmit(&out, 0) != null);
