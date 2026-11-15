@@ -109,9 +109,9 @@ pub fn getCumulativeTsn(self: *const MessageAssembler) u32 {
     };
 }
 
-pub fn hasGaps(self: *const MessageAssembler) bool {
+pub fn needsImmediateSack(self: *const MessageAssembler) bool {
     return switch (self.inner) {
-        inline else => |*a| a.hasGaps(),
+        inline else => |*a| a.needsImmediateSack(),
     };
 }
 

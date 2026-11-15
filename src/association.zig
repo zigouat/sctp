@@ -611,7 +611,8 @@ pub fn handleRead(self: *Association, data: []const u8, now: i64) error{ Invalid
 
     if (received_data and self.state == .shutdown_sent) {
         try self.transmits.pushBack(self.allocator, .{ .shutdown = self.message_assembler.getCumulativeTsn() });
-        if (self.message_assembler.hasGaps()) try self.pushSack();
+        // RFC9260 - 9.2. a SACK must also be sent when the SHUTDOWN can't acknowledge everything (gaps) or duplicate TSNs were received.
+        if (self.message_assembler.needsImmediateSack()) try self.pushSack();
         return self.messageIterator();
     }
 
@@ -1889,6 +1890,31 @@ test "Association.handleRead: data in shutdown sent is answered with a shutdown"
 
     try testing.expectEqual(.shutdown_sent, assoc.state);
     try testing.expectEqual(Transmit{ .shutdown = 100 }, assoc.transmits.popFront().?);
+}
+
+test "Association.handleRead: duplicate data in shutdown sent is answered with a shutdown and a sack" {
+    var assoc = try testEstablishedAssoc();
+    defer assoc.deinit();
+    assoc.message_assembler.setInitTsn(100);
+    assoc.state = .shutdown_sent;
+
+    var buffer: [32]u8 = undefined;
+    var lens: [1]usize = undefined;
+    _ = try testRead(&assoc, testDataPacket(&buffer, assoc.verification_tag, 100), 0, &lens);
+    try testing.expectEqual(Transmit{ .shutdown = 100 }, assoc.transmits.popFront().?);
+    try testing.expectEqual(null, assoc.transmits.popFront());
+
+    // the peer retransmits the chunk because the acknowledgement was lost
+    _ = try testRead(&assoc, testDataPacket(&buffer, assoc.verification_tag, 100), 0, &lens);
+    try testing.expectEqual(.shutdown_sent, assoc.state);
+    try testing.expectEqual(Transmit{ .shutdown = 100 }, assoc.transmits.popFront().?);
+    try testing.expectEqual(Transmit.sack, assoc.transmits.popFront().?);
+
+    // the sack reports the duplicate
+    var out: [message.MTU]u8 = undefined;
+    const sack_len = assoc.message_assembler.writeSack(&out);
+    try testing.expectEqual(1, std.mem.readInt(u16, out[14..16], .big));
+    try testing.expectEqual(100, std.mem.readInt(u32, out[sack_len - 4 ..][0..4], .big));
 }
 
 test "Association.handleRead: data in shutdown pending is delivered and acknowledged" {
