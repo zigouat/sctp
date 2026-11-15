@@ -11,9 +11,10 @@ This library implement a subset of the SCTP protocol, focusing on the parts need
 | [RFC 9260](https://www.rfc-editor.org/rfc/rfc9260.html) | Stream Control Transmission Protocol | Single-homed associations: handshake, data transfer, fragmentation, congestion control, graceful shutdown and abort. Heartbeats are answered but not sent; ECN is ignored. |
 | [RFC 3758](https://www.rfc-editor.org/rfc/rfc3758.html) | Partial Reliability Extension (PR-SCTP) | FORWARD TSN, with the max-retransmit and deadline policies. Enabled with `supported_extensions.partial_reliability`. |
 | [RFC 6525](https://www.rfc-editor.org/rfc/rfc6525.html) | Stream Reconfiguration | Outgoing and incoming SSN reset requests. SSN/TSN reset and adding streams are not supported. Enabled with `supported_extensions.stream_reconfiguration`. |
+| [RFC 8260](https://www.rfc-editor.org/rfc/rfc8260.html) | Stream Schedulers and User Message Interleaving | I-DATA and I-FORWARD-TSN, with a round-robin stream scheduler. DATA chunks are used when the peer doesn't support it. Partial reliability is disabled if the peer supports I-DATA but not I-FORWARD-TSN. Enabled with `supported_extensions.message_interleaving`. |
 | [RFC 5061](https://www.rfc-editor.org/rfc/rfc5061.html) | Dynamic Address Reconfiguration | Only the Supported Extensions parameter, used to negotiate the extensions above. |
 
-Not implemented: multi-homing, I-DATA ([RFC 8260](https://www.rfc-editor.org/rfc/rfc8260.html)), AUTH ([RFC 4895](https://www.rfc-editor.org/rfc/rfc4895.html)).
+Not implemented: multi-homing, other RFC 8260 stream schedulers, AUTH ([RFC 4895](https://www.rfc-editor.org/rfc/rfc4895.html)).
 
 ## Architecture
 
@@ -21,7 +22,7 @@ This is a sans-IO implementation of SCTP, meaning that it does not handle any I/
 
 ## Installation
 
-Requires Zig `0.16.0`.
+Requires Zig `0.17.1`.
 
 ```sh
 zig fetch --save git+https://github.com/zigouat/sctp.git#v0.1.0
