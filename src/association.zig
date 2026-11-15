@@ -32,10 +32,14 @@ pub const Extensions = packed struct(u8) {
     }
 
     fn write(extensions: Extensions, buffer: []u8) usize {
-        var chunks: [3]message.ChunkType = undefined;
+        var chunks: [4]message.ChunkType = undefined;
         var count: usize = 0;
         if (extensions.stream_reconfiguration) {
             chunks[count] = .reconfig;
+            count += 1;
+        }
+        if (extensions.partial_reliability) {
+            chunks[count] = .forward_tsn;
             count += 1;
         }
         if (extensions.message_interleaving) {
@@ -1498,6 +1502,42 @@ test "PeerExtensions: the order of the parameters does not matter" {
         var peer: PeerExtensions = .{};
         for (params) |param| peer.handleParameter(param);
         try testing.expectEqual(Extensions{ .stream_reconfiguration = true, .partial_reliability = true }, peer.extensions);
+    }
+}
+
+test "Extensions.write: partial reliability is announced with the parameter and in the supported extensions" {
+    const cases = [_]struct { Extensions, []const message.ChunkType, bool }{
+        .{ .{}, &.{}, false },
+        .{ .{ .stream_reconfiguration = true }, &.{.reconfig}, false },
+        .{ .{ .partial_reliability = true }, &.{.forward_tsn}, true },
+        .{ .{ .stream_reconfiguration = true, .partial_reliability = true }, &.{ .reconfig, .forward_tsn }, true },
+        .{
+            .{ .stream_reconfiguration = true, .partial_reliability = true, .message_interleaving = true },
+            &.{ .reconfig, .forward_tsn, .idata, .iforward_tsn },
+            true,
+        },
+    };
+
+    for (cases) |case| {
+        const extensions, const expected_chunks, const expected_forward_tsn_supported = case;
+        var buffer: [64]u8 = undefined;
+        const written = extensions.write(&buffer);
+
+        var listed: []const message.ChunkType = &.{};
+        var forward_tsn_supported = false;
+        var it = message.ParameterIterator.init(buffer[0..written]);
+        while (try it.next()) |param| switch (param) {
+            .supported_extensions => |chunks| listed = chunks,
+            .forward_tsn_supported => forward_tsn_supported = true,
+            else => return error.UnexpectedParameter,
+        };
+        try testing.expectEqualSlices(message.ChunkType, expected_chunks, listed);
+        try testing.expectEqual(expected_forward_tsn_supported, forward_tsn_supported);
+
+        // a peer that only reads the supported extensions (e.g. pion) sees the same partial reliability
+        var peer: PeerExtensions = .{};
+        peer.handleParameter(.{ .supported_extensions = listed });
+        try testing.expectEqual(extensions.partial_reliability, peer.extensions.partial_reliability);
     }
 }
 
