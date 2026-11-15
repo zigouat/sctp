@@ -73,6 +73,8 @@ const PeerExtensions = struct {
         switch (param) {
             .supported_extensions => |chunks| for (chunks) |c| switch (c) {
                 .reconfig => peer.extensions.stream_reconfiguration = true,
+                // some stacks (e.g. dcsctp) list FORWARD TSN here, which means the same as the Forward-TSN-Supported parameter
+                .forward_tsn => peer.extensions.partial_reliability = true,
                 .idata => peer.extensions.message_interleaving = true,
                 .iforward_tsn => peer.iforward_tsn = true,
                 else => {},
@@ -1484,6 +1486,57 @@ test "Association: negotiate extensions" {
         try testing.expectEqual(case[2][1], assoc1.negotiated_extensions.partial_reliability);
         try testing.expectEqual(case[2][1], assoc2.negotiated_extensions.partial_reliability);
     }
+}
+
+test "PeerExtensions: the order of the parameters does not matter" {
+    const forward_tsn: message.Parameter = .forward_tsn_supported;
+    const supported: message.Parameter = .{ .supported_extensions = &.{.reconfig} };
+    const orders = [_][2]message.Parameter{ .{ forward_tsn, supported }, .{ supported, forward_tsn } };
+
+    for (orders) |params| {
+        var peer: PeerExtensions = .{};
+        for (params) |param| peer.handleParameter(param);
+        try testing.expectEqual(Extensions{ .stream_reconfiguration = true, .partial_reliability = true }, peer.extensions);
+    }
+}
+
+test "PeerExtensions: forward tsn listed in the supported extensions enables partial reliability" {
+    var peer: PeerExtensions = .{};
+    peer.handleParameter(.{ .supported_extensions = &.{.forward_tsn} });
+    try testing.expectEqual(Extensions{ .partial_reliability = true }, peer.extensions);
+}
+
+test "Association: negotiate partial reliability from a dcsctp INIT ACK" {
+    var assoc = Association.init(testing.allocator, .{
+        .source_port = 5000,
+        .dest_port = 5000,
+        .random = test_prng.random(),
+        .supported_extensions = .{ .stream_reconfiguration = true, .partial_reliability = true },
+    });
+    defer assoc.deinit();
+    try assoc.connect();
+
+    var packet = [_]u8{
+        0x13, 0x88, 0x13, 0x88, // source and destination ports: 5000
+        0x00, 0x00, 0x00, 0x00, // verification tag, set below
+        0x00, 0x00, 0x00, 0x00, // checksum, set below
+        0x02, 0x00, 0x00, 0x28, // INIT ACK, length 40
+        0x11, 0x22, 0x33, 0x44, // initiate tag
+        0x00, 0x10, 0x00, 0x00, // a_rwnd
+        0x00, 0x10, 0x00, 0x10, // outbound and inbound streams: 16
+        0x00, 0x00, 0x00, 0x01, // initial tsn
+        0xC0, 0x00, 0x00, 0x04, // Forward-TSN-Supported
+        0x80, 0x08, 0x00, 0x06, 0x82, 0xC0, 0x00, 0x00, // Supported-Extensions: RE-CONFIG, FORWARD TSN (+ padding)
+        0x00, 0x07, 0x00, 0x08, 1, 2, 3, 4, // State Cookie
+    };
+    std.mem.writeInt(u32, packet[4..8], assoc.verification_tag, .big);
+    Helper.checkSum(&packet);
+    _ = try assoc.handleRead(&packet, 0);
+    try testing.expectEqual(.cookie_echoed, assoc.state);
+    try testing.expectEqual(
+        Extensions{ .stream_reconfiguration = true, .partial_reliability = true },
+        assoc.negotiated_extensions,
+    );
 }
 
 test "Association.pollTransmits: a timed out message that was gap acked is not retransmitted" {
