@@ -194,7 +194,7 @@ pub fn acknowledge(self: *MessageAssembler, d: message.Data) bool {
 }
 
 pub fn scheduleSack(self: *MessageAssembler, immediate: bool, now: i64) bool {
-    if (self.send_sack or immediate or self.hasGaps()) return true;
+    if (self.send_sack or immediate or self.needsImmediateSack()) return true;
     self.send_sack = true;
     self.sack_deadline = now + sack_delay;
     return false;
@@ -239,8 +239,10 @@ pub fn getCumulativeTsn(self: *const MessageAssembler) u32 {
     return self.sack_generator.received.cumulative_tsn;
 }
 
-pub fn hasGaps(self: *const MessageAssembler) bool {
-    return self.sack_generator.received.cumulative_tsn != self.sack_generator.received.highest_tsn_received;
+/// RFC9260 - 6.7. gaps or duplicate TSNs must be reported without delay.
+pub fn needsImmediateSack(self: *const MessageAssembler) bool {
+    const received = &self.sack_generator.received;
+    return received.cumulative_tsn != received.highest_tsn_received or self.sack_generator.duplicate_count != 0;
 }
 
 /// Restart the incoming stream sequence number of `streams` at 0, an empty slice resets all the streams.
