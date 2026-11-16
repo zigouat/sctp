@@ -98,10 +98,9 @@ const Deferred = struct {
 };
 
 const SeqNumCheck = enum { new, retransmission, bad };
-
 /// Streams with a pending outgoing reset, rebuilt from `requests` when an outgoing part completes since a stream may
 /// be in several requests.
-streams: std.AutoHashMapUnmanaged(u16, void),
+streams: Helper.StreamArrayMap,
 /// Streams of the queued requests in order.
 request_streams: std.Deque(u16),
 /// Set when a request is queued to reset all the streams.
@@ -163,7 +162,7 @@ pub fn resetStreams(self: *StreamReset, allocator: Allocator, streams: []const u
 ///
 /// Returns `false` if the stream is not resetting, the message is not buffered and can be sent right away.
 pub fn bufferMessage(self: *StreamReset, allocator: Allocator, data: []const u8, config: message.UserMessageConfig) Allocator.Error!bool {
-    if (!self.reset_all_streams and (self.streams.size == 0 or !self.streams.contains(config.stream_id))) {
+    if (!self.reset_all_streams and (self.streams.count() == 0 or !self.streams.contains(config.stream_id))) {
         @branchHint(.likely);
         return false;
     }
@@ -188,7 +187,7 @@ pub fn maybeStartTransmitting(self: *StreamReset, msg_queue: *const MessageQueue
     if (request.flags.started) return;
 
     if (request.flags.direction.outgoing) {
-        if (msg_queue.hasUnsentMessages(if (request.stream_count == 0) null else &self.streams)) return;
+        if (msg_queue.hasUnsentMessages(if (request.stream_count == 0) null else self.streams.keys())) return;
         request.last_assigned_tsn = msg_queue.highestTsnSent();
     }
     request.flags.started = true;

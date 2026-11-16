@@ -8,8 +8,6 @@ test {
     _ = @import("message_assembler/sequential.zig");
     _ = @import("message_assembler/interleaved.zig");
     _ = @import("message_queue.zig");
-    _ = @import("message_queue/sequential.zig");
-    _ = @import("message_queue/interleaver.zig");
     _ = @import("message.zig");
     _ = @import("sack_handler.zig");
     _ = @import("stream_reset.zig");
