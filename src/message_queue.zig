@@ -51,7 +51,6 @@ const forward_tsn_header_size = 8;
 const forward_tsn_entry_size = 4;
 const iforward_tsn_entry_size = 8;
 
-
 pub const Message = struct {
     id: u32,
     ptr: [*]const u8,
