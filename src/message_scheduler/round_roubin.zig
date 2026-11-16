@@ -20,18 +20,33 @@ pub fn ensureUnusedCapacity(self: *RoundRobin, allocator: std.mem.Allocator, cou
     try self.streams.ensureUnusedCapacity(allocator, count);
 }
 
-/// The stream whose turn it is, it stays scheduled.
+/// The stream whose turn it is.
 pub fn peek(self: *const RoundRobin) ?u16 {
     return self.streams.front();
 }
 
-/// Removes the stream whose turn it is, push it back to give it another turn.
-pub fn nextStream(self: *RoundRobin) ?u16 {
-    return self.streams.popFront();
+/// A message of `stream_id` is queued, `had_unsent` if the stream already had messages to send. The capacity must be
+/// reserved.
+pub fn pushMessage(self: *RoundRobin, stream_id: u16, had_unsent: bool) void {
+    if (!had_unsent) self.streams.pushBackAssumeCapacity(stream_id);
 }
 
-pub fn pushBack(self: *RoundRobin, allocator: std.mem.Allocator, stream_id: u16) AllocError!void {
-    try self.streams.pushBack(allocator, stream_id);
+/// A chunk of the current message of the stream whose turn it is was sent, the next stream takes its turn.
+pub fn chunkSent(self: *RoundRobin, message_done: bool, stream_has_more: bool) void {
+    _ = message_done;
+    // popping makes room for the push
+    const stream_id = self.streams.popFront().?;
+    if (stream_has_more) self.streams.pushBackAssumeCapacity(stream_id);
+}
+
+/// The current message of the stream whose turn it is is dropped before it was fully sent.
+pub fn messageDropped(self: *RoundRobin) void {
+    _ = self;
+}
+
+/// The stream whose turn it is has nothing left to send.
+pub fn skipStream(self: *RoundRobin) void {
+    _ = self.streams.popFront();
 }
 
 /// Removes the streams at or above `max_streams`.
